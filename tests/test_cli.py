@@ -1580,7 +1580,7 @@ def test_cli_version_exits_before_requiring_a_command(
         issue_claim.main(["--version"])
 
     assert exited.value.code == 0
-    assert capsys.readouterr().out == "agent-claim 0.1.0\n"
+    assert capsys.readouterr().out == "agent-claim 0.2.0\n"
 
 
 @pytest.mark.parametrize(
