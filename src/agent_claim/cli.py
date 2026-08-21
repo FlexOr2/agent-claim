@@ -923,34 +923,61 @@ def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
     return own
 
 
+def _require_coordinator_override(role: str | None, reason: str | None) -> None:
+    if role != "coordinator":
+        raise ClaimUnavailable("a coordinator override requires --role coordinator")
+    if reason is None:
+        raise ClaimUnavailable("a coordinator override requires --reason")
+
+
 def release_claim(
     client: IssueComments,
     issue: int,
     agent: str,
-    role: str,
-    reason: str,
+    role: str | None,
+    reason: str | None,
     claim_id: str | None,
     *,
+    branch: str | None = None,
     coordinator_override: bool = False,
 ) -> ActiveClaim:
+    if coordinator_override:
+        _require_coordinator_override(role, reason)
     standing = tuple(claim for claim in _ledger_claims(client) if claim.issue == issue)
     if not standing:
         raise ClaimUnavailable(f"issue #{issue} has no active build claim")
-    if claim_id is None and len(standing) != 1:
-        raise ClaimUnavailable(f"issue #{issue} has conflicting claims; pass --claim-id")
-    selected = next(
-        (claim for claim in standing if claim.claim_id == (claim_id or standing[0].claim_id)),
-        None,
-    )
-    if selected is None:
-        raise ClaimUnavailable(f"issue #{issue} has no active claim {claim_id!r}")
-    if coordinator_override:
-        if role != "coordinator":
-            raise ClaimUnavailable("a coordinator override requires --role coordinator")
-    elif (agent, role) != (selected.agent, selected.role):
+    if claim_id is None:
+        if not branch:
+            raise ClaimUnavailable(
+                "release without --claim-id requires a non-empty current branch; "
+                "pass --claim-id"
+            )
+        matches = tuple(
+            claim
+            for claim in standing
+            if claim.agent == agent and claim.branch == branch
+        )
+        if len(matches) != 1:
+            raise ClaimUnavailable(
+                f"issue #{issue} has no unique claim for this session on branch "
+                f"{branch!r}; pass --claim-id"
+            )
+        selected = matches[0]
+    else:
+        selected = next(
+            (claim for claim in standing if claim.claim_id == claim_id),
+            None,
+        )
+        if selected is None:
+            raise ClaimUnavailable(f"issue #{issue} has no active claim {claim_id!r}")
+    if role is None:
+        role = selected.role
+    if not coordinator_override and (agent, role) != (selected.agent, selected.role):
         raise ClaimUnavailable(
             "only the original claimant may release; use an explicit coordinator override"
         )
+    if reason is None:
+        reason = DEFAULT_RELEASE_REASON
 
     ledger_url = client.post_comment(
         LEDGER_ISSUE,
@@ -1651,6 +1678,7 @@ AGENT_CLAIM_AGENT_ENV = "AGENT_CLAIM_AGENT"
 GROK_SESSION_ID_ENV = "GROK_SESSION_ID"
 CLAUDE_SESSION_ID_ENV = "CLAUDE_SESSION_ID"
 DEFAULT_CLAIM_ROLE = "builder"
+DEFAULT_RELEASE_REASON = "landed"
 
 
 def _resolved_agent(explicit: str | None) -> str:
@@ -1738,8 +1766,8 @@ def _parser() -> argparse.ArgumentParser:
     release = commands.add_parser("release", help="release a landed or abandoned claim")
     release.add_argument("issue", type=int)
     release.add_argument("--agent")
-    release.add_argument("--role", required=True)
-    release.add_argument("--reason", required=True)
+    release.add_argument("--role")
+    release.add_argument("--reason")
     release.add_argument("--claim-id")
     release.add_argument("--coordinator-override", action="store_true")
 
@@ -1898,6 +1926,17 @@ def main(arguments: list[str] | None = None) -> int:
     try:
         if parsed.command in {"claim", "release"}:
             parsed.agent = _resolved_agent(parsed.agent)
+        release_branch: str | None = None
+        if parsed.command == "release":
+            if parsed.coordinator_override:
+                _require_coordinator_override(parsed.role, parsed.reason)
+            if parsed.claim_id is None:
+                release_branch = _git_output(["branch", "--show-current"])
+                if not release_branch:
+                    raise ClaimUnavailable(
+                        "release without --claim-id requires a non-empty current branch; "
+                        "pass --claim-id"
+                    )
         client = GitHubIssueComments(_repository(parsed.repo))
         if parsed.command == "bootstrap":
             ledger = bootstrap_ledger(client)
@@ -1923,6 +1962,7 @@ def main(arguments: list[str] | None = None) -> int:
                 parsed.role,
                 parsed.reason,
                 parsed.claim_id,
+                branch=release_branch,
                 coordinator_override=parsed.coordinator_override,
             )
             print(f"RELEASED issue #{parsed.issue}: {released.claim_id}")
