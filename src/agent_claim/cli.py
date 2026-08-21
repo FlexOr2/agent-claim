@@ -1753,6 +1753,7 @@ def _parser() -> argparse.ArgumentParser:
 
     status = commands.add_parser("status", help="show repository-wide build claims")
     status.add_argument("issue", type=int, nargs="?")
+    status.add_argument("--json", action="store_true")
 
     claim = commands.add_parser("claim", help="claim an issue and scope before editing")
     claim.add_argument("issue", type=int)
@@ -1791,32 +1792,69 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _status(claims: tuple[ActiveClaim, ...], issue: int | None) -> int:
+def _status_claims(
+    claims: tuple[ActiveClaim, ...], issue: int | None
+) -> tuple[tuple[ActiveClaim, ...], set[str]]:
     selected = tuple(claim for claim in claims if issue is None or claim.issue == issue)
     if not selected:
-        subject = "repository" if issue is None else f"issue #{issue}"
-        print(f"UNCLAIMED {subject}")
-        return 0
+        return (), set()
     index = _claim_conflict_index(claims)
     related_ids = (
         {claim.claim_id for claim in claims}
         if issue is None
         else _related_claim_ids(index, selected)
     )
-    related = tuple(
-        claim
-        for claim in claims
-        if claim.claim_id in related_ids
-    )
+    related = tuple(claim for claim in claims if claim.claim_id in related_ids)
+    return related, index.conflict_ids
+
+
+def _status(claims: tuple[ActiveClaim, ...], issue: int | None) -> int:
+    related, conflict_ids = _status_claims(claims, issue)
+    if not related:
+        subject = "repository" if issue is None else f"issue #{issue}"
+        print(f"UNCLAIMED {subject}")
+        return 0
     for claim in related:
-        state = "CONFLICT" if claim.claim_id in index.conflict_ids else "CLAIMED"
+        state = "CONFLICT" if claim.claim_id in conflict_ids else "CLAIMED"
         print(
             f"{state} issue #{claim.issue}: {claim.agent} ({claim.role}) "
             f"base={claim.base} branch={claim.branch} claim={claim.claim_id}"
         )
         for path in claim.scope:
             print(f"  {path}")
-    return 2 if any(claim.claim_id in index.conflict_ids for claim in related) else 0
+    return 2 if any(claim.claim_id in conflict_ids for claim in related) else 0
+
+
+def _status_json(
+    claims: tuple[ActiveClaim, ...], issue: int | None, ledger: int
+) -> int:
+    related, conflict_ids = _status_claims(claims, issue)
+    if not related:
+        state = "UNCLAIMED"
+    elif any(claim.claim_id in conflict_ids for claim in related):
+        state = "CONFLICT"
+    else:
+        state = "CLAIMED"
+    payload = {
+        "ledger": ledger,
+        "issue": issue,
+        "state": state,
+        "claims": [
+            {
+                "issue": claim.issue,
+                "agent": claim.agent,
+                "role": claim.role,
+                "base": claim.base,
+                "branch": claim.branch,
+                "claim_id": claim.claim_id,
+                "scope": list(claim.scope),
+                "state": "CONFLICT" if claim.claim_id in conflict_ids else "CLAIMED",
+            }
+            for claim in related
+        ],
+    }
+    print(json.dumps(payload))
+    return 2 if state == "CONFLICT" else 0
 
 
 MUTATING_HOOK_TOOLS = frozenset({"Edit", "MultiEdit", "Write", "search_replace", "write"})
@@ -1948,8 +1986,11 @@ def main(arguments: list[str] | None = None) -> int:
             raise ClaimUnavailable("no agent-claim ledger exists; run agent-claim bootstrap")
         configure_ledger(ledger)
         if parsed.command == "status":
+            claims = _ledger_claims(client)
+            if parsed.json:
+                return _status_json(claims, parsed.issue, ledger)
             print(f"LEDGER #{ledger}")
-            return _status(_ledger_claims(client), parsed.issue)
+            return _status(claims, parsed.issue)
         if parsed.command == "claim":
             claimed = acquire_claim(client, _request(parsed))
             print(f"CLAIMED issue #{parsed.issue}: {claimed.claim_id} {claimed.comment.url}")

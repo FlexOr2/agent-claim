@@ -3056,6 +3056,218 @@ def test_status_direct_empty_claims_prints_unclaimed_repository_without_ledger(
     assert capsys.readouterr().out == "UNCLAIMED repository\n"
 
 
+def test_cli_status_json_empty_ledger_prints_unclaimed_object(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _patch_status_cli(monkeypatch, FakeComments())
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "status", "--json"]) == 0
+    assert capsys.readouterr().out == json.dumps(
+        {
+            "ledger": LEDGER_ISSUE,
+            "issue": None,
+            "state": "UNCLAIMED",
+            "claims": [],
+        }
+    ) + "\n"
+
+
+def test_cli_status_json_issue_with_no_claim_prints_unclaimed_object(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _patch_status_cli(monkeypatch, FakeComments())
+
+    assert (
+        issue_claim.main(["--repo", "example/agent-claim", "status", "72", "--json"]) == 0
+    )
+    assert capsys.readouterr().out == json.dumps(
+        {
+            "ledger": LEDGER_ISSUE,
+            "issue": 72,
+            "state": "UNCLAIMED",
+            "claims": [],
+        }
+    ) + "\n"
+
+
+def test_cli_status_json_after_claim_prints_claimed_object(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _patch_status_cli(monkeypatch, FakeComments())
+    monkeypatch.setattr(issue_claim, "_validate_checkout", lambda request: None)
+
+    assert (
+        issue_claim.main(
+            [
+                "--repo",
+                "example/agent-claim",
+                "claim",
+                "72",
+                "--agent",
+                "Codex Sol",
+                "--role",
+                "builder",
+                "--base",
+                BASE,
+                "--branch",
+                "codex/issue-72",
+                "--scope",
+                "src",
+                "--claim-id",
+                "cli-claim",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    status = issue_claim.main(
+        ["--repo", "example/agent-claim", "status", "72", "--json"]
+    )
+    assert status == 0
+    assert capsys.readouterr().out == json.dumps(
+        {
+            "ledger": LEDGER_ISSUE,
+            "issue": 72,
+            "state": "CLAIMED",
+            "claims": [
+                {
+                    "issue": 72,
+                    "agent": "Codex Sol",
+                    "role": "builder",
+                    "base": BASE,
+                    "branch": "codex/issue-72",
+                    "claim_id": "cli-claim",
+                    "scope": ["src"],
+                    "state": "CLAIMED",
+                }
+            ],
+        }
+    ) + "\n"
+
+
+def test_cli_status_json_overlapping_protocol_comments_print_conflict_object(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments(
+        {
+            LEDGER_ISSUE: [
+                comment(1, claim_comment(request(issue=72, scope=("shared",)))),
+                comment(
+                    2,
+                    claim_comment(
+                        request("claim-b", "Grok 4.6", issue=73, scope=("shared/file.py",))
+                    ),
+                ),
+            ]
+        }
+    )
+    _patch_status_cli(monkeypatch, client)
+
+    status = issue_claim.main(["--repo", "example/agent-claim", "status", "--json"])
+    assert status == 2
+    assert capsys.readouterr().out == json.dumps(
+        {
+            "ledger": LEDGER_ISSUE,
+            "issue": None,
+            "state": "CONFLICT",
+            "claims": [
+                {
+                    "issue": 72,
+                    "agent": "Codex Sol",
+                    "role": "builder",
+                    "base": BASE,
+                    "branch": "codex/issue-72-claims",
+                    "claim_id": "claim-a",
+                    "scope": ["shared"],
+                    "state": "CONFLICT",
+                },
+                {
+                    "issue": 73,
+                    "agent": "Grok 4.6",
+                    "role": "builder",
+                    "base": BASE,
+                    "branch": "codex/issue-73-claims",
+                    "claim_id": "claim-b",
+                    "scope": ["shared/file.py"],
+                    "state": "CONFLICT",
+                },
+            ],
+        }
+    ) + "\n"
+
+
+def test_cli_status_json_issue_on_overlap_prints_related_conflict_object(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments(
+        {
+            LEDGER_ISSUE: [
+                comment(1, claim_comment(request(issue=72, scope=("shared",)))),
+                comment(
+                    2,
+                    claim_comment(
+                        request("claim-b", "Grok 4.6", issue=73, scope=("shared/file.py",))
+                    ),
+                ),
+            ]
+        }
+    )
+    _patch_status_cli(monkeypatch, client)
+
+    status = issue_claim.main(
+        ["--repo", "example/agent-claim", "status", "72", "--json"]
+    )
+    assert status == 2
+    assert capsys.readouterr().out == json.dumps(
+        {
+            "ledger": LEDGER_ISSUE,
+            "issue": 72,
+            "state": "CONFLICT",
+            "claims": [
+                {
+                    "issue": 72,
+                    "agent": "Codex Sol",
+                    "role": "builder",
+                    "base": BASE,
+                    "branch": "codex/issue-72-claims",
+                    "claim_id": "claim-a",
+                    "scope": ["shared"],
+                    "state": "CONFLICT",
+                },
+                {
+                    "issue": 73,
+                    "agent": "Grok 4.6",
+                    "role": "builder",
+                    "base": BASE,
+                    "branch": "codex/issue-73-claims",
+                    "claim_id": "claim-b",
+                    "scope": ["shared/file.py"],
+                    "state": "CONFLICT",
+                },
+            ],
+        }
+    ) + "\n"
+
+
+def test_cli_status_json_without_ledger_errors_and_prints_no_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _patch_status_cli(monkeypatch, FakeComments(), ledger=None)
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "status", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "ERROR:" in captured.err
+    assert "no agent-claim ledger exists" in captured.err
+
+
 def test_cli_supersede_freezes_the_drained_ledger_and_prints_the_contract_line(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
