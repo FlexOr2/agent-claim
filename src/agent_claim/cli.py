@@ -1650,6 +1650,7 @@ def _validate_checkout(request: ClaimRequest) -> None:
 AGENT_CLAIM_AGENT_ENV = "AGENT_CLAIM_AGENT"
 GROK_SESSION_ID_ENV = "GROK_SESSION_ID"
 CLAUDE_SESSION_ID_ENV = "CLAUDE_SESSION_ID"
+DEFAULT_CLAIM_ROLE = "builder"
 
 
 def _resolved_agent(explicit: str | None) -> str:
@@ -1728,7 +1729,7 @@ def _parser() -> argparse.ArgumentParser:
     claim = commands.add_parser("claim", help="claim an issue and scope before editing")
     claim.add_argument("issue", type=int)
     claim.add_argument("--agent")
-    claim.add_argument("--role", required=True)
+    claim.add_argument("--role", default=DEFAULT_CLAIM_ROLE)
     claim.add_argument("--base")
     claim.add_argument("--branch")
     claim.add_argument("--scope", action="append", required=True)
