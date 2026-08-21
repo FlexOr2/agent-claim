@@ -21,7 +21,7 @@ git+https://github.com/FlexOr2/agent-claim.git@v0.1.0`.
 ```bash
 agent-claim bootstrap
 agent-claim status
-agent-claim claim 42 --agent "Ada" --role builder --scope src/widget.py
+agent-claim claim 42 --agent "Ada" --scope src/widget.py
 agent-claim release 42 --claim-id <id> --agent "Ada" --role builder --reason landed
 agent-claim reconcile
 ```
@@ -30,8 +30,9 @@ Omitted `--base`/`--branch` bind the current checkout; explicit values must matc
 Omitted `--agent` on `claim` and `release` is filled from non-empty
 `AGENT_CLAIM_AGENT`, else non-empty `GROK_SESSION_ID` as `Grok {session}`, else
 non-empty `CLAUDE_SESSION_ID` as `Claude {session}`. `GROK_AGENT` is not a name.
-Missing or present-invalid identity fails closed before GitHub work. `--role`
-stays required. `supersede` still requires `--agent`.
+Missing or present-invalid identity fails closed before GitHub work. Omitted
+`--role` on `claim` is `builder`; an explicit `--role` wins. `release` and
+`supersede` still require `--role`. `supersede` still requires `--agent`.
 
 Run commands in the repository being coordinated, or pass `--repo
 OWNER/REPOSITORY`. A claim must begin from a clean linked worktree and binds its

@@ -2030,9 +2030,18 @@ def test_claim_request_binds_omitted_base_and_branch_to_checkout(
 @pytest.mark.parametrize(
     "arguments",
     [
-        ["claim", "42", "--agent", "Ada", "--scope", "src/widget.py"],
         ["claim", "42", "--agent", "Ada", "--role", "builder"],
         ["release", "42", "--agent", "Ada", "--reason", "landed"],
+        [
+            "supersede",
+            "170",
+            "--agent",
+            "Ada",
+            "--reason",
+            "landed",
+            "--claim-id",
+            "cli-claim",
+        ],
     ],
 )
 def test_claim_and_release_still_require_role_and_scope(arguments: list[str]) -> None:
@@ -2040,6 +2049,93 @@ def test_claim_and_release_still_require_role_and_scope(arguments: list[str]) ->
         issue_claim._parser().parse_args(arguments)
 
     assert exited.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("role_flags", "role"),
+    [
+        ((), issue_claim.DEFAULT_CLAIM_ROLE),
+        (("--role", "builder"), "builder"),
+        (("--role", "coordinator"), "coordinator"),
+    ],
+)
+def test_cli_claim_omitted_role_posts_default_and_explicit_wins(
+    monkeypatch: pytest.MonkeyPatch,
+    role_flags: tuple[str, ...],
+    role: str,
+) -> None:
+    client = FakeComments()
+    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(issue_claim, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(issue_claim, "_validate_checkout", lambda request: None)
+
+    claimed = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Codex Sol",
+            *role_flags,
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "src",
+            "--claim-id",
+            "cli-claim",
+        ]
+    )
+
+    assert claimed == 0
+    posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])
+    assert isinstance(posted, ActiveClaim)
+    assert posted.role == role
+
+
+def test_cli_claim_empty_role_fails_closed_without_posting_builder(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(issue_claim, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(issue_claim, "_validate_checkout", lambda request: None)
+    argv = [
+        "--repo",
+        "example/agent-claim",
+        "claim",
+        "72",
+        "--agent",
+        "Codex Sol",
+        "--role",
+        "",
+        "--base",
+        BASE,
+        "--branch",
+        "codex/issue-72",
+        "--scope",
+        "src",
+        "--claim-id",
+        "cli-claim",
+    ]
+
+    parsed = issue_claim._parser().parse_args(argv)
+    with pytest.raises(ClaimError, match=r"role.+must be one bounded non-empty line"):
+        issue_claim._request(parsed)
+
+    claimed = issue_claim.main(argv)
+    captured = capsys.readouterr()
+
+    assert claimed == 2
+    assert captured.out == ""
+    assert "ERROR:" in captured.err
+    assert "role" in captured.err
+    assert "must be one bounded non-empty line" in captured.err
+    assert client.list_protocol_candidates(LEDGER_ISSUE) == ()
+    assert active_claims(tuple(client.comments.get(LEDGER_ISSUE, ()))) == ()
 
 
 @pytest.mark.parametrize(
