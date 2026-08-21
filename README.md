@@ -21,10 +21,12 @@ git+https://github.com/FlexOr2/agent-claim.git@v0.1.0`.
 ```bash
 agent-claim bootstrap
 agent-claim status
-agent-claim claim 42 --agent "Ada" --role builder --base "$(git rev-parse HEAD)" --branch "$(git branch --show-current)" --scope src/widget.py
+agent-claim claim 42 --agent "Ada" --role builder --scope src/widget.py
 agent-claim release 42 --claim-id <id> --agent "Ada" --role builder --reason landed
 agent-claim reconcile
 ```
+
+Omitted `--base`/`--branch` bind the current checkout; explicit values must match it.
 
 Run commands in the repository being coordinated, or pass `--repo
 OWNER/REPOSITORY`. A claim must begin from a clean linked worktree and binds its

@@ -1892,6 +1892,142 @@ def test_checkout_validation_rejects_false_or_late_claims(
         issue_claim._validate_checkout(candidate)
 
 
+def _git_checkout(
+    *,
+    head: str = BASE,
+    branch: str = "codex/issue-72",
+    git_directory: str = "/repo/.git/worktrees/issue-72",
+    common_directory: str = "/repo/.git",
+    dirty: str = "",
+) -> dict[tuple[str, str], str]:
+    return {
+        ("rev-parse", "HEAD"): head,
+        ("branch", "--show-current"): branch,
+        ("rev-parse", "--git-dir"): git_directory,
+        ("rev-parse", "--git-common-dir"): common_directory,
+        ("status", "--porcelain"): dirty,
+    }
+
+
+def _parse_claim_command(*flags: str):
+    return issue_claim._parser().parse_args(
+        [
+            "claim",
+            "72",
+            "--agent",
+            "Codex Sol",
+            "--role",
+            "builder",
+            "--scope",
+            "src",
+            "--claim-id",
+            "cli-claim",
+            *flags,
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("flags", "git_values", "error"),
+    [
+        ((), _git_checkout(), None),
+        (("--branch", "codex/issue-72"), _git_checkout(), None),
+        (("--base", BASE), _git_checkout(), None),
+        (("--branch", "other"), _git_checkout(), "does not match checkout branch"),
+        (("--base", "b" * 40), _git_checkout(), "does not match checkout HEAD"),
+        (
+            ("--base", "b" * 40, "--branch", "other"),
+            _git_checkout(),
+            "does not match checkout HEAD",
+        ),
+        ((), _git_checkout(branch="main"), "isolated non-main worktree branch"),
+        ((), _git_checkout(branch="master"), "isolated non-main worktree branch"),
+        (
+            (),
+            _git_checkout(git_directory="/repo/.git", common_directory="/repo/.git"),
+            "linked isolated worktree",
+        ),
+        ((), _git_checkout(dirty=" M file"), "before the first worktree edit"),
+    ],
+)
+def test_claim_request_binds_omitted_base_and_branch_to_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+    flags: tuple[str, ...],
+    git_values: dict[tuple[str, str], str],
+    error: str | None,
+) -> None:
+    monkeypatch.setattr(
+        issue_claim, "_git_output", lambda arguments: git_values[tuple(arguments)]
+    )
+    parsed = _parse_claim_command(*flags)
+    if "--base" not in flags:
+        assert parsed.base is None
+    if "--branch" not in flags:
+        assert parsed.branch is None
+
+    if error is not None:
+        with pytest.raises(ClaimError, match=error):
+            issue_claim._request(parsed)
+        return
+
+    claimed = issue_claim._request(parsed)
+    assert claimed.base == git_values[("rev-parse", "HEAD")]
+    assert claimed.branch == git_values[("branch", "--show-current")]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["claim", "42", "--role", "builder", "--scope", "src/widget.py"],
+        ["claim", "42", "--agent", "Ada", "--scope", "src/widget.py"],
+        ["claim", "42", "--agent", "Ada", "--role", "builder"],
+    ],
+)
+def test_claim_still_requires_agent_role_and_scope(arguments: list[str]) -> None:
+    with pytest.raises(SystemExit) as exited:
+        issue_claim._parser().parse_args(arguments)
+
+    assert exited.value.code == 2
+
+
+def test_cli_claim_omitted_base_and_branch_posts_filled_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    git_values = _git_checkout()
+    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(issue_claim, "discover_ledger", lambda client: LEDGER_ISSUE)
+    monkeypatch.setattr(
+        issue_claim, "_git_output", lambda arguments: git_values[tuple(arguments)]
+    )
+
+    claimed = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Codex Sol",
+            "--role",
+            "builder",
+            "--scope",
+            "src",
+            "--claim-id",
+            "cli-claim",
+        ]
+    )
+
+    assert claimed == 0
+    assert "CLAIMED issue #72" in capsys.readouterr().out
+    posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])
+    assert isinstance(posted, ActiveClaim)
+    assert posted.base == BASE
+    assert posted.branch == "codex/issue-72"
+    assert posted.scope == ("src",)
+
+
 def test_cli_status_claim_release_and_adapter_error_exit_codes(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

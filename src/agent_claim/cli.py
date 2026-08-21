@@ -1648,11 +1648,19 @@ def _validate_checkout(request: ClaimRequest) -> None:
 
 
 def _request(arguments: argparse.Namespace) -> ClaimRequest:
+    if arguments.base is None:
+        base = _git_output(["rev-parse", "HEAD"])
+    else:
+        base = arguments.base
+    if arguments.branch is None:
+        branch = _git_output(["branch", "--show-current"])
+    else:
+        branch = arguments.branch
     payload: dict[str, object] = {
         "action": "claim",
         "agent": arguments.agent,
-        "base": arguments.base,
-        "branch": arguments.branch,
+        "base": base,
+        "branch": branch,
         "claim_id": arguments.claim_id or uuid.uuid4().hex,
         "issue": arguments.issue,
         "role": arguments.role,
@@ -1697,8 +1705,8 @@ def _parser() -> argparse.ArgumentParser:
     claim.add_argument("issue", type=int)
     claim.add_argument("--agent", required=True)
     claim.add_argument("--role", required=True)
-    claim.add_argument("--base", required=True)
-    claim.add_argument("--branch", required=True)
+    claim.add_argument("--base")
+    claim.add_argument("--branch")
     claim.add_argument("--scope", action="append", required=True)
     claim.add_argument("--claim-id")
 
