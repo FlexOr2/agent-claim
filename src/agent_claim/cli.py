@@ -1761,8 +1761,6 @@ def main(arguments: list[str] | None = None) -> int:
         print(POLICY_LOADER)
         return 0
     try:
-        if parsed.command == "supersede":
-            raise ClaimUnavailable("supersede is not available in v0.1")
         client = GitHubIssueComments(_repository(parsed.repo))
         if parsed.command == "bootstrap":
             ledger = bootstrap_ledger(client)
@@ -1790,6 +1788,20 @@ def main(arguments: list[str] | None = None) -> int:
                 coordinator_override=parsed.coordinator_override,
             )
             print(f"RELEASED issue #{parsed.issue}: {released.claim_id}")
+            return 0
+        if parsed.command == "supersede":
+            frozen = supersede_ledger(
+                client,
+                parsed.successor_issue,
+                parsed.agent,
+                parsed.role,
+                parsed.reason,
+                parsed.claim_id,
+            )
+            print(
+                f"SUPERSEDED ledger #{LEDGER_ISSUE} successor "
+                f"#{parsed.successor_issue}: {frozen.claim_id}"
+            )
             return 0
         if parsed.issue is None:
             reconciled = reconcile_all_labels(client)

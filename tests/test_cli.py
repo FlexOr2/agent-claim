@@ -1951,14 +1951,15 @@ def test_cli_status_claim_release_and_adapter_error_exit_codes(
     assert "ERROR: adapter failed" in capsys.readouterr().err
 
 
-def test_cli_supersede_is_unavailable_before_any_github_mutation(
+def test_cli_supersede_freezes_the_drained_ledger_and_prints_the_contract_line(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     client = FakeComments(valid_successors={170})
     monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(issue_claim, "discover_ledger", lambda client: LEDGER_ISSUE)
-    monkeypatch.setattr(issue_claim, "_validate_checkout", lambda request: None)
+    acquired = acquire_claim(client, request(issue=LEDGER_ISSUE))
+
     frozen = issue_claim.main(
         [
             "--repo",
@@ -1972,14 +1973,57 @@ def test_cli_supersede_is_unavailable_before_any_github_mutation(
             "--reason",
             "reviewed successor ready",
             "--claim-id",
-            "rollover",
+            acquired.claim_id,
         ]
     )
 
+    captured = capsys.readouterr()
+    assert frozen == 0
+    assert captured.out == (
+        f"SUPERSEDED ledger #{LEDGER_ISSUE} successor #170: {acquired.claim_id}\n"
+    )
+    assert LEDGER_ISSUE not in client.labels
+    assert "not available in v0.1" not in captured.out
+    assert "not available in v0.1" not in captured.err
+    with pytest.raises(LedgerSuperseded, match="successor #170"):
+        active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+
+
+@pytest.mark.parametrize("failure", ["builder", "drain"])
+def test_cli_supersede_fails_closed_without_mutating_protocol_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    client = FakeComments(valid_successors={170})
+    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(issue_claim, "discover_ledger", lambda client: LEDGER_ISSUE)
+    acquired = acquire_claim(client, request(issue=LEDGER_ISSUE))
+    if failure == "drain":
+        acquire_claim(client, request("other", issue=72, scope=("frontend",)))
+    protocol_count = len(client.list_protocol_candidates(LEDGER_ISSUE))
+
+    frozen = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "supersede",
+            "170",
+            "--agent",
+            "Fleet Coordinator",
+            "--role",
+            "builder" if failure == "builder" else "coordinator",
+            "--reason",
+            "reviewed successor ready",
+            "--claim-id",
+            acquired.claim_id,
+        ]
+    )
+
+    captured = capsys.readouterr()
     assert frozen == 2
-    assert client.comments == {}
-    assert client.labels == set()
-    assert "not available in v0.1" in capsys.readouterr().err
+    assert captured.err.startswith("ERROR:")
+    assert len(client.list_protocol_candidates(LEDGER_ISSUE)) == protocol_count
 
 
 def forbid_github_for_policy(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -37,8 +37,9 @@ to the earliest ledger, visibly closing later duplicates. It refuses to compete
 when another machine-readable claim/ledger contract exists. A claimed issue gets
 one reusable minimal projection comment and a generation-scoped label.
 Use `release --coordinator-override` only for an explicit coordinator action.
-Ledger rollover (`supersede`) is intentionally unavailable in v0.1 and deferred
-to a follow-up issue; the command fails before making a GitHub mutation.
+Ledger rollover (`supersede`) requires a coordinator whose named claim is the
+only active claim and owns the ledger issue; the successor is a higher-numbered
+open empty collaborator-locked issue, and the freeze is atomic.
 
 ## Global loader
 
