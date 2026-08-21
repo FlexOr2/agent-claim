@@ -7,8 +7,8 @@ Codex, Claude, Grok, people, and future agents use the same contract.
 ## Install and maintain
 
 ```bash
-uv tool install git+https://github.com/FlexOr2/agent-claim.git@v0.1.0
-# or: pipx install git+https://github.com/FlexOr2/agent-claim.git@v0.1.0
+uv tool install git+https://github.com/FlexOr2/agent-claim.git@v0.2.0
+# or: pipx install git+https://github.com/FlexOr2/agent-claim.git@v0.2.0
 uv tool upgrade agent-claim
 uv tool uninstall agent-claim
 ```
@@ -48,7 +48,7 @@ provider actually loads. Skip the append when `<!-- agent-claim-policy:v1 -->`
 is already present. Never overwrite an existing loader. The CLI does not write
 `~/.claude`, `~/.codex`, or `~/.grok`.
 
-## v0.1 boundary
+## v0.2 boundary
 
 GitHub via the `gh` CLI is supported today. The tool does not automatically
 allocate work, merge code, operate a lease server, or infer an agent identity.
