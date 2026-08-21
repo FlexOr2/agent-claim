@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-claim"
+dynamic = ["version"]
+description = "Repository-neutral GitHub issue claims for coding agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "agent-claim contributors"}]
+
+[project.scripts]
+agent-claim = "agent_claim.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.8", "build>=1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "agent_claim.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
