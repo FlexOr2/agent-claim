@@ -1772,6 +1772,7 @@ def main(arguments: list[str] | None = None) -> int:
             raise ClaimUnavailable("no agent-claim ledger exists; run agent-claim bootstrap")
         configure_ledger(ledger)
         if parsed.command == "status":
+            print(f"LEDGER #{ledger}")
             return _status(_ledger_claims(client), parsed.issue)
         if parsed.command == "claim":
             claimed = acquire_claim(client, _request(parsed))

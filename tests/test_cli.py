@@ -1951,6 +1951,131 @@ def test_cli_status_claim_release_and_adapter_error_exit_codes(
     assert "ERROR: adapter failed" in capsys.readouterr().err
 
 
+def _patch_status_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    client: FakeComments,
+    *,
+    ledger: int | None = LEDGER_ISSUE,
+) -> None:
+    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(issue_claim, "discover_ledger", lambda _client: ledger)
+
+
+def test_cli_status_empty_ledger_prints_ledger_then_unclaimed_repository(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _patch_status_cli(monkeypatch, FakeComments())
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "status"]) == 0
+    assert capsys.readouterr().out == f"LEDGER #{LEDGER_ISSUE}\nUNCLAIMED repository\n"
+
+
+def test_cli_status_issue_with_no_claim_prints_ledger_then_unclaimed_issue(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _patch_status_cli(monkeypatch, FakeComments())
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "status", "72"]) == 0
+    assert capsys.readouterr().out == f"LEDGER #{LEDGER_ISSUE}\nUNCLAIMED issue #72\n"
+
+
+def test_cli_status_after_claim_prints_ledger_then_claimed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _patch_status_cli(monkeypatch, FakeComments())
+    monkeypatch.setattr(issue_claim, "_validate_checkout", lambda request: None)
+
+    assert (
+        issue_claim.main(
+            [
+                "--repo",
+                "example/agent-claim",
+                "claim",
+                "72",
+                "--agent",
+                "Codex Sol",
+                "--role",
+                "builder",
+                "--base",
+                BASE,
+                "--branch",
+                "codex/issue-72",
+                "--scope",
+                "src",
+                "--claim-id",
+                "cli-claim",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    status = issue_claim.main(["--repo", "example/agent-claim", "status", "72"])
+    assert status == 0
+    assert capsys.readouterr().out == (
+        f"LEDGER #{LEDGER_ISSUE}\n"
+        f"CLAIMED issue #72: Codex Sol (builder) base={BASE} "
+        "branch=codex/issue-72 claim=cli-claim\n"
+        "  src\n"
+    )
+
+
+def test_cli_status_overlapping_protocol_comments_print_ledger_then_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments(
+        {
+            LEDGER_ISSUE: [
+                comment(1, claim_comment(request(issue=72, scope=("shared",)))),
+                comment(
+                    2,
+                    claim_comment(
+                        request("claim-b", "Grok 4.6", issue=73, scope=("shared/file.py",))
+                    ),
+                ),
+            ]
+        }
+    )
+    _patch_status_cli(monkeypatch, client)
+
+    status = issue_claim.main(["--repo", "example/agent-claim", "status"])
+    assert status == 2
+    assert capsys.readouterr().out == (
+        f"LEDGER #{LEDGER_ISSUE}\n"
+        f"CONFLICT issue #72: Codex Sol (builder) base={BASE} "
+        "branch=codex/issue-72-claims claim=claim-a\n"
+        "  shared\n"
+        f"CONFLICT issue #73: Grok 4.6 (builder) base={BASE} "
+        "branch=codex/issue-73-claims claim=claim-b\n"
+        "  shared/file.py\n"
+    )
+
+
+def test_cli_status_without_ledger_errors_and_prints_no_ledger_line(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _patch_status_cli(monkeypatch, FakeComments(), ledger=None)
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "status"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "ERROR:" in captured.err
+    assert "no agent-claim ledger exists" in captured.err
+    assert "LEDGER" not in captured.out
+
+
+def test_status_direct_empty_claims_prints_unclaimed_repository_without_ledger(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _status((), None) == 0
+    assert capsys.readouterr().out == "UNCLAIMED repository\n"
+
+
 def test_cli_supersede_freezes_the_drained_ledger_and_prints_the_contract_line(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
