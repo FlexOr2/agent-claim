@@ -194,16 +194,29 @@ def request(
     agent: str = "Codex Sol",
     *,
     issue: int = 71,
+    role: str = "builder",
+    branch: str | None = None,
     scope: tuple[str, ...] = ("docs/COORDINATION.md", "scripts/issue_claim.py"),
 ) -> ClaimRequest:
     return ClaimRequest(
         issue=issue,
         agent=agent,
-        role="builder",
+        role=role,
         base=BASE,
-        branch=f"codex/issue-{issue}-claims",
+        branch=branch or f"codex/issue-{issue}-claims",
         scope=scope,
         claim_id=claim_id,
+    )
+
+
+def _claims_client(*standing: ClaimRequest) -> FakeComments:
+    return FakeComments(
+        {
+            LEDGER_ISSUE: [
+                comment(index, claim_comment(claimed))
+                for index, claimed in enumerate(standing, start=1)
+            ]
+        }
     )
 
 
@@ -1102,6 +1115,185 @@ def test_release_refuses_foreign_actor_without_explicit_override() -> None:
         )
 
 
+@pytest.mark.parametrize("role", ["builder", "reviewer"])
+def test_release_claim_omitted_id_posts_landed_using_selected_role(role: str) -> None:
+    client = _claims_client(
+        request("mine", "Ada", issue=72, role=role, branch="lane-72", scope=("src",))
+    )
+
+    released = release_claim(client, 72, "Ada", None, None, None, branch="lane-72")
+    posted = parse_claim_event(client.comments[LEDGER_ISSUE][-1])
+
+    assert released.claim_id == "mine"
+    assert isinstance(posted, ClaimantRelease)
+    assert posted.role == role
+    assert posted.reason == "landed"
+    assert posted.agent == "Ada"
+    assert active_claims(tuple(client.comments[LEDGER_ISSUE])) == ()
+
+
+def test_release_claim_omitted_id_releases_when_foreign_peer_exists_on_issue() -> None:
+    client = _claims_client(
+        request("mine", "Ada", issue=72, role="reviewer", branch="lane-72", scope=("src",)),
+        request(
+            "theirs",
+            "Other",
+            issue=72,
+            role="builder",
+            branch="other-lane",
+            scope=("docs",),
+        ),
+    )
+
+    released = release_claim(client, 72, "Ada", None, None, None, branch="lane-72")
+    standing = active_claims(tuple(client.comments[LEDGER_ISSUE]))
+    posted = parse_claim_event(client.comments[LEDGER_ISSUE][-1])
+
+    assert released.claim_id == "mine"
+    assert [claim.claim_id for claim in standing] == ["theirs"]
+    assert isinstance(posted, ClaimantRelease)
+    assert posted.role == "reviewer"
+    assert posted.reason == "landed"
+
+
+def test_release_claim_omitted_id_uniqueness_is_issue_scoped() -> None:
+    client = _claims_client(
+        request(
+            "on-72", "Ada", issue=72, role="reviewer", branch="lane-72", scope=("src",)
+        ),
+        request(
+            "on-73", "Ada", issue=73, role="reviewer", branch="lane-72", scope=("docs",)
+        ),
+    )
+
+    released = release_claim(client, 72, "Ada", None, None, None, branch="lane-72")
+    standing = active_claims(tuple(client.comments[LEDGER_ISSUE]))
+
+    assert released.claim_id == "on-72"
+    assert [claim.claim_id for claim in standing] == ["on-73"]
+
+
+@pytest.mark.parametrize(
+    ("agent", "branch", "standing"),
+    [
+        (
+            "Other",
+            "lane-72",
+            (
+                request(
+                    "mine",
+                    "Ada",
+                    issue=72,
+                    role="reviewer",
+                    branch="lane-72",
+                    scope=("src",),
+                ),
+            ),
+        ),
+        (
+            "Ada",
+            "other-lane",
+            (
+                request(
+                    "mine",
+                    "Ada",
+                    issue=72,
+                    role="reviewer",
+                    branch="lane-72",
+                    scope=("src",),
+                ),
+            ),
+        ),
+        (
+            "Ada",
+            "lane-72",
+            (
+                request(
+                    "one", "Ada", issue=72, role="reviewer", branch="lane-72", scope=("src",)
+                ),
+                request(
+                    "two", "Ada", issue=72, role="builder", branch="lane-72", scope=("docs",)
+                ),
+            ),
+        ),
+    ],
+)
+def test_release_claim_omitted_id_fails_closed_for_wrong_agent_branch_or_two_matches(
+    agent: str, branch: str, standing: tuple[ClaimRequest, ...]
+) -> None:
+    client = _claims_client(*standing)
+    protocol_count = len(client.list_protocol_candidates(LEDGER_ISSUE))
+
+    with pytest.raises(ClaimUnavailable, match="pass --claim-id") as raised:
+        release_claim(client, 72, agent, None, None, None, branch=branch)
+
+    assert "conflicting claims" not in str(raised.value)
+    assert len(client.list_protocol_candidates(LEDGER_ISSUE)) == protocol_count
+
+
+def test_release_claim_explicit_id_ignores_branch() -> None:
+    client = _claims_client(
+        request("mine", "Ada", issue=72, role="reviewer", branch="lane-72", scope=("src",))
+    )
+
+    released = release_claim(client, 72, "Ada", None, None, "mine", branch="other-lane")
+    posted = parse_claim_event(client.comments[LEDGER_ISSUE][-1])
+
+    assert released.claim_id == "mine"
+    assert isinstance(posted, ClaimantRelease)
+    assert posted.role == "reviewer"
+    assert posted.reason == "landed"
+    assert active_claims(tuple(client.comments[LEDGER_ISSUE])) == ()
+
+
+def test_release_claim_omitted_id_requires_branch_and_does_not_call_git(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unused(arguments: list[str]) -> str:
+        pytest.fail("release_claim must not call git")
+
+    monkeypatch.setattr(issue_claim, "_git_output", unused)
+    client = _claims_client(
+        request("mine", "Ada", issue=72, role="reviewer", branch="lane-72", scope=("src",))
+    )
+
+    with pytest.raises(ClaimUnavailable, match="current branch"):
+        release_claim(client, 72, "Ada", None, None, None)
+    assert len(client.list_protocol_candidates(LEDGER_ISSUE)) == 1
+
+    released = release_claim(client, 72, "Ada", None, None, None, branch="lane-72")
+    assert released.claim_id == "mine"
+
+
+@pytest.mark.parametrize(
+    ("role", "reason"),
+    [
+        ("builder", "takeover"),
+        ("coordinator", None),
+        (None, None),
+        (None, "takeover"),
+    ],
+)
+def test_release_claim_override_fails_before_ledger_without_role_and_reason(
+    role: str | None, reason: str | None
+) -> None:
+    client = FakeComments()
+    expected = "--role coordinator" if role != "coordinator" else "--reason"
+
+    with pytest.raises(ClaimUnavailable, match=expected):
+        release_claim(
+            client,
+            72,
+            "Ada",
+            role,
+            reason,
+            "mine",
+            coordinator_override=True,
+        )
+
+    assert client.comments == {}
+
+
 def test_label_reconciliation_heals_claim_posted_during_release_remove() -> None:
     old_claim_body = claim_comment(request("old", issue=72, scope=("old",)))
     old_claim = parse_claim_event(comment(1, old_claim_body))
@@ -1939,6 +2131,29 @@ def _forbid_git_fill(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(issue_claim, "_git_output", unused)
 
 
+def _patch_release_session(
+    monkeypatch: pytest.MonkeyPatch,
+    client: FakeComments,
+    *,
+    agent: str = "Ada",
+    branch: str | None = "lane-72",
+    forbid_git: bool = False,
+) -> None:
+    _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: agent})
+    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(issue_claim, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    if forbid_git:
+        def unused(arguments: list[str]) -> str:
+            pytest.fail("explicit --claim-id must not inspect checkout branch")
+
+        monkeypatch.setattr(issue_claim, "_git_output", unused)
+        return
+    git_values = {("branch", "--show-current"): branch or ""}
+    monkeypatch.setattr(
+        issue_claim, "_git_output", lambda arguments: git_values[tuple(arguments)]
+    )
+
+
 def _assert_missing_identity_message(message: str) -> None:
     assert "--agent" in message
     assert issue_claim.AGENT_CLAIM_AGENT_ENV in message
@@ -2031,7 +2246,6 @@ def test_claim_request_binds_omitted_base_and_branch_to_checkout(
     "arguments",
     [
         ["claim", "42", "--agent", "Ada", "--role", "builder"],
-        ["release", "42", "--agent", "Ada", "--reason", "landed"],
         [
             "supersede",
             "170",
@@ -2044,11 +2258,24 @@ def test_claim_request_binds_omitted_base_and_branch_to_checkout(
         ],
     ],
 )
-def test_claim_and_release_still_require_role_and_scope(arguments: list[str]) -> None:
+def test_claim_still_requires_scope_and_supersede_still_requires_role(
+    arguments: list[str],
+) -> None:
     with pytest.raises(SystemExit) as exited:
         issue_claim._parser().parse_args(arguments)
 
     assert exited.value.code == 2
+
+
+def test_cli_claim_role_argparse_default_unchanged_and_release_omits_role_reason() -> None:
+    claimed = issue_claim._parser().parse_args(["claim", "42", "--scope", "src/widget.py"])
+    released = issue_claim._parser().parse_args(["release", "42"])
+
+    assert claimed.role == issue_claim.DEFAULT_CLAIM_ROLE
+    assert released.role is None
+    assert released.reason is None
+    assert released.claim_id is None
+    assert released.coordinator_override is False
 
 
 @pytest.mark.parametrize(
@@ -2254,10 +2481,14 @@ def test_invalid_agent_identity_fails_before_git_and_github(
         issue_claim._request(parsed)
 
     _forbid_github_construction(monkeypatch)
-    release = ["release", "72", "--role", "builder", "--reason", "landed"]
+    releases = [
+        ["release", "72"],
+        ["release", "72", "--role", "builder", "--reason", "landed"],
+    ]
     if explicit is not None:
-        release.extend(["--agent", explicit])
-    for argv in (command, release):
+        for argv in releases:
+            argv.extend(["--agent", explicit])
+    for argv in (command, *releases):
         assert issue_claim.main(["--repo", "example/agent-claim", *argv]) == 2
         captured = capsys.readouterr()
         assert captured.out == ""
@@ -2293,6 +2524,7 @@ def test_missing_agent_identity_fails_closed_without_github(
     _forbid_github_construction(monkeypatch)
     for argv in (
         command,
+        ["release", "72"],
         ["release", "72", "--role", "builder", "--reason", "landed"],
     ):
         assert issue_claim.main(["--repo", "example/agent-claim", *argv]) == 2
@@ -2407,6 +2639,199 @@ def test_cli_two_session_claimants_cannot_release_without_extra_comment(
     assert len(client.list_protocol_candidates(LEDGER_ISSUE)) == protocol_count
     standing = active_claims(tuple(client.comments[LEDGER_ISSUE]))
     assert [claim.agent for claim in standing] == ["Grok session-1"]
+
+
+@pytest.mark.parametrize(
+    ("role", "flags", "reason"),
+    [
+        ("builder", (), "landed"),
+        ("reviewer", (), "landed"),
+        ("reviewer", ("--reason", "abandoned"), "abandoned"),
+    ],
+)
+def test_cli_release_omitted_flags_posts_landed_using_selected_claim_role(
+    monkeypatch: pytest.MonkeyPatch, role: str, flags: tuple[str, ...], reason: str
+) -> None:
+    client = _claims_client(
+        request("mine", "Ada", issue=72, role=role, branch="lane-72", scope=("src",))
+    )
+    _patch_release_session(monkeypatch, client)
+
+    released = issue_claim.main(
+        ["--repo", "example/agent-claim", "release", "72", *flags]
+    )
+    posted = parse_claim_event(client.comments[LEDGER_ISSUE][-1])
+
+    assert released == 0
+    assert isinstance(posted, ClaimantRelease)
+    assert posted.claim_id == "mine"
+    assert posted.role == role
+    assert posted.reason == reason
+    assert posted.agent == "Ada"
+    assert active_claims(tuple(client.comments[LEDGER_ISSUE])) == ()
+
+
+def test_cli_release_omitted_claim_id_releases_when_foreign_peer_exists_on_issue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _claims_client(
+        request("mine", "Ada", issue=72, role="reviewer", branch="lane-72", scope=("src",)),
+        request(
+            "theirs",
+            "Other",
+            issue=72,
+            role="builder",
+            branch="other-lane",
+            scope=("docs",),
+        ),
+    )
+    _patch_release_session(monkeypatch, client)
+
+    released = issue_claim.main(["--repo", "example/agent-claim", "release", "72"])
+    standing = active_claims(tuple(client.comments[LEDGER_ISSUE]))
+    posted = parse_claim_event(client.comments[LEDGER_ISSUE][-1])
+
+    assert released == 0
+    assert [claim.claim_id for claim in standing] == ["theirs"]
+    assert isinstance(posted, ClaimantRelease)
+    assert posted.role == "reviewer"
+    assert posted.reason == "landed"
+
+
+@pytest.mark.parametrize(
+    ("agent", "branch", "standing"),
+    [
+        (
+            "Other",
+            "lane-72",
+            (
+                request(
+                    "mine",
+                    "Ada",
+                    issue=72,
+                    role="reviewer",
+                    branch="lane-72",
+                    scope=("src",),
+                ),
+            ),
+        ),
+        (
+            "Ada",
+            "other-lane",
+            (
+                request(
+                    "mine",
+                    "Ada",
+                    issue=72,
+                    role="reviewer",
+                    branch="lane-72",
+                    scope=("src",),
+                ),
+            ),
+        ),
+        (
+            "Ada",
+            "lane-72",
+            (
+                request(
+                    "one", "Ada", issue=72, role="reviewer", branch="lane-72", scope=("src",)
+                ),
+                request(
+                    "two", "Ada", issue=72, role="builder", branch="lane-72", scope=("docs",)
+                ),
+            ),
+        ),
+    ],
+)
+def test_cli_release_wrong_agent_or_branch_or_two_matches_fails_without_post(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    agent: str,
+    branch: str,
+    standing: tuple[ClaimRequest, ...],
+) -> None:
+    client = _claims_client(*standing)
+    _patch_release_session(monkeypatch, client, agent=agent, branch=branch)
+    protocol_count = len(client.list_protocol_candidates(LEDGER_ISSUE))
+
+    released = issue_claim.main(["--repo", "example/agent-claim", "release", "72"])
+    captured = capsys.readouterr()
+
+    assert released == 2
+    assert captured.out == ""
+    assert "ERROR:" in captured.err
+    assert "pass --claim-id" in captured.err
+    assert "conflicting claims" not in captured.err
+    assert len(client.list_protocol_candidates(LEDGER_ISSUE)) == protocol_count
+
+
+def test_cli_release_explicit_claim_id_ignores_checkout_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _claims_client(
+        request("mine", "Ada", issue=72, role="reviewer", branch="lane-72", scope=("src",))
+    )
+    _patch_release_session(monkeypatch, client, forbid_git=True)
+
+    released = issue_claim.main(
+        ["--repo", "example/agent-claim", "release", "72", "--claim-id", "mine"]
+    )
+    posted = parse_claim_event(client.comments[LEDGER_ISSUE][-1])
+
+    assert released == 0
+    assert isinstance(posted, ClaimantRelease)
+    assert posted.role == "reviewer"
+    assert posted.reason == "landed"
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ("--coordinator-override",),
+        ("--coordinator-override", "--role", "builder", "--reason", "takeover"),
+        ("--coordinator-override", "--role", "coordinator"),
+        ("--coordinator-override", "--reason", "takeover"),
+    ],
+)
+def test_cli_release_override_fails_before_git_and_github(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    flags: tuple[str, ...],
+) -> None:
+    _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Ada"})
+    _forbid_github_construction(monkeypatch)
+
+    def unused(arguments: list[str]) -> str:
+        pytest.fail("coordinator override must fail before git")
+
+    monkeypatch.setattr(issue_claim, "_git_output", unused)
+
+    released = issue_claim.main(
+        ["--repo", "example/agent-claim", "release", "72", *flags]
+    )
+    captured = capsys.readouterr()
+
+    assert released == 2
+    assert captured.out == ""
+    assert "ERROR:" in captured.err
+    assert "coordinator override" in captured.err
+
+
+def test_cli_release_omitted_claim_id_fails_closed_on_detached_head(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Ada"})
+    _forbid_github_construction(monkeypatch)
+    monkeypatch.setattr(issue_claim, "_git_output", lambda arguments: "")
+
+    released = issue_claim.main(["--repo", "example/agent-claim", "release", "72"])
+    captured = capsys.readouterr()
+
+    assert released == 2
+    assert captured.out == ""
+    assert "ERROR:" in captured.err
+    assert "pass --claim-id" in captured.err
 
 
 def test_cli_claim_omitted_base_and_branch_posts_filled_checkout(
