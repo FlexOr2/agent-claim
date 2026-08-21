@@ -1909,6 +1909,57 @@ def _git_checkout(
     }
 
 
+def _set_agent_identity_env(
+    monkeypatch: pytest.MonkeyPatch, environ: dict[str, str] | None = None
+) -> None:
+    for name in (
+        issue_claim.AGENT_CLAIM_AGENT_ENV,
+        issue_claim.GROK_SESSION_ID_ENV,
+        issue_claim.CLAUDE_SESSION_ID_ENV,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in (environ or {}).items():
+        monkeypatch.setenv(name, value)
+
+
+def _forbid_github_construction(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unused(*args, **kwargs):
+        pytest.fail("agent identity must be resolved before GitHub")
+
+    monkeypatch.setattr(issue_claim, "GitHubIssueComments", unused)
+    monkeypatch.setattr(issue_claim, "_repository", unused)
+    monkeypatch.setattr(issue_claim, "discover_ledger", unused)
+
+
+def _forbid_git_fill(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unused(arguments: list[str]) -> str:
+        pytest.fail("agent identity must be resolved before git fill")
+
+    monkeypatch.setattr(issue_claim, "_git_output", unused)
+
+
+def _assert_missing_identity_message(message: str) -> None:
+    assert "--agent" in message
+    assert issue_claim.AGENT_CLAIM_AGENT_ENV in message
+    assert issue_claim.GROK_SESSION_ID_ENV in message
+    assert issue_claim.CLAUDE_SESSION_ID_ENV in message
+    assert "GROK_AGENT" not in message
+
+
+def _claim_without_agent_args(*flags: str) -> list[str]:
+    return [
+        "claim",
+        "72",
+        "--role",
+        "builder",
+        "--scope",
+        "src",
+        "--claim-id",
+        "cli-claim",
+        *flags,
+    ]
+
+
 def _parse_claim_command(*flags: str):
     return issue_claim._parser().parse_args(
         [
@@ -1978,16 +2029,287 @@ def test_claim_request_binds_omitted_base_and_branch_to_checkout(
 @pytest.mark.parametrize(
     "arguments",
     [
-        ["claim", "42", "--role", "builder", "--scope", "src/widget.py"],
         ["claim", "42", "--agent", "Ada", "--scope", "src/widget.py"],
         ["claim", "42", "--agent", "Ada", "--role", "builder"],
+        ["release", "42", "--agent", "Ada", "--reason", "landed"],
     ],
 )
-def test_claim_still_requires_agent_role_and_scope(arguments: list[str]) -> None:
+def test_claim_and_release_still_require_role_and_scope(arguments: list[str]) -> None:
     with pytest.raises(SystemExit) as exited:
         issue_claim._parser().parse_args(arguments)
 
     assert exited.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["claim", "42", "--role", "builder", "--scope", "src/widget.py"],
+        ["release", "42", "--role", "builder", "--reason", "landed"],
+    ],
+)
+def test_claim_and_release_parse_omitted_agent(
+    monkeypatch: pytest.MonkeyPatch, arguments: list[str]
+) -> None:
+    _set_agent_identity_env(monkeypatch)
+    parsed = issue_claim._parser().parse_args(arguments)
+    assert parsed.agent is None
+
+
+def test_supersede_still_requires_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_agent_identity_env(monkeypatch)
+    with pytest.raises(SystemExit) as exited:
+        issue_claim._parser().parse_args(
+            [
+                "supersede",
+                "170",
+                "--role",
+                "coordinator",
+                "--reason",
+                "reviewed successor ready",
+                "--claim-id",
+                "cli-claim",
+            ]
+        )
+
+    assert exited.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("explicit", "environ", "agent"),
+    [
+        (
+            "Ada",
+            {
+                "AGENT_CLAIM_AGENT": "Other",
+                "GROK_SESSION_ID": "grok-session",
+                "CLAUDE_SESSION_ID": "claude-session",
+            },
+            "Ada",
+        ),
+        (None, {"AGENT_CLAIM_AGENT": "Ada"}, "Ada"),
+        (None, {"AGENT_CLAIM_AGENT": "", "GROK_SESSION_ID": "sess-1"}, "Grok sess-1"),
+        (
+            None,
+            {"GROK_SESSION_ID": "sess-1", "CLAUDE_SESSION_ID": "sess-2"},
+            "Grok sess-1",
+        ),
+        (None, {"CLAUDE_SESSION_ID": "sess-2"}, "Claude sess-2"),
+        (
+            None,
+            {
+                "AGENT_CLAIM_AGENT": "",
+                "GROK_SESSION_ID": "",
+                "CLAUDE_SESSION_ID": "sess-2",
+            },
+            "Claude sess-2",
+        ),
+    ],
+)
+def test_request_and_cli_claim_fill_agent_from_documented_else_chain(
+    monkeypatch: pytest.MonkeyPatch,
+    explicit: str | None,
+    environ: dict[str, str],
+    agent: str,
+) -> None:
+    _set_agent_identity_env(monkeypatch, environ)
+    git_values = _git_checkout()
+    monkeypatch.setattr(
+        issue_claim, "_git_output", lambda arguments: git_values[tuple(arguments)]
+    )
+    command = _claim_without_agent_args()
+    if explicit is not None:
+        command.extend(["--agent", explicit])
+    parsed = issue_claim._parser().parse_args(command)
+    assert issue_claim._request(parsed).agent == agent
+
+    client = FakeComments()
+    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(issue_claim, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    assert issue_claim.main(["--repo", "example/agent-claim", *command]) == 0
+    posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])
+    assert isinstance(posted, ActiveClaim)
+    assert posted.agent == agent
+
+
+@pytest.mark.parametrize(
+    ("explicit", "environ"),
+    [
+        ("", {"AGENT_CLAIM_AGENT": "Ada"}),
+        (None, {"AGENT_CLAIM_AGENT": " ", "GROK_SESSION_ID": "sess-1"}),
+        (None, {"GROK_SESSION_ID": "bad\nid", "CLAUDE_SESSION_ID": "sess-2"}),
+        (None, {"GROK_SESSION_ID": "x" * 200, "CLAUDE_SESSION_ID": "sess-2"}),
+    ],
+)
+def test_invalid_agent_identity_fails_before_git_and_github(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    explicit: str | None,
+    environ: dict[str, str],
+) -> None:
+    _set_agent_identity_env(monkeypatch, environ)
+    _forbid_git_fill(monkeypatch)
+    command = _claim_without_agent_args()
+    if explicit is not None:
+        command.extend(["--agent", explicit])
+    parsed = issue_claim._parser().parse_args(command)
+    with pytest.raises(ClaimError, match="agent must be one bounded non-empty line"):
+        issue_claim._request(parsed)
+
+    _forbid_github_construction(monkeypatch)
+    release = ["release", "72", "--role", "builder", "--reason", "landed"]
+    if explicit is not None:
+        release.extend(["--agent", explicit])
+    for argv in (command, release):
+        assert issue_claim.main(["--repo", "example/agent-claim", *argv]) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "ERROR:" in captured.err
+        assert "agent must be one bounded non-empty line" in captured.err
+
+
+@pytest.mark.parametrize(
+    "environ",
+    [
+        {},
+        {
+            "AGENT_CLAIM_AGENT": "",
+            "GROK_SESSION_ID": "",
+            "CLAUDE_SESSION_ID": "",
+        },
+        {"GROK_AGENT": "should-not-fill"},
+    ],
+)
+def test_missing_agent_identity_fails_closed_without_github(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    environ: dict[str, str],
+) -> None:
+    _set_agent_identity_env(monkeypatch, environ)
+    _forbid_git_fill(monkeypatch)
+    command = _claim_without_agent_args()
+    parsed = issue_claim._parser().parse_args(command)
+    with pytest.raises(ClaimError) as raised:
+        issue_claim._request(parsed)
+    _assert_missing_identity_message(str(raised.value))
+
+    _forbid_github_construction(monkeypatch)
+    for argv in (
+        command,
+        ["release", "72", "--role", "builder", "--reason", "landed"],
+    ):
+        assert issue_claim.main(["--repo", "example/agent-claim", *argv]) == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.startswith("ERROR:")
+        _assert_missing_identity_message(captured.err)
+
+
+def test_cli_same_filled_agent_can_claim_and_release_without_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_agent_identity_env(monkeypatch, {"GROK_SESSION_ID": "session-1"})
+    client = FakeComments()
+    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(issue_claim, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(issue_claim, "_validate_checkout", lambda request: None)
+
+    claimed = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--role",
+            "builder",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "src",
+            "--claim-id",
+            "cli-claim",
+        ]
+    )
+    released = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "release",
+            "72",
+            "--role",
+            "builder",
+            "--reason",
+            "landed",
+            "--claim-id",
+            "cli-claim",
+        ]
+    )
+
+    assert (claimed, released) == (0, 0)
+    posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])
+    assert isinstance(posted, ActiveClaim)
+    assert posted.agent == "Grok session-1"
+    assert active_claims(tuple(client.comments[LEDGER_ISSUE])) == ()
+
+
+def test_cli_two_session_claimants_cannot_release_without_extra_comment(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_agent_identity_env(monkeypatch, {"GROK_SESSION_ID": "session-1"})
+    client = FakeComments()
+    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(issue_claim, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(issue_claim, "_validate_checkout", lambda request: None)
+
+    assert (
+        issue_claim.main(
+            [
+                "--repo",
+                "example/agent-claim",
+                "claim",
+                "72",
+                "--role",
+                "builder",
+                "--base",
+                BASE,
+                "--branch",
+                "codex/issue-72",
+                "--scope",
+                "src",
+                "--claim-id",
+                "cli-claim",
+            ]
+        )
+        == 0
+    )
+    protocol_count = len(client.list_protocol_candidates(LEDGER_ISSUE))
+    capsys.readouterr()
+
+    _set_agent_identity_env(monkeypatch, {"CLAUDE_SESSION_ID": "session-2"})
+    released = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "release",
+            "72",
+            "--role",
+            "builder",
+            "--reason",
+            "landed",
+            "--claim-id",
+            "cli-claim",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert released == 2
+    assert "original claimant" in captured.err
+    assert len(client.list_protocol_candidates(LEDGER_ISSUE)) == protocol_count
+    standing = active_claims(tuple(client.comments[LEDGER_ISSUE]))
+    assert [claim.agent for claim in standing] == ["Grok session-1"]
 
 
 def test_cli_claim_omitted_base_and_branch_posts_filled_checkout(

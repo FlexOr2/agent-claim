@@ -27,6 +27,11 @@ agent-claim reconcile
 ```
 
 Omitted `--base`/`--branch` bind the current checkout; explicit values must match it.
+Omitted `--agent` on `claim` and `release` is filled from non-empty
+`AGENT_CLAIM_AGENT`, else non-empty `GROK_SESSION_ID` as `Grok {session}`, else
+non-empty `CLAUDE_SESSION_ID` as `Claude {session}`. `GROK_AGENT` is not a name.
+Missing or present-invalid identity fails closed before GitHub work. `--role`
+stays required. `supersede` still requires `--agent`.
 
 Run commands in the repository being coordinated, or pass `--repo
 OWNER/REPOSITORY`. A claim must begin from a clean linked worktree and binds its
@@ -53,6 +58,6 @@ is already present. Never overwrite an existing loader. The CLI does not write
 ## v0.2 boundary
 
 GitHub via the `gh` CLI is supported today. The tool does not automatically
-allocate work, merge code, operate a lease server, or infer an agent identity.
-It intentionally leaves policy-file generation and non-GitHub adapters for a
-later release.
+allocate work, merge code, or operate a lease server. Omitted `--agent` follows
+the documented else-chain; it does not invent an identity. It intentionally
+leaves policy-file generation and non-GitHub adapters for a later release.

@@ -1647,7 +1647,31 @@ def _validate_checkout(request: ClaimRequest) -> None:
         raise ClaimError("claim must be acquired before the first worktree edit")
 
 
+AGENT_CLAIM_AGENT_ENV = "AGENT_CLAIM_AGENT"
+GROK_SESSION_ID_ENV = "GROK_SESSION_ID"
+CLAUDE_SESSION_ID_ENV = "CLAUDE_SESSION_ID"
+
+
+def _resolved_agent(explicit: str | None) -> str:
+    if explicit is not None:
+        return _outbound_text(explicit, "agent", maximum=128)
+    configured = os.environ.get(AGENT_CLAIM_AGENT_ENV)
+    if configured:
+        return _outbound_text(configured, "agent", maximum=128)
+    grok_session = os.environ.get(GROK_SESSION_ID_ENV)
+    if grok_session:
+        return _outbound_text(f"Grok {grok_session}", "agent", maximum=128)
+    claude_session = os.environ.get(CLAUDE_SESSION_ID_ENV)
+    if claude_session:
+        return _outbound_text(f"Claude {claude_session}", "agent", maximum=128)
+    raise ClaimError(
+        "agent identity is required: pass --agent or set "
+        f"{AGENT_CLAIM_AGENT_ENV}, {GROK_SESSION_ID_ENV}, or {CLAUDE_SESSION_ID_ENV}"
+    )
+
+
 def _request(arguments: argparse.Namespace) -> ClaimRequest:
+    agent = _resolved_agent(arguments.agent)
     if arguments.base is None:
         base = _git_output(["rev-parse", "HEAD"])
     else:
@@ -1658,7 +1682,7 @@ def _request(arguments: argparse.Namespace) -> ClaimRequest:
         branch = arguments.branch
     payload: dict[str, object] = {
         "action": "claim",
-        "agent": arguments.agent,
+        "agent": agent,
         "base": base,
         "branch": branch,
         "claim_id": arguments.claim_id or uuid.uuid4().hex,
@@ -1670,7 +1694,7 @@ def _request(arguments: argparse.Namespace) -> ClaimRequest:
         1,
         "2026-01-01T00:00:00Z",
         "2026-01-01T00:00:00Z",
-        f"{_marker(payload)}\n\nAgent: {arguments.agent} ({arguments.role})",
+        f"{_marker(payload)}\n\nAgent: {agent} ({arguments.role})",
         "OWNER",
         "https://github.com/local/request",
     )
@@ -1703,7 +1727,7 @@ def _parser() -> argparse.ArgumentParser:
 
     claim = commands.add_parser("claim", help="claim an issue and scope before editing")
     claim.add_argument("issue", type=int)
-    claim.add_argument("--agent", required=True)
+    claim.add_argument("--agent")
     claim.add_argument("--role", required=True)
     claim.add_argument("--base")
     claim.add_argument("--branch")
@@ -1712,7 +1736,7 @@ def _parser() -> argparse.ArgumentParser:
 
     release = commands.add_parser("release", help="release a landed or abandoned claim")
     release.add_argument("issue", type=int)
-    release.add_argument("--agent", required=True)
+    release.add_argument("--agent")
     release.add_argument("--role", required=True)
     release.add_argument("--reason", required=True)
     release.add_argument("--claim-id")
@@ -1769,6 +1793,8 @@ def main(arguments: list[str] | None = None) -> int:
         print(POLICY_LOADER)
         return 0
     try:
+        if parsed.command in {"claim", "release"}:
+            parsed.agent = _resolved_agent(parsed.agent)
         client = GitHubIssueComments(_repository(parsed.repo))
         if parsed.command == "bootstrap":
             ledger = bootstrap_ledger(client)
