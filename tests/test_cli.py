@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_claim import checkout, discovery, github, protocol
 from agent_claim import cli as issue_claim
 from agent_claim.cli import (  # noqa: E402
     MAX_COMMENT_BYTES,
@@ -239,8 +240,8 @@ class FakeComments:
         )
 
     def post_comment(self, issue: int, body: str) -> str:
-        if issue == LEDGER_ISSUE and self.inject_before_next_ledger_post is not None:
-            self.comments.setdefault(LEDGER_ISSUE, []).append(
+        if issue == protocol.LEDGER_ISSUE and self.inject_before_next_ledger_post is not None:
+            self.comments.setdefault(protocol.LEDGER_ISSUE, []).append(
                 self.inject_before_next_ledger_post
             )
             self.inject_before_next_ledger_post = None
@@ -254,8 +255,8 @@ class FakeComments:
         ) + 1
         posted = comment(identifier, body)
         self.comments.setdefault(issue, []).append(posted)
-        if issue == LEDGER_ISSUE and self.inject_after_next_ledger_post is not None:
-            self.comments.setdefault(LEDGER_ISSUE, []).append(
+        if issue == protocol.LEDGER_ISSUE and self.inject_after_next_ledger_post is not None:
+            self.comments.setdefault(protocol.LEDGER_ISSUE, []).append(
                 self.inject_after_next_ledger_post
             )
             self.inject_after_next_ledger_post = None
@@ -266,7 +267,7 @@ class FakeComments:
         if self.fail_add_label:
             raise ClaimError("label add failed")
         if self.inject_during_next_add is not None:
-            self.comments.setdefault(LEDGER_ISSUE, []).append(self.inject_during_next_add)
+            self.comments.setdefault(protocol.LEDGER_ISSUE, []).append(self.inject_during_next_add)
             self.inject_during_next_add = None
         self.labels.add(issue)
 
@@ -275,7 +276,7 @@ class FakeComments:
         if self.fail_remove_label:
             raise ClaimError("label remove failed")
         if self.inject_during_next_remove is not None:
-            self.comments.setdefault(LEDGER_ISSUE, []).append(
+            self.comments.setdefault(protocol.LEDGER_ISSUE, []).append(
                 self.inject_during_next_remove
             )
             self.labels.add(self.inject_during_next_remove_event.issue)
@@ -323,10 +324,10 @@ class FakeComments:
         adoptable_projections = [
             entry
             for entry in all_projections
-            if (issue_claim._projection_ledger(entry) or 0) <= issue_claim.LEDGER_ISSUE
+            if (issue_claim._projection_ledger(entry) or 0) <= protocol.LEDGER_ISSUE
         ]
         has_newer_projection = any(
-            (issue_claim._projection_ledger(entry) or 0) > issue_claim.LEDGER_ISSUE
+            (issue_claim._projection_ledger(entry) or 0) > protocol.LEDGER_ISSUE
             for entry in all_projections
         )
         if adopt_stale and adoptable_projections:
@@ -904,7 +905,7 @@ def test_status_scope_index_never_rescans_scope_pairs(
     def scope_pair_scan(*args, **kwargs):
         pytest.fail("status must use its single scope index")
 
-    monkeypatch.setattr(issue_claim, "claims_conflict", scope_pair_scan)
+    monkeypatch.setattr(protocol, "claims_conflict", scope_pair_scan)
 
     assert _status(tuple(claims), None) == 0
     assert capsys.readouterr().out.count("CLAIMED") == 50
@@ -945,7 +946,7 @@ def test_owning_issue_projection_uses_the_configured_ledger_number(
 ) -> None:
     claimed = parse_claim_event(comment(1, claim_comment(request(issue=72))))
     assert isinstance(claimed, ActiveClaim)
-    monkeypatch.setattr(issue_claim, "LEDGER_ISSUE", 170)
+    monkeypatch.setattr(protocol, "LEDGER_ISSUE", 170)
 
     projection = issue_claim._active_projection(claimed)
 
@@ -1071,12 +1072,12 @@ def test_claim_labels_are_isolated_by_ledger_generation() -> None:
 def test_successor_adopts_old_projection_but_old_helper_cannot_mutate_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(issue_claim, "LEDGER_ISSUE", 71)
+    monkeypatch.setattr(protocol, "LEDGER_ISSUE", 71)
     old_projection = comment(1, issue_claim._unclaimed_projection())
     old_duplicate = replace(old_projection, identifier=2)
     client = FakeComments({72: [old_projection, old_duplicate]})
 
-    monkeypatch.setattr(issue_claim, "LEDGER_ISSUE", 170)
+    monkeypatch.setattr(protocol, "LEDGER_ISSUE", 170)
     successor_body = issue_claim._active_projection(
         ActiveClaim(
             72,
@@ -1093,7 +1094,7 @@ def test_successor_adopts_old_projection_but_old_helper_cannot_mutate_it(
     assert len(client.comments[72]) == 1
     assert "ledger=170" in client.comments[72][0].body.partition("\n")[0]
 
-    monkeypatch.setattr(issue_claim, "LEDGER_ISSUE", 71)
+    monkeypatch.setattr(protocol, "LEDGER_ISSUE", 71)
     with pytest.raises(ClaimError, match="newer ledger generation"):
         client.upsert_projection(72, issue_claim._unclaimed_projection(), create=False)
     assert len(client.comments[72]) == 1
@@ -1252,7 +1253,7 @@ def test_release_claim_omitted_id_requires_branch_and_does_not_call_git(
     def unused(arguments: list[str]) -> str:
         pytest.fail("release_claim must not call git")
 
-    monkeypatch.setattr(issue_claim, "_git_output", unused)
+    monkeypatch.setattr(checkout, "_git_output", unused)
     client = _claims_client(
         request("mine", "Ada", issue=72, role="reviewer", branch="lane-72", scope=("src",))
     )
@@ -1399,7 +1400,7 @@ def test_old_reconcile_clears_only_its_generation_label_after_freeze() -> None:
 def test_paused_old_release_fails_frozen_without_mutating_successor_projection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(issue_claim, "LEDGER_ISSUE", 71)
+    monkeypatch.setattr(protocol, "LEDGER_ISSUE", 71)
     client = FakeComments(valid_successors={170})
     old_claim = acquire_claim(client, request("old", issue=72, scope=("old",)))
     client.post_comment(
@@ -1419,7 +1420,7 @@ def test_paused_old_release_fails_frozen_without_mutating_successor_projection(
         rollover.claim_id,
     )
 
-    monkeypatch.setattr(issue_claim, "LEDGER_ISSUE", 170)
+    monkeypatch.setattr(protocol, "LEDGER_ISSUE", 170)
     acquire_claim(
         client,
         request("successor", "Grok 4.6", issue=72, scope=("new",)),
@@ -1428,7 +1429,7 @@ def test_paused_old_release_fails_frozen_without_mutating_successor_projection(
     client.other_labels[claim_label(170)] = set(client.labels)
     client.labels.clear()
 
-    monkeypatch.setattr(issue_claim, "LEDGER_ISSUE", 71)
+    monkeypatch.setattr(protocol, "LEDGER_ISSUE", 71)
     with pytest.raises(LedgerSuperseded, match="successor #170"):
         reconcile_issue_label(client, 72)
 
@@ -1501,7 +1502,7 @@ def test_github_comment_reader_accepts_paginated_json_lines(
         "html_url": "https://github.com/example/agent-claim/issues/71#issuecomment-12",
     }
     client = GitHubIssueComments("example/agent-claim")
-    monkeypatch.setattr(issue_claim, "COMMENTS_PER_PAGE", 2)
+    monkeypatch.setattr(github, "COMMENTS_PER_PAGE", 2)
 
     def page(arguments: list[str]) -> str:
         endpoint = arguments[1]
@@ -1638,9 +1639,9 @@ def test_github_successor_adopts_stale_projection_but_old_generation_skips_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = GitHubIssueComments("example/agent-claim")
-    monkeypatch.setattr(issue_claim, "LEDGER_ISSUE", 71)
+    monkeypatch.setattr(protocol, "LEDGER_ISSUE", 71)
     stale = comment(10, issue_claim._unclaimed_projection())
-    monkeypatch.setattr(issue_claim, "LEDGER_ISSUE", 171)
+    monkeypatch.setattr(protocol, "LEDGER_ISSUE", 171)
     future = comment(11, issue_claim._unclaimed_projection())
     monkeypatch.setattr(client, "_projection_comments", lambda issue: (stale, future))
     observed: list[tuple[list[str], bytes | None]] = []
@@ -1650,7 +1651,7 @@ def test_github_successor_adopts_stale_projection_but_old_generation_skips_it(
         return ""
 
     monkeypatch.setattr(client, "_run", run)
-    monkeypatch.setattr(issue_claim, "LEDGER_ISSUE", 170)
+    monkeypatch.setattr(protocol, "LEDGER_ISSUE", 170)
     successor_body = issue_claim._unclaimed_projection()
 
     assert client.upsert_projection(72, successor_body, adopt_stale=True)
@@ -1668,7 +1669,7 @@ def test_github_successor_adopts_stale_projection_but_old_generation_skips_it(
         )
     ]
 
-    monkeypatch.setattr(issue_claim, "LEDGER_ISSUE", 71)
+    monkeypatch.setattr(protocol, "LEDGER_ISSUE", 71)
     successor = replace(stale, body=successor_body)
     monkeypatch.setattr(client, "_projection_comments", lambda issue: (successor,))
     observed.clear()
@@ -1807,7 +1808,7 @@ def test_repository_falls_back_to_standard_github_remote(
 def test_bounded_command_stops_before_unbounded_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(issue_claim, "MAX_COMMAND_OUTPUT_BYTES", 32)
+    monkeypatch.setattr(github, "MAX_COMMAND_OUTPUT_BYTES", 32)
 
     with pytest.raises(ClaimError, match="output limit"):
         issue_claim._bounded_command(
@@ -1844,7 +1845,7 @@ def test_bounded_command_wraps_stdin_write_errors(
     def cannot_write(*args, **kwargs):
         raise OSError(5, "Input/output error")
 
-    monkeypatch.setattr(issue_claim.os, "write", cannot_write)
+    monkeypatch.setattr(github.os, "write", cannot_write)
 
     with pytest.raises(ClaimError, match="failed while sending bounded input"):
         issue_claim._bounded_command(
@@ -1869,7 +1870,7 @@ def test_bounded_command_reaps_child_when_selector_setup_fails(
         raise OSError(5, "selector failed")
 
     monkeypatch.setattr(subprocess, "Popen", start)
-    monkeypatch.setattr(issue_claim.selectors, "DefaultSelector", cannot_select)
+    monkeypatch.setattr(github.selectors, "DefaultSelector", cannot_select)
 
     with pytest.raises(ClaimError, match="failed while coordinating I/O"):
         issue_claim._bounded_command(
@@ -1913,7 +1914,7 @@ def test_bounded_command_reaps_child_when_select_fails(
             self.closed = True
 
     monkeypatch.setattr(subprocess, "Popen", start)
-    monkeypatch.setattr(issue_claim.selectors, "DefaultSelector", FailingSelector)
+    monkeypatch.setattr(github.selectors, "DefaultSelector", FailingSelector)
 
     with pytest.raises(ClaimError, match="failed while waiting for I/O"):
         issue_claim._bounded_command(
@@ -1932,7 +1933,7 @@ def test_bounded_command_reaps_child_when_output_read_fails(
 ) -> None:
     observed: dict[str, subprocess.Popen[bytes]] = {}
     original_popen = subprocess.Popen
-    original_read = issue_claim.os.read
+    original_read = github.os.read
 
     def start(*arguments, **kwargs):
         process = original_popen(*arguments, **kwargs)
@@ -1950,7 +1951,7 @@ def test_bounded_command_reaps_child_when_output_read_fails(
         return original_read(file_descriptor, count)
 
     monkeypatch.setattr(subprocess, "Popen", start)
-    monkeypatch.setattr(issue_claim.os, "read", cannot_read)
+    monkeypatch.setattr(github.os, "read", cannot_read)
 
     with pytest.raises(ClaimError, match="failed while reading output"):
         issue_claim._bounded_command(
@@ -1996,7 +1997,7 @@ def test_bounded_command_reaps_child_on_cancellation(
             pass
 
     monkeypatch.setattr(subprocess, "Popen", start)
-    monkeypatch.setattr(issue_claim.selectors, "DefaultSelector", CancellingSelector)
+    monkeypatch.setattr(github.selectors, "DefaultSelector", CancellingSelector)
 
     with pytest.raises(CancellationSentinel):
         issue_claim._bounded_command(
@@ -2019,7 +2020,7 @@ def test_checkout_validation_binds_clean_head_and_branch(
         ("rev-parse", "--git-common-dir"): "/repo/.git",
         ("status", "--porcelain"): "",
     }
-    monkeypatch.setattr(issue_claim, "_git_output", lambda arguments: values[tuple(arguments)])
+    monkeypatch.setattr(checkout, "_git_output", lambda arguments: values[tuple(arguments)])
 
     issue_claim._validate_checkout(request())
 
@@ -2079,7 +2080,7 @@ def test_checkout_validation_rejects_false_or_late_claims(
     values: dict[tuple[str, str], str],
     message: str,
 ) -> None:
-    monkeypatch.setattr(issue_claim, "_git_output", lambda arguments: values[tuple(arguments)])
+    monkeypatch.setattr(checkout, "_git_output", lambda arguments: values[tuple(arguments)])
 
     with pytest.raises(ClaimError, match=message):
         issue_claim._validate_checkout(candidate)
@@ -2119,16 +2120,16 @@ def _forbid_github_construction(monkeypatch: pytest.MonkeyPatch) -> None:
     def unused(*args, **kwargs):
         pytest.fail("agent identity must be resolved before GitHub")
 
-    monkeypatch.setattr(issue_claim, "GitHubIssueComments", unused)
-    monkeypatch.setattr(issue_claim, "_repository", unused)
-    monkeypatch.setattr(issue_claim, "discover_ledger", unused)
+    monkeypatch.setattr(github, "GitHubIssueComments", unused)
+    monkeypatch.setattr(checkout, "_repository", unused)
+    monkeypatch.setattr(discovery, "discover_ledger", unused)
 
 
 def _forbid_git_fill(monkeypatch: pytest.MonkeyPatch) -> None:
     def unused(arguments: list[str]) -> str:
         pytest.fail("agent identity must be resolved before git fill")
 
-    monkeypatch.setattr(issue_claim, "_git_output", unused)
+    monkeypatch.setattr(checkout, "_git_output", unused)
 
 
 def _patch_release_session(
@@ -2140,17 +2141,17 @@ def _patch_release_session(
     forbid_git: bool = False,
 ) -> None:
     _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: agent})
-    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
-    monkeypatch.setattr(issue_claim, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     if forbid_git:
         def unused(arguments: list[str]) -> str:
             pytest.fail("explicit --claim-id must not inspect checkout branch")
 
-        monkeypatch.setattr(issue_claim, "_git_output", unused)
+        monkeypatch.setattr(checkout, "_git_output", unused)
         return
     git_values = {("branch", "--show-current"): branch or ""}
     monkeypatch.setattr(
-        issue_claim, "_git_output", lambda arguments: git_values[tuple(arguments)]
+        checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
     )
 
 
@@ -2224,7 +2225,7 @@ def test_claim_request_binds_omitted_base_and_branch_to_checkout(
     error: str | None,
 ) -> None:
     monkeypatch.setattr(
-        issue_claim, "_git_output", lambda arguments: git_values[tuple(arguments)]
+        checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
     )
     parsed = _parse_claim_command(*flags)
     if "--base" not in flags:
@@ -2292,9 +2293,9 @@ def test_cli_claim_omitted_role_posts_default_and_explicit_wins(
     role: str,
 ) -> None:
     client = FakeComments()
-    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
-    monkeypatch.setattr(issue_claim, "discover_ledger", lambda _client: LEDGER_ISSUE)
-    monkeypatch.setattr(issue_claim, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
 
     claimed = issue_claim.main(
         [
@@ -2327,9 +2328,9 @@ def test_cli_claim_empty_role_fails_closed_without_posting_builder(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     client = FakeComments()
-    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
-    monkeypatch.setattr(issue_claim, "discover_ledger", lambda _client: LEDGER_ISSUE)
-    monkeypatch.setattr(issue_claim, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     argv = [
         "--repo",
         "example/agent-claim",
@@ -2439,7 +2440,7 @@ def test_request_and_cli_claim_fill_agent_from_documented_else_chain(
     _set_agent_identity_env(monkeypatch, environ)
     git_values = _git_checkout()
     monkeypatch.setattr(
-        issue_claim, "_git_output", lambda arguments: git_values[tuple(arguments)]
+        checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
     )
     command = _claim_without_agent_args()
     if explicit is not None:
@@ -2448,8 +2449,8 @@ def test_request_and_cli_claim_fill_agent_from_documented_else_chain(
     assert issue_claim._request(parsed).agent == agent
 
     client = FakeComments()
-    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
-    monkeypatch.setattr(issue_claim, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     assert issue_claim.main(["--repo", "example/agent-claim", *command]) == 0
     posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])
     assert isinstance(posted, ActiveClaim)
@@ -2539,9 +2540,9 @@ def test_cli_same_filled_agent_can_claim_and_release_without_flag(
 ) -> None:
     _set_agent_identity_env(monkeypatch, {"GROK_SESSION_ID": "session-1"})
     client = FakeComments()
-    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
-    monkeypatch.setattr(issue_claim, "discover_ledger", lambda _client: LEDGER_ISSUE)
-    monkeypatch.setattr(issue_claim, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
 
     claimed = issue_claim.main(
         [
@@ -2589,9 +2590,9 @@ def test_cli_two_session_claimants_cannot_release_without_extra_comment(
 ) -> None:
     _set_agent_identity_env(monkeypatch, {"GROK_SESSION_ID": "session-1"})
     client = FakeComments()
-    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
-    monkeypatch.setattr(issue_claim, "discover_ledger", lambda _client: LEDGER_ISSUE)
-    monkeypatch.setattr(issue_claim, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
 
     assert (
         issue_claim.main(
@@ -2804,7 +2805,7 @@ def test_cli_release_override_fails_before_git_and_github(
     def unused(arguments: list[str]) -> str:
         pytest.fail("coordinator override must fail before git")
 
-    monkeypatch.setattr(issue_claim, "_git_output", unused)
+    monkeypatch.setattr(checkout, "_git_output", unused)
 
     released = issue_claim.main(
         ["--repo", "example/agent-claim", "release", "72", *flags]
@@ -2823,7 +2824,7 @@ def test_cli_release_omitted_claim_id_fails_closed_on_detached_head(
 ) -> None:
     _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Ada"})
     _forbid_github_construction(monkeypatch)
-    monkeypatch.setattr(issue_claim, "_git_output", lambda arguments: "")
+    monkeypatch.setattr(checkout, "_git_output", lambda arguments: "")
 
     released = issue_claim.main(["--repo", "example/agent-claim", "release", "72"])
     captured = capsys.readouterr()
@@ -2840,10 +2841,10 @@ def test_cli_claim_omitted_base_and_branch_posts_filled_checkout(
 ) -> None:
     client = FakeComments()
     git_values = _git_checkout()
-    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
-    monkeypatch.setattr(issue_claim, "discover_ledger", lambda client: LEDGER_ISSUE)
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda client: LEDGER_ISSUE)
     monkeypatch.setattr(
-        issue_claim, "_git_output", lambda arguments: git_values[tuple(arguments)]
+        checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
     )
 
     claimed = issue_claim.main(
@@ -2877,9 +2878,9 @@ def test_cli_status_claim_release_and_adapter_error_exit_codes(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     client = FakeComments()
-    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
-    monkeypatch.setattr(issue_claim, "discover_ledger", lambda client: LEDGER_ISSUE)
-    monkeypatch.setattr(issue_claim, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
 
     claimed = issue_claim.main(
         [
@@ -2923,7 +2924,7 @@ def test_cli_status_claim_release_and_adapter_error_exit_codes(
     assert "CLAIMED issue #72" in capsys.readouterr().out
 
     monkeypatch.setattr(
-        issue_claim,
+        github,
         "GitHubIssueComments",
         lambda repository: (_ for _ in ()).throw(ClaimError("adapter failed")),
     )
@@ -2937,8 +2938,8 @@ def _patch_status_cli(
     *,
     ledger: int | None = LEDGER_ISSUE,
 ) -> None:
-    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
-    monkeypatch.setattr(issue_claim, "discover_ledger", lambda _client: ledger)
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: ledger)
 
 
 def test_cli_status_empty_ledger_prints_ledger_then_unclaimed_repository(
@@ -2966,7 +2967,7 @@ def test_cli_status_after_claim_prints_ledger_then_claimed(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _patch_status_cli(monkeypatch, FakeComments())
-    monkeypatch.setattr(issue_claim, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
 
     assert (
         issue_claim.main(
@@ -3097,7 +3098,7 @@ def test_cli_status_json_after_claim_prints_claimed_object(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _patch_status_cli(monkeypatch, FakeComments())
-    monkeypatch.setattr(issue_claim, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
 
     assert (
         issue_claim.main(
@@ -3273,8 +3274,8 @@ def test_cli_supersede_freezes_the_drained_ledger_and_prints_the_contract_line(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     client = FakeComments(valid_successors={170})
-    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
-    monkeypatch.setattr(issue_claim, "discover_ledger", lambda client: LEDGER_ISSUE)
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda client: LEDGER_ISSUE)
     acquired = acquire_claim(client, request(issue=LEDGER_ISSUE))
 
     frozen = issue_claim.main(
@@ -3313,8 +3314,8 @@ def test_cli_supersede_fails_closed_without_mutating_protocol_candidates(
     failure: str,
 ) -> None:
     client = FakeComments(valid_successors={170})
-    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
-    monkeypatch.setattr(issue_claim, "discover_ledger", lambda client: LEDGER_ISSUE)
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda client: LEDGER_ISSUE)
     acquired = acquire_claim(client, request(issue=LEDGER_ISSUE))
     if failure == "drain":
         acquire_claim(client, request("other", issue=72, scope=("frontend",)))
@@ -3347,9 +3348,9 @@ def forbid_github_for_policy(monkeypatch: pytest.MonkeyPatch) -> None:
     def unused(*args, **kwargs):
         pytest.fail("policy must not use GitHub")
 
-    monkeypatch.setattr(issue_claim, "GitHubIssueComments", unused)
-    monkeypatch.setattr(issue_claim, "_repository", unused)
-    monkeypatch.setattr(issue_claim, "discover_ledger", unused)
+    monkeypatch.setattr(github, "GitHubIssueComments", unused)
+    monkeypatch.setattr(checkout, "_repository", unused)
+    monkeypatch.setattr(discovery, "discover_ledger", unused)
 
 
 @pytest.mark.parametrize(
@@ -3449,7 +3450,7 @@ def _patch_protect_git(
             pytest.fail("protect must not bind HEAD to claim.base")
         return values[tuple(arguments)]
 
-    monkeypatch.setattr(issue_claim, "_git_output", git)
+    monkeypatch.setattr(checkout, "_git_output", git)
 
 
 def _patch_protect_claim(
@@ -3469,8 +3470,8 @@ def _patch_protect_claim(
         ),
     )
     client = FakeComments({LEDGER_ISSUE: [claimed]}, {72})
-    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
-    monkeypatch.setattr(issue_claim, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     return client
 
 
@@ -3478,12 +3479,12 @@ def _forbid_protect_git_github_and_identity(monkeypatch: pytest.MonkeyPatch) -> 
     def unused(*args, **kwargs):
         pytest.fail("this protect path must not use identity, git, or GitHub")
 
-    monkeypatch.setattr(issue_claim, "_resolved_agent", unused)
-    monkeypatch.setattr(issue_claim, "_git_output", unused)
-    monkeypatch.setattr(issue_claim, "GitHubIssueComments", unused)
-    monkeypatch.setattr(issue_claim, "_repository", unused)
-    monkeypatch.setattr(issue_claim, "discover_ledger", unused)
-    monkeypatch.setattr(issue_claim, "configure_ledger", unused)
+    monkeypatch.setattr(checkout, "_resolved_agent", unused)
+    monkeypatch.setattr(checkout, "_git_output", unused)
+    monkeypatch.setattr(github, "GitHubIssueComments", unused)
+    monkeypatch.setattr(checkout, "_repository", unused)
+    monkeypatch.setattr(discovery, "discover_ledger", unused)
+    monkeypatch.setattr(protocol, "configure_ledger", unused)
 
 
 def _protect_main(monkeypatch: pytest.MonkeyPatch, payload: object) -> int:
@@ -3640,14 +3641,14 @@ def test_protect_missing_ledger_denies_claim_first_without_configure(
     _set_agent_identity_env(monkeypatch, {issue_claim.GROK_SESSION_ID_ENV: "sess-1"})
     _patch_protect_git(monkeypatch, work)
     monkeypatch.setattr(
-        issue_claim, "GitHubIssueComments", lambda repository: FakeComments()
+        github, "GitHubIssueComments", lambda repository: FakeComments()
     )
-    monkeypatch.setattr(issue_claim, "discover_ledger", lambda _client: None)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: None)
 
     def unused_configure(issue: int) -> None:
         pytest.fail("missing ledger must not configure_ledger")
 
-    monkeypatch.setattr(issue_claim, "configure_ledger", unused_configure)
+    monkeypatch.setattr(protocol, "configure_ledger", unused_configure)
 
     assert (
         _protect_main(
@@ -3856,13 +3857,13 @@ def test_protect_ledger_error_denies_json_without_error_prefix(
     _set_agent_identity_env(monkeypatch, {issue_claim.GROK_SESSION_ID_ENV: "sess-1"})
     _patch_protect_git(monkeypatch, work)
     monkeypatch.setattr(
-        issue_claim, "GitHubIssueComments", lambda repository: FakeComments()
+        github, "GitHubIssueComments", lambda repository: FakeComments()
     )
 
     def failed(_client):
         raise ClaimError("adapter failed")
 
-    monkeypatch.setattr(issue_claim, "discover_ledger", failed)
+    monkeypatch.setattr(discovery, "discover_ledger", failed)
 
     assert (
         _protect_main(
@@ -3887,13 +3888,13 @@ def test_protect_non_claim_error_from_write_path_denies_json_without_traceback(
     _set_agent_identity_env(monkeypatch, {issue_claim.GROK_SESSION_ID_ENV: "sess-1"})
     _patch_protect_git(monkeypatch, work)
     monkeypatch.setattr(
-        issue_claim, "GitHubIssueComments", lambda repository: FakeComments()
+        github, "GitHubIssueComments", lambda repository: FakeComments()
     )
 
     def crashed(_client):
         raise RuntimeError("write path crashed")
 
-    monkeypatch.setattr(issue_claim, "discover_ledger", crashed)
+    monkeypatch.setattr(discovery, "discover_ledger", crashed)
 
     assert (
         _protect_main(
