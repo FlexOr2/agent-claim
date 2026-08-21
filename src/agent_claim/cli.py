@@ -23,6 +23,15 @@ LEDGER_ISSUE = 0
 LEGACY_MARKER_PREFIX = "<!-- agent-claim:v1 "
 MARKER_PREFIX = "<!-- agent-claim:v2 "
 MARKER_SUFFIX = " -->"
+POLICY_LOADER = (
+    "<!-- agent-claim-policy:v1 -->\n"
+    "Before the first edit in a Git repository, use live `agent-claim`: "
+    "`status`, then `claim` the issue and write scope. `bootstrap` only when "
+    "neither a coordination/claim contract nor a ledger exists. `release` after "
+    "landing or abandoning the lane. Missing `gh` or network is a failure, "
+    "never coordinated success. Read-only review stays free. Do not invent a "
+    "second board."
+)
 PROJECTION_MARKER_PREFIX = "<!-- agent-claim-projection:v1 ledger="
 PROJECTION_MARKER_PATTERN = re.compile(
     rf"{re.escape(PROJECTION_MARKER_PREFIX)}(?P<ledger>[1-9][0-9]*){re.escape(MARKER_SUFFIX)}"
@@ -1712,6 +1721,9 @@ def _parser() -> argparse.ArgumentParser:
     supersede.add_argument("--role", required=True)
     supersede.add_argument("--reason", required=True)
     supersede.add_argument("--claim-id", required=True)
+
+    policy = commands.add_parser("policy", help="print the provider-neutral loader block")
+    policy.add_argument("--print", action="store_true", required=True, dest="print_loader")
     return parser
 
 
@@ -1745,6 +1757,9 @@ def _status(claims: tuple[ActiveClaim, ...], issue: int | None) -> int:
 
 def main(arguments: list[str] | None = None) -> int:
     parsed = _parser().parse_args(arguments)
+    if parsed.command == "policy":
+        print(POLICY_LOADER)
+        return 0
     try:
         if parsed.command == "supersede":
             raise ClaimUnavailable("supersede is not available in v0.1")

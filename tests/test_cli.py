@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 
 import pytest
 
@@ -1979,3 +1980,69 @@ def test_cli_supersede_is_unavailable_before_any_github_mutation(
     assert client.comments == {}
     assert client.labels == set()
     assert "not available in v0.1" in capsys.readouterr().err
+
+
+def forbid_github_for_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unused(*args, **kwargs):
+        pytest.fail("policy must not use GitHub")
+
+    monkeypatch.setattr(issue_claim, "GitHubIssueComments", unused)
+    monkeypatch.setattr(issue_claim, "_repository", unused)
+    monkeypatch.setattr(issue_claim, "discover_ledger", unused)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["policy", "--print"],
+        ["--repo", "OWNER/REPO", "policy", "--print"],
+    ],
+)
+def test_cli_policy_print_emits_the_locked_loader_without_github(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    arguments: list[str],
+) -> None:
+    home = tmp_path / "home"
+    work = tmp_path / "work"
+    home.mkdir()
+    work.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(work)
+    forbid_github_for_policy(monkeypatch)
+
+    assert issue_claim.main(arguments) == 0
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "<!-- agent-claim-policy:v1 -->\n"
+        "Before the first edit in a Git repository, use live `agent-claim`: "
+        "`status`, then `claim` the issue and write scope. `bootstrap` only when "
+        "neither a coordination/claim contract nor a ledger exists. `release` after "
+        "landing or abandoning the lane. Missing `gh` or network is a failure, "
+        "never coordinated success. Read-only review stays free. Do not invent a "
+        "second board.\n"
+    )
+    assert captured.err == ""
+    assert list(home.iterdir()) == []
+    assert list(work.iterdir()) == []
+
+
+def test_cli_policy_without_print_is_an_argparse_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    work = tmp_path / "work"
+    home.mkdir()
+    work.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(work)
+    forbid_github_for_policy(monkeypatch)
+
+    with pytest.raises(SystemExit) as exited:
+        issue_claim.main(["policy"])
+
+    assert exited.value.code == 2
+    assert list(home.iterdir()) == []
+    assert list(work.iterdir()) == []

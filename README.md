@@ -40,6 +40,13 @@ Use `release --coordinator-override` only for an explicit coordinator action.
 Ledger rollover (`supersede`) is intentionally unavailable in v0.1 and deferred
 to a follow-up issue; the command fails before making a GitHub mutation.
 
+## Global loader
+
+Run `agent-claim policy --print` and append the block once into the file the
+provider actually loads. Skip the append when `<!-- agent-claim-policy:v1 -->`
+is already present. Never overwrite an existing loader. The CLI does not write
+`~/.claude`, `~/.codex`, or `~/.grok`.
+
 ## v0.1 boundary
 
 GitHub via the `gh` CLI is supported today. The tool does not automatically
