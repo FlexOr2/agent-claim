@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import sys
@@ -2673,3 +2674,505 @@ def test_cli_policy_without_print_is_an_argparse_error(
     assert exited.value.code == 2
     assert list(home.iterdir()) == []
     assert list(work.iterdir()) == []
+
+
+def _isolate_protect_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[Path, Path]:
+    home = tmp_path / "home"
+    work = tmp_path / "work"
+    home.mkdir()
+    work.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(work)
+    return home, work
+
+
+def _protect_git_values(
+    work: Path, overrides: dict[tuple[str, str], str] | None = None
+) -> dict[tuple[str, str], str]:
+    values = {
+        ("branch", "--show-current"): "codex/issue-72-claims",
+        ("rev-parse", "--git-dir"): str(work / ".git" / "worktrees" / "issue-72"),
+        ("rev-parse", "--git-common-dir"): str(work / ".git"),
+        ("rev-parse", "--show-toplevel"): str(work.resolve()),
+    }
+    if overrides:
+        values.update(overrides)
+    return values
+
+
+def _patch_protect_git(
+    monkeypatch: pytest.MonkeyPatch,
+    work: Path,
+    overrides: dict[tuple[str, str], str] | None = None,
+) -> None:
+    values = _protect_git_values(work, overrides)
+
+    def git(arguments: list[str]) -> str:
+        if arguments == ["status", "--porcelain"]:
+            pytest.fail("dirty tree is irrelevant to protect")
+        if arguments == ["rev-parse", "HEAD"]:
+            pytest.fail("protect must not bind HEAD to claim.base")
+        return values[tuple(arguments)]
+
+    monkeypatch.setattr(issue_claim, "_git_output", git)
+
+
+def _patch_protect_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    agent: str = "Grok sess-1",
+    scope: tuple[str, ...] = ("src",),
+    branch: str = "codex/issue-72-claims",
+) -> FakeComments:
+    claimed = comment(
+        1,
+        claim_comment(
+            replace(
+                request("cli-claim", agent, issue=72, scope=scope),
+                branch=branch,
+            )
+        ),
+    )
+    client = FakeComments({LEDGER_ISSUE: [claimed]}, {72})
+    monkeypatch.setattr(issue_claim, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(issue_claim, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    return client
+
+
+def _forbid_protect_git_github_and_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unused(*args, **kwargs):
+        pytest.fail("this protect path must not use identity, git, or GitHub")
+
+    monkeypatch.setattr(issue_claim, "_resolved_agent", unused)
+    monkeypatch.setattr(issue_claim, "_git_output", unused)
+    monkeypatch.setattr(issue_claim, "GitHubIssueComments", unused)
+    monkeypatch.setattr(issue_claim, "_repository", unused)
+    monkeypatch.setattr(issue_claim, "discover_ledger", unused)
+    monkeypatch.setattr(issue_claim, "configure_ledger", unused)
+
+
+def _protect_main(monkeypatch: pytest.MonkeyPatch, payload: object) -> int:
+    raw = payload if isinstance(payload, str) else json.dumps(payload)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(raw))
+    return issue_claim.main(["--repo", "example/agent-claim", "protect"])
+
+
+def _assert_protect_decision(
+    capsys: pytest.CaptureFixture[str],
+    *,
+    decision: str,
+    reason: str | None = None,
+) -> None:
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    if decision == "allow":
+        assert payload == {"decision": "allow"}
+        return
+    assert payload == {"decision": "deny", "reason": reason}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"toolName": "Bash", "toolInput": {"path": "src/cli.py", "command": "rm -rf /"}},
+        {"tool_name": "run_terminal_command", "tool_input": {"command": "git status"}},
+        {"toolName": "read_file", "toolInput": {"path": "src/secret.py"}},
+        {"tool_name": "grep", "tool_input": {"pattern": "secret"}},
+        {"toolName": "list_dir", "toolInput": {"path": "src"}},
+        {"tool_name": "spawn_subagent", "tool_input": {"prompt": "edit src"}},
+        {"toolName": "unknown"},
+    ],
+)
+def test_protect_non_mutating_tools_allow_without_identity_git_or_github(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    payload: dict[str, object],
+) -> None:
+    home, work = _isolate_protect_home(monkeypatch, tmp_path)
+    _set_agent_identity_env(monkeypatch)
+    _forbid_protect_git_github_and_identity(monkeypatch)
+
+    assert _protect_main(monkeypatch, payload) == 0
+    _assert_protect_decision(capsys, decision="allow")
+    assert list(home.iterdir()) == []
+    assert list(work.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "path_key"),
+    [("write", "path"), ("search_replace", "filePath")],
+)
+def test_protect_grok_camelcase_allows_when_session_claim_covers_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    tool_name: str,
+    path_key: str,
+) -> None:
+    home, work = _isolate_protect_home(monkeypatch, tmp_path)
+    _set_agent_identity_env(monkeypatch, {issue_claim.GROK_SESSION_ID_ENV: "sess-1"})
+    _patch_protect_git(monkeypatch, work)
+    _patch_protect_claim(monkeypatch)
+
+    assert (
+        _protect_main(
+            monkeypatch,
+            {"toolName": tool_name, "toolInput": {path_key: "src/widget.py"}},
+        )
+        == 0
+    )
+    _assert_protect_decision(capsys, decision="allow")
+    assert list(home.iterdir()) == []
+
+
+def test_protect_grok_camelcase_denies_write_without_this_session_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home, work = _isolate_protect_home(monkeypatch, tmp_path)
+    _set_agent_identity_env(monkeypatch, {issue_claim.GROK_SESSION_ID_ENV: "sess-1"})
+    _patch_protect_git(monkeypatch, work)
+    _patch_protect_claim(monkeypatch, agent="Codex Sol")
+
+    assert (
+        _protect_main(
+            monkeypatch,
+            {"toolName": "write", "toolInput": {"path": "src/widget.py"}},
+        )
+        == 2
+    )
+    _assert_protect_decision(capsys, decision="deny", reason="claim first")
+    assert list(home.iterdir()) == []
+
+
+def test_protect_absolute_file_path_allows_when_claim_scope_covers_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _isolate_protect_home(monkeypatch, tmp_path)
+    work = tmp_path / "work"
+    _set_agent_identity_env(monkeypatch, {issue_claim.GROK_SESSION_ID_ENV: "sess-1"})
+    _patch_protect_git(monkeypatch, work)
+    _patch_protect_claim(monkeypatch)
+    target = work / "src" / "agent_claim" / "cli.py"
+
+    assert (
+        _protect_main(
+            monkeypatch,
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": str(target.resolve())},
+            },
+        )
+        == 0
+    )
+    _assert_protect_decision(capsys, decision="allow")
+
+
+def test_protect_dirty_worktree_still_allows_covered_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _isolate_protect_home(monkeypatch, tmp_path)
+    work = tmp_path / "work"
+    (work / "dirty.txt").write_text("edited\n", encoding="utf-8")
+    _set_agent_identity_env(monkeypatch, {issue_claim.GROK_SESSION_ID_ENV: "sess-1"})
+    _patch_protect_git(monkeypatch, work)
+    _patch_protect_claim(monkeypatch)
+
+    assert (
+        _protect_main(
+            monkeypatch,
+            {"toolName": "write", "toolInput": {"path": "src/widget.py"}},
+        )
+        == 0
+    )
+    _assert_protect_decision(capsys, decision="allow")
+
+
+def test_protect_missing_ledger_denies_claim_first_without_configure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _isolate_protect_home(monkeypatch, tmp_path)
+    work = tmp_path / "work"
+    _set_agent_identity_env(monkeypatch, {issue_claim.GROK_SESSION_ID_ENV: "sess-1"})
+    _patch_protect_git(monkeypatch, work)
+    monkeypatch.setattr(
+        issue_claim, "GitHubIssueComments", lambda repository: FakeComments()
+    )
+    monkeypatch.setattr(issue_claim, "discover_ledger", lambda _client: None)
+
+    def unused_configure(issue: int) -> None:
+        pytest.fail("missing ledger must not configure_ledger")
+
+    monkeypatch.setattr(issue_claim, "configure_ledger", unused_configure)
+
+    assert (
+        _protect_main(
+            monkeypatch,
+            {"toolName": "write", "toolInput": {"path": "src/widget.py"}},
+        )
+        == 2
+    )
+    _assert_protect_decision(capsys, decision="deny", reason="claim first")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ["not-json", "[]", "null", "1", '{"toolName": 1}', "{}"],
+)
+def test_protect_invalid_hook_payload_denies_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    payload: str,
+) -> None:
+    home, work = _isolate_protect_home(monkeypatch, tmp_path)
+    _set_agent_identity_env(monkeypatch)
+    _forbid_protect_git_github_and_identity(monkeypatch)
+
+    assert _protect_main(monkeypatch, payload) == 2
+    _assert_protect_decision(capsys, decision="deny", reason="invalid hook payload")
+    assert list(home.iterdir()) == []
+    assert list(work.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"toolName": "Write"},
+        {"tool_name": "Edit", "tool_input": "src/widget.py"},
+        {"toolName": "MultiEdit", "toolInput": {"contents": "x"}},
+        {"toolName": "write", "toolInput": {"path": "", "file_path": ""}},
+    ],
+)
+def test_protect_mutating_tool_without_path_denies_path_required(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    payload: dict[str, object],
+) -> None:
+    _isolate_protect_home(monkeypatch, tmp_path)
+    _set_agent_identity_env(monkeypatch)
+    _forbid_protect_git_github_and_identity(monkeypatch)
+
+    assert _protect_main(monkeypatch, payload) == 2
+    _assert_protect_decision(capsys, decision="deny", reason="path required")
+
+
+def test_protect_missing_identity_denies_without_github(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _isolate_protect_home(monkeypatch, tmp_path)
+    _set_agent_identity_env(monkeypatch)
+    _forbid_github_construction(monkeypatch)
+    _forbid_git_fill(monkeypatch)
+
+    assert (
+        _protect_main(
+            monkeypatch,
+            {"toolName": "write", "toolInput": {"path": "src/widget.py"}},
+        )
+        == 2
+    )
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["decision"] == "deny"
+    _assert_missing_identity_message(payload["reason"])
+
+
+@pytest.mark.parametrize("branch", ["main", "master"])
+def test_protect_main_branch_denies_without_github(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    branch: str,
+) -> None:
+    _isolate_protect_home(monkeypatch, tmp_path)
+    work = tmp_path / "work"
+    _set_agent_identity_env(monkeypatch, {issue_claim.GROK_SESSION_ID_ENV: "sess-1"})
+    _patch_protect_git(
+        monkeypatch, work, {("branch", "--show-current"): branch}
+    )
+    _forbid_github_construction(monkeypatch)
+
+    assert (
+        _protect_main(
+            monkeypatch,
+            {"toolName": "write", "toolInput": {"path": "src/widget.py"}},
+        )
+        == 2
+    )
+    _assert_protect_decision(capsys, decision="deny", reason="not main")
+
+
+def test_protect_primary_checkout_denies_worktree_without_github(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _isolate_protect_home(monkeypatch, tmp_path)
+    work = tmp_path / "work"
+    _set_agent_identity_env(monkeypatch, {issue_claim.GROK_SESSION_ID_ENV: "sess-1"})
+    git_directory = str(work / ".git")
+    _patch_protect_git(
+        monkeypatch,
+        work,
+        {
+            ("rev-parse", "--git-dir"): git_directory,
+            ("rev-parse", "--git-common-dir"): git_directory,
+        },
+    )
+    _forbid_github_construction(monkeypatch)
+
+    assert (
+        _protect_main(
+            monkeypatch,
+            {"toolName": "write", "toolInput": {"path": "src/widget.py"}},
+        )
+        == 2
+    )
+    _assert_protect_decision(capsys, decision="deny", reason="worktree")
+
+
+def test_protect_path_outside_repository_denies_path_required(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _isolate_protect_home(monkeypatch, tmp_path)
+    work = tmp_path / "work"
+    _set_agent_identity_env(monkeypatch, {issue_claim.GROK_SESSION_ID_ENV: "sess-1"})
+    _patch_protect_git(monkeypatch, work)
+    _forbid_github_construction(monkeypatch)
+
+    assert (
+        _protect_main(
+            monkeypatch,
+            {
+                "toolName": "write",
+                "toolInput": {"path": str(tmp_path / "outside.py")},
+            },
+        )
+        == 2
+    )
+    _assert_protect_decision(capsys, decision="deny", reason="path required")
+
+
+def test_protect_wrong_branch_denies_claim_first(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _isolate_protect_home(monkeypatch, tmp_path)
+    work = tmp_path / "work"
+    _set_agent_identity_env(monkeypatch, {issue_claim.GROK_SESSION_ID_ENV: "sess-1"})
+    _patch_protect_git(monkeypatch, work)
+    _patch_protect_claim(monkeypatch, branch="other/issue-72")
+
+    assert (
+        _protect_main(
+            monkeypatch,
+            {"toolName": "write", "toolInput": {"path": "src/widget.py"}},
+        )
+        == 2
+    )
+    _assert_protect_decision(capsys, decision="deny", reason="claim first")
+
+
+def test_protect_non_overlapping_scope_denies_claim_first(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _isolate_protect_home(monkeypatch, tmp_path)
+    work = tmp_path / "work"
+    _set_agent_identity_env(monkeypatch, {issue_claim.GROK_SESSION_ID_ENV: "sess-1"})
+    _patch_protect_git(monkeypatch, work)
+    _patch_protect_claim(monkeypatch, scope=("docs",))
+
+    assert (
+        _protect_main(
+            monkeypatch,
+            {"toolName": "write", "toolInput": {"path": "src/widget.py"}},
+        )
+        == 2
+    )
+    _assert_protect_decision(capsys, decision="deny", reason="claim first")
+
+
+def test_protect_ledger_error_denies_json_without_error_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _isolate_protect_home(monkeypatch, tmp_path)
+    work = tmp_path / "work"
+    _set_agent_identity_env(monkeypatch, {issue_claim.GROK_SESSION_ID_ENV: "sess-1"})
+    _patch_protect_git(monkeypatch, work)
+    monkeypatch.setattr(
+        issue_claim, "GitHubIssueComments", lambda repository: FakeComments()
+    )
+
+    def failed(_client):
+        raise ClaimError("adapter failed")
+
+    monkeypatch.setattr(issue_claim, "discover_ledger", failed)
+
+    assert (
+        _protect_main(
+            monkeypatch,
+            {"toolName": "write", "toolInput": {"path": "src/widget.py"}},
+        )
+        == 2
+    )
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "ERROR:" not in captured.out
+    assert json.loads(captured.out) == {"decision": "deny", "reason": "adapter failed"}
+
+
+def test_protect_non_claim_error_from_write_path_denies_json_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _isolate_protect_home(monkeypatch, tmp_path)
+    work = tmp_path / "work"
+    _set_agent_identity_env(monkeypatch, {issue_claim.GROK_SESSION_ID_ENV: "sess-1"})
+    _patch_protect_git(monkeypatch, work)
+    monkeypatch.setattr(
+        issue_claim, "GitHubIssueComments", lambda repository: FakeComments()
+    )
+
+    def crashed(_client):
+        raise RuntimeError("write path crashed")
+
+    monkeypatch.setattr(issue_claim, "discover_ledger", crashed)
+
+    assert (
+        _protect_main(
+            monkeypatch,
+            {"toolName": "write", "toolInput": {"path": "src/widget.py"}},
+        )
+        == 2
+    )
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "ERROR:" not in captured.out
+    assert json.loads(captured.out) == {
+        "decision": "deny",
+        "reason": "write path crashed",
+    }

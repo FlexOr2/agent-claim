@@ -1756,6 +1756,9 @@ def _parser() -> argparse.ArgumentParser:
 
     policy = commands.add_parser("policy", help="print the provider-neutral loader block")
     policy.add_argument("--print", action="store_true", required=True, dest="print_loader")
+    commands.add_parser(
+        "protect", help="deny PreToolUse writes without this session's live claim"
+    )
     return parser
 
 
@@ -1787,11 +1790,110 @@ def _status(claims: tuple[ActiveClaim, ...], issue: int | None) -> int:
     return 2 if any(claim.claim_id in index.conflict_ids for claim in related) else 0
 
 
+MUTATING_HOOK_TOOLS = frozenset({"Edit", "MultiEdit", "Write", "search_replace", "write"})
+
+
+def _hook_allow() -> int:
+    print(json.dumps({"decision": "allow"}))
+    return 0
+
+
+def _hook_deny(reason: str) -> int:
+    print(json.dumps({"decision": "deny", "reason": reason}))
+    return 2
+
+
+def _hook_payload() -> dict[str, object] | None:
+    try:
+        payload = json.loads(sys.stdin.read())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _hook_field(payload: dict[str, object], *keys: str) -> object:
+    for key in keys:
+        if key in payload:
+            return payload[key]
+    return None
+
+
+def _hook_path(tool_input: dict[str, object]) -> str | None:
+    for key in ("path", "file_path", "filePath"):
+        value = tool_input.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _protect_relative_path(raw_path: str) -> str | None:
+    toplevel = Path(_git_output(["rev-parse", "--show-toplevel"])).resolve()
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    try:
+        relative = candidate.resolve().relative_to(toplevel).as_posix()
+        return _valid_scope([relative])[0]
+    except (InvalidClaimMarker, OSError, ValueError):
+        return None
+
+
+def _protect_write(repository: str | None, payload: dict[str, object]) -> int:
+    tool_input = _hook_field(payload, "toolInput", "tool_input")
+    if not isinstance(tool_input, dict):
+        return _hook_deny("path required")
+    raw_path = _hook_path(tool_input)
+    if raw_path is None:
+        return _hook_deny("path required")
+    agent = _resolved_agent(None)
+    branch = _git_output(["branch", "--show-current"])
+    if branch in {"main", "master"}:
+        return _hook_deny("not main")
+    git_directory = Path(_git_output(["rev-parse", "--git-dir"])).resolve()
+    common_directory = Path(_git_output(["rev-parse", "--git-common-dir"])).resolve()
+    if git_directory == common_directory:
+        return _hook_deny("worktree")
+    relative = _protect_relative_path(raw_path)
+    if relative is None:
+        return _hook_deny("path required")
+    client = GitHubIssueComments(_repository(repository))
+    ledger = discover_ledger(client)
+    if ledger is None:
+        return _hook_deny("claim first")
+    configure_ledger(ledger)
+    for claim in _ledger_claims(client):
+        if (
+            claim.agent == agent
+            and claim.branch == branch
+            and _scopes_overlap(claim.scope, (relative,))
+        ):
+            return _hook_allow()
+    return _hook_deny("claim first")
+
+
+def _protect(repository: str | None) -> int:
+    # Grok fail-opens on crash or non-JSON hook output; deny instead of raising.
+    try:
+        payload = _hook_payload()
+        if payload is None:
+            return _hook_deny("invalid hook payload")
+        tool_name = _hook_field(payload, "toolName", "tool_name")
+        if not isinstance(tool_name, str):
+            return _hook_deny("invalid hook payload")
+        if tool_name not in MUTATING_HOOK_TOOLS:
+            return _hook_allow()
+        return _protect_write(repository, payload)
+    except Exception as error:
+        return _hook_deny(str(error))
+
+
 def main(arguments: list[str] | None = None) -> int:
     parsed = _parser().parse_args(arguments)
     if parsed.command == "policy":
         print(POLICY_LOADER)
         return 0
+    if parsed.command == "protect":
+        return _protect(parsed.repo)
     try:
         if parsed.command in {"claim", "release"}:
             parsed.agent = _resolved_agent(parsed.agent)
