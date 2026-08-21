@@ -55,6 +55,31 @@ provider actually loads. Skip the append when `<!-- agent-claim-policy:v1 -->`
 is already present. Never overwrite an existing loader. The CLI does not write
 `~/.claude`, `~/.codex`, or `~/.grok`.
 
+## PreToolUse write gate
+
+Copy this hook once into the file the provider actually loads. Skip when
+`Write|Edit|MultiEdit|write|search_replace` is already present. Never overwrite
+an existing hook file. The CLI does not write `~/.grok`.
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|write|search_replace",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agent-claim protect",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
 ## v0.2 boundary
 
 GitHub via the `gh` CLI is supported today. The tool does not automatically
