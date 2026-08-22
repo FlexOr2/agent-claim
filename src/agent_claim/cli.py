@@ -129,6 +129,7 @@ def _parser() -> argparse.ArgumentParser:
     claim.add_argument("--branch")
     claim.add_argument("--scope", action="append", required=True)
     claim.add_argument("--claim-id")
+    claim.add_argument("--json", action="store_true")
 
     release = commands.add_parser("release", help="release a landed or abandoned claim")
     release.add_argument("issue", type=int)
@@ -137,6 +138,7 @@ def _parser() -> argparse.ArgumentParser:
     release.add_argument("--reason")
     release.add_argument("--claim-id")
     release.add_argument("--coordinator-override", action="store_true")
+    release.add_argument("--json", action="store_true")
 
     reconcile = commands.add_parser("reconcile", help="repair claimed-label projections")
     reconcile.add_argument("issue", type=int, nargs="?")
@@ -221,6 +223,41 @@ def _status_json(
     }
     print(json.dumps(payload))
     return 2 if state == "CONFLICT" else 0
+
+
+def _claim_json(claimed: protocol.ActiveClaim) -> int:
+    print(
+        json.dumps(
+            {
+                "issue": claimed.issue,
+                "claim_id": claimed.claim_id,
+                "url": claimed.comment.url,
+                "agent": claimed.agent,
+                "role": claimed.role,
+                "base": claimed.base,
+                "branch": claimed.branch,
+                "scope": list(claimed.scope),
+            }
+        )
+    )
+    return 0
+
+
+def _release_json(
+    released: protocol.ActiveClaim, agent: str, role: str | None, reason: str | None
+) -> int:
+    print(
+        json.dumps(
+            {
+                "issue": released.issue,
+                "claim_id": released.claim_id,
+                "agent": agent,
+                "role": role if role is not None else released.role,
+                "reason": reason if reason is not None else protocol.DEFAULT_RELEASE_REASON,
+            }
+        )
+    )
+    return 0
 
 
 MUTATING_HOOK_TOOLS = frozenset({"Edit", "MultiEdit", "Write", "search_replace", "write"})
@@ -361,6 +398,8 @@ def main(arguments: list[str] | None = None) -> int:
             return _status(claims, parsed.issue)
         if parsed.command == "claim":
             claimed = protocol.acquire_claim(client, _request(parsed))
+            if parsed.json:
+                return _claim_json(claimed)
             print(f"CLAIMED issue #{parsed.issue}: {claimed.claim_id} {claimed.comment.url}")
             return 0
         if parsed.command == "release":
@@ -374,6 +413,8 @@ def main(arguments: list[str] | None = None) -> int:
                 branch=release_branch,
                 coordinator_override=parsed.coordinator_override,
             )
+            if parsed.json:
+                return _release_json(released, parsed.agent, parsed.role, parsed.reason)
             print(f"RELEASED issue #{parsed.issue}: {released.claim_id}")
             return 0
         if parsed.command == "supersede":
