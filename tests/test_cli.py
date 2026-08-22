@@ -3269,6 +3269,259 @@ def test_cli_status_json_without_ledger_errors_and_prints_no_stdout(
     assert "no agent-claim ledger exists" in captured.err
 
 
+def test_cli_claim_and_release_accept_json_while_parent_and_bootstrap_reject_it() -> None:
+    claimed = issue_claim._parser().parse_args(
+        ["claim", "42", "--scope", "src/widget.py", "--json"]
+    )
+    released = issue_claim._parser().parse_args(["release", "42", "--json"])
+    omitted_claim = issue_claim._parser().parse_args(["claim", "42", "--scope", "src"])
+    omitted_release = issue_claim._parser().parse_args(["release", "42"])
+
+    assert claimed.json is True
+    assert released.json is True
+    assert omitted_claim.json is False
+    assert omitted_release.json is False
+    for arguments in (["--json", "status"], ["bootstrap", "--json"]):
+        with pytest.raises(SystemExit) as exited:
+            issue_claim._parser().parse_args(arguments)
+        assert exited.value.code == 2
+
+
+def test_cli_claim_without_json_prints_the_claimed_line(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+
+    claimed = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Codex Sol",
+            "--role",
+            "builder",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "src",
+            "--claim-id",
+            "cli-claim",
+        ]
+    )
+
+    assert claimed == 0
+    assert capsys.readouterr().out == (
+        "CLAIMED issue #72: cli-claim "
+        "https://github.com/example/agent-claim/issues/71#issuecomment-1\n"
+    )
+
+
+def test_cli_release_without_json_prints_the_released_line(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = _claims_client(
+        request("mine", "Ada", issue=72, role="reviewer", branch="lane-72", scope=("src",))
+    )
+    _patch_release_session(monkeypatch, client)
+
+    released = issue_claim.main(["--repo", "example/agent-claim", "release", "72"])
+
+    assert released == 0
+    assert capsys.readouterr().out == "RELEASED issue #72: mine\n"
+
+
+def test_cli_claim_json_prints_acquired_claim_object(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+
+    claimed = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Codex Sol",
+            "--role",
+            "builder",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "src",
+            "--scope",
+            "docs",
+            "--claim-id",
+            "cli-claim",
+            "--json",
+        ]
+    )
+
+    assert claimed == 0
+    assert capsys.readouterr().out == json.dumps(
+        {
+            "issue": 72,
+            "claim_id": "cli-claim",
+            "url": "https://github.com/example/agent-claim/issues/71#issuecomment-1",
+            "agent": "Codex Sol",
+            "role": "builder",
+            "base": BASE,
+            "branch": "codex/issue-72",
+            "scope": ["src", "docs"],
+        }
+    ) + "\n"
+    posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])
+    assert isinstance(posted, ActiveClaim)
+    assert posted.scope == ("src", "docs")
+
+
+@pytest.mark.parametrize(
+    ("standing_role", "flags", "agent", "role", "reason"),
+    [
+        ("reviewer", ("--json",), "Ada", "reviewer", "landed"),
+        (
+            "reviewer",
+            ("--reason", "abandoned", "--json"),
+            "Ada",
+            "reviewer",
+            "abandoned",
+        ),
+        (
+            "reviewer",
+            (
+                "--claim-id",
+                "mine",
+                "--coordinator-override",
+                "--role",
+                "coordinator",
+                "--reason",
+                "verified abandoned",
+                "--json",
+            ),
+            "Fleet Coordinator",
+            "coordinator",
+            "verified abandoned",
+        ),
+    ],
+)
+def test_cli_release_json_prints_effective_posted_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    standing_role: str,
+    flags: tuple[str, ...],
+    agent: str,
+    role: str,
+    reason: str,
+) -> None:
+    client = _claims_client(
+        request("mine", "Ada", issue=72, role=standing_role, branch="lane-72", scope=("src",))
+    )
+    _patch_release_session(
+        monkeypatch, client, agent=agent, forbid_git="--claim-id" in flags
+    )
+
+    released = issue_claim.main(
+        ["--repo", "example/agent-claim", "release", "72", *flags]
+    )
+
+    assert released == 0
+    assert capsys.readouterr().out == json.dumps(
+        {
+            "issue": 72,
+            "claim_id": "mine",
+            "agent": agent,
+            "role": role,
+            "reason": reason,
+        }
+    ) + "\n"
+    assert active_claims(tuple(client.comments[LEDGER_ISSUE])) == ()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        [
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--scope",
+            "src",
+            "--claim-id",
+            "cli-claim",
+            "--json",
+        ],
+        ["release", "72", "--agent", "Ada", "--claim-id", "mine", "--json"],
+    ],
+)
+def test_cli_claim_and_release_json_errors_print_no_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    arguments: list[str],
+) -> None:
+    _patch_status_cli(monkeypatch, FakeComments(), ledger=None)
+
+    assert issue_claim.main(["--repo", "example/agent-claim", *arguments]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("ERROR:")
+    assert "no agent-claim ledger exists" in captured.err
+
+
+def test_cli_claim_json_conflict_errors_without_success_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = _claims_client(request(issue=72, scope=("src",)))
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    protocol_count = len(client.list_protocol_candidates(LEDGER_ISSUE))
+
+    claimed = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Grok 4.6",
+            "--role",
+            "builder",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "docs",
+            "--claim-id",
+            "challenger",
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert claimed == 2
+    assert captured.out == ""
+    assert captured.err.startswith("ERROR:")
+    assert len(client.list_protocol_candidates(LEDGER_ISSUE)) == protocol_count
+
+
 def test_cli_supersede_freezes_the_drained_ledger_and_prints_the_contract_line(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

@@ -43,7 +43,7 @@ Run commands in the repository being coordinated, or pass `--repo
 OWNER/REPOSITORY`. A claim must begin from a clean linked worktree and binds its
 base commit, branch, issue, and repository-relative scope. Claims collide on the
 same issue or overlapping paths; disjoint scopes can proceed concurrently.
-Agents should read `agent-claim status --json`.
+Agents should read `--json` from `status`, `claim`, and `release`.
 
 `bootstrap` adopts the exact `<!-- agent-claim-ledger:v1 -->` issue marker,
 ensures it is locked and labelled, and safely converges concurrent first starts
