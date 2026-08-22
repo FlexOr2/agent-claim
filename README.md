@@ -7,14 +7,14 @@ Codex, Claude, Grok, people, and future agents use the same contract.
 ## Install and maintain
 
 ```bash
-uv tool install git+https://github.com/FlexOr2/agent-claim.git@v0.3.0
-# or: pipx install git+https://github.com/FlexOr2/agent-claim.git@v0.3.0
+uv tool install git+https://github.com/FlexOr2/agent-claim.git@v0.4.0
+# or: pipx install git+https://github.com/FlexOr2/agent-claim.git@v0.4.0
 uv tool upgrade agent-claim
 uv tool uninstall agent-claim
 ```
 
 To roll back, force-install the previous tag with `uv tool install --force
-git+https://github.com/FlexOr2/agent-claim.git@v0.2.0`.
+git+https://github.com/FlexOr2/agent-claim.git@v0.3.0`.
 
 ## Five-command quick start
 
@@ -87,7 +87,7 @@ an existing hook file. The CLI does not write `~/.grok`.
 }
 ```
 
-## v0.3 boundary
+## v0.4 boundary
 
 GitHub via the `gh` CLI is supported today. The tool does not automatically
 allocate work, merge code, or operate a lease server. Omitted `--agent` follows
