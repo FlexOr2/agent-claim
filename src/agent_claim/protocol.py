@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath, PureWindowsPath
+from types import MappingProxyType
 from typing import Protocol
 
 CLAIM_LABEL_PREFIX = "agent-claim:active:"
@@ -115,6 +117,20 @@ class LedgerSupersede:
 ClaimEvent = ActiveClaim | ClaimantRelease | OverrideRelease | LedgerSupersede
 
 
+class DuplicateClaimConflict(ClaimError):
+    """A duplicate claim id where reconcile refuses to pick a winner silently."""
+
+    def __init__(self, claim_id: str, superseded: ActiveClaim, survivor: ActiveClaim):
+        self.claim_id = claim_id
+        self.superseded = superseded
+        self.survivor = survivor
+        super().__init__(
+            f"claim id {claim_id!r} has two still-active claims from different agents "
+            f"({superseded.agent} {superseded.comment.url} vs {survivor.agent} "
+            f"{survivor.comment.url}); release one manually, then run reconcile again"
+        )
+
+
 class LedgerSuperseded(ClaimError):
     def __init__(self, successor_issue: int, claim: ActiveClaim):
         self.successor_issue = successor_issue
@@ -157,6 +173,8 @@ class IssueComments(Protocol):
         create: bool = True,
         adopt_stale: bool = False,
     ) -> bool: ...
+
+    def neutralize_claim_comment(self, comment_id: int, body: str) -> None: ...
 
 
 def claim_label(ledger_issue: int | None = None) -> str:
@@ -495,7 +513,16 @@ def _apply_terminal_event(
     event: ClaimantRelease | OverrideRelease | LedgerSupersede,
     active: dict[str, ActiveClaim],
     acquired: dict[str, ActiveClaim],
-) -> None:
+) -> bool:
+    """Validate and apply a terminal event against the claim it targets.
+
+    Returns whether the engine honored the event: accepted it as a real terminal
+    event for the claim `acquired` currently holds for this id, whether or not
+    popping `active` actually changed anything (an idempotent release retry, or a
+    coordinator override after the claimant already released, still counts as
+    honored). A `LedgerSupersede` that does not satisfy its narrow freeze window is
+    never honored — it silently no-ops without being validated against any claim.
+    """
     claimed = acquired.get(event.claim_id)
     if isinstance(event, LedgerSupersede):
         if (
@@ -505,7 +532,7 @@ def _apply_terminal_event(
             or event.claim_comment_id != claimed.comment.identifier
             or set(active) != {claimed.claim_id}
         ):
-            return
+            return False
         raise LedgerSuperseded(event.successor_issue, claimed)
     if claimed is None:
         raise InvalidClaimMarker(
@@ -525,32 +552,92 @@ def _apply_terminal_event(
             f"claim id {event.claim_id!r} terminal event targets the wrong claim comment"
         )
     active.pop(event.claim_id, None)
+    return True
 
 
-def active_claims(comments: tuple[IssueComment, ...]) -> tuple[ActiveClaim, ...]:
+@dataclass(frozen=True)
+class ClaimLedgerAggregate:
+    """Non-raising result of one chronological walk over the ledger's claim events.
+
+    `occurrences` holds every ActiveClaim event seen for a claim id, in ledger order;
+    a duplicated id has more than one. `terminated_by`, when present for a claim id,
+    holds every terminal-event comment `_apply_terminal_event` honored for it — a
+    release retry or a coordinator override that lands after the claimant already
+    released both still count, since the engine validated and accepted each one.
+    An inert or foreign terminal event (one `_apply_terminal_event` never honored,
+    such as a `LedgerSupersede` posted outside its narrow freeze window) never shows
+    up here. Because `acquired` (below) only ever binds a claim id to its first-ever
+    occurrence, every honored termination belongs to `occurrences[claim_id][0]`;
+    later occurrences of a duplicated id are never tracked as "acquired" and so can
+    never absorb a terminal event themselves.
+    """
+
+    active: tuple[ActiveClaim, ...]
+    seen_claim_ids: frozenset[str]
+    duplicate_claim_ids: tuple[str, ...]
+    occurrences: Mapping[str, tuple[ActiveClaim, ...]]
+    terminated_by: Mapping[str, tuple[IssueComment, ...]]
+
+
+def _aggregate_claim_events(comments: tuple[IssueComment, ...]) -> ClaimLedgerAggregate:
+    """Walk the ledger once, tolerating a reused claim id instead of raising on sight.
+
+    The strict reader, the pre/post acquire guards, and the reconcile repair pass all
+    consume this single walk, so duplicate-claim-id detection and release status can
+    never drift between two independently maintained parsers.
+    """
     active: dict[str, ActiveClaim] = {}
     acquired: dict[str, ActiveClaim] = {}
-    seen_claim_ids: set[str] = set()
+    occurrences: dict[str, list[ActiveClaim]] = {}
+    terminated_by: dict[str, list[IssueComment]] = {}
+    duplicate_claim_ids: list[str] = []
     ordered = sorted(comments, key=lambda comment: (comment.created_at, comment.identifier))
     for comment in ordered:
         event = parse_claim_event(comment)
         if event is None:
             continue
         if isinstance(event, ActiveClaim):
-            if event.claim_id in seen_claim_ids:
-                raise InvalidClaimMarker(f"claim id {event.claim_id!r} was reused")
-            seen_claim_ids.add(event.claim_id)
+            occurrences.setdefault(event.claim_id, []).append(event)
+            if event.claim_id in acquired:
+                if event.claim_id not in duplicate_claim_ids:
+                    duplicate_claim_ids.append(event.claim_id)
+                continue
             acquired[event.claim_id] = event
             active[event.claim_id] = event
             continue
-        _apply_terminal_event(event, active, acquired)
+        if _apply_terminal_event(event, active, acquired):
+            terminated_by.setdefault(event.claim_id, []).append(event.comment)
 
-    return tuple(
-        sorted(
-            active.values(),
-            key=lambda event: (event.comment.created_at, event.comment.identifier),
-        )
+    return ClaimLedgerAggregate(
+        active=tuple(
+            sorted(
+                active.values(),
+                key=lambda event: (event.comment.created_at, event.comment.identifier),
+            )
+        ),
+        seen_claim_ids=frozenset(acquired),
+        duplicate_claim_ids=tuple(duplicate_claim_ids),
+        occurrences=MappingProxyType(
+            {claim_id: tuple(events) for claim_id, events in occurrences.items()}
+        ),
+        terminated_by=MappingProxyType(
+            {
+                claim_id: tuple(terminal_comments)
+                for claim_id, terminal_comments in terminated_by.items()
+            }
+        ),
     )
+
+
+def _reject_duplicate_claim_ids(aggregate: ClaimLedgerAggregate) -> None:
+    if aggregate.duplicate_claim_ids:
+        raise InvalidClaimMarker(f"claim id {aggregate.duplicate_claim_ids[0]!r} was reused")
+
+
+def active_claims(comments: tuple[IssueComment, ...]) -> tuple[ActiveClaim, ...]:
+    aggregate = _aggregate_claim_events(comments)
+    _reject_duplicate_claim_ids(aggregate)
+    return aggregate.active
 
 
 def _scope_prefixes(paths: tuple[str, ...]) -> set[tuple[str, ...]]:
@@ -760,6 +847,23 @@ def supersede_comment(
     )
 
 
+def _neutralized_claim_body(claim_id: str, survivor: ActiveClaim) -> str:
+    """Neutralize a duplicate claim-id event so it stops parsing as a claim marker.
+
+    The edited body deliberately does not start with a claim marker prefix, so
+    `is_protocol_candidate` excludes it: the ledger's "was edited after publication"
+    guard for trusted protocol comments never sees it again.
+    """
+    return _validated_comment(
+        "## SUPERSEDED — duplicate claim id neutralized by reconcile\n\n"
+        f"- Claim ID: `{claim_id}` (reused; a ledger claim id must stay unique)\n"
+        f"- Superseded by: {survivor.agent} ({survivor.role}) — {survivor.comment.url}\n\n"
+        "`agent-claim reconcile` neutralized this comment because its claim id was "
+        "reused by the surviving claim linked above; the ledger reads that claim as "
+        "the sole event for this id."
+    )
+
+
 def _active_projection(claim: ActiveClaim) -> str:
     return _validated_comment(
         f"{_projection_marker()}\n"
@@ -864,8 +968,95 @@ def reconcile_all_labels(client: IssueComments) -> tuple[int, ...]:
     return tuple(sorted(active_issues))
 
 
+def _duplicate_lifecycles(
+    aggregate: ClaimLedgerAggregate, claim_id: str
+) -> tuple[tuple[ActiveClaim, tuple[IssueComment, ...]], ...]:
+    """Pair each occurrence of a duplicated claim id with every comment that honored
+    its termination (a release retry or claimant-then-coordinator pair both land here).
+
+    Derived entirely from `ClaimLedgerAggregate.occurrences`/`terminated_by`, i.e. from
+    what `_apply_terminal_event` itself did during the shared walk — never from an
+    independent re-parse. An inert or foreign terminal event (one `_apply_terminal_event`
+    did not honor, such as a `LedgerSupersede` posted outside its narrow window) never
+    shows up here, so it can never be mistaken for a real release.
+    """
+    occurrences = aggregate.occurrences[claim_id]
+    terminating_comments = aggregate.terminated_by.get(claim_id, ())
+    return tuple(
+        (occurrence, terminating_comments if index == 0 else ())
+        for index, occurrence in enumerate(occurrences)
+    )
+
+
+@dataclass(frozen=True)
+class DuplicateClaimRepair:
+    """One duplicated claim id reconcile neutralized, for the operator-visible report."""
+
+    claim_id: str
+    superseded_comment_ids: tuple[int, ...]
+    survivor_comment_id: int
+
+
+def repair_duplicate_claims(client: IssueComments) -> tuple[DuplicateClaimRepair, ...]:
+    """Tolerant reconcile pre-pass: neutralize safely-superseded duplicate claim ids.
+
+    A same-claim-id re-claim poisons every strict reader (status/claim/release) with
+    `claim id ... was reused`. This runs before those strict reads so `reconcile` can
+    heal the ledger instead of erroring. For each duplicated id, the newest occurrence
+    is kept as the survivor: for a released-then-reused id it is the only occurrence
+    still live; for a same-agent self-re-claim, keeping the newest is deliberate
+    because it reflects that agent's latest intent (this is not applied across issues:
+    a same-agent duplicate that spans two different issues still only keeps the newer
+    issue's lane, silently ending the older one). An older occurrence only
+    auto-neutralizes when it is already released, or when it shares the survivor's
+    agent and role. A still-active duplicate from a different agent is a real
+    ownership conflict: reconcile refuses it loudly instead of picking a winner.
+    Every duplicated id on the ledger is validated before any comment is edited, so
+    one unsafe conflict never leaves a different, otherwise-safe repair half-applied.
+    """
+    aggregate = _aggregate_claim_events(client.list_protocol_candidates(LEDGER_ISSUE))
+    plans: list[tuple[str, ActiveClaim, tuple[IssueComment, ...]]] = []
+    for claim_id in aggregate.duplicate_claim_ids:
+        lifecycles = _duplicate_lifecycles(aggregate, claim_id)
+        survivor, _ = lifecycles[-1]
+        superseded_comments: list[IssueComment] = []
+        for occurrence, terminal_comments in lifecycles[:-1]:
+            same_claimant = (occurrence.agent, occurrence.role) == (
+                survivor.agent,
+                survivor.role,
+            )
+            if not (terminal_comments or same_claimant):
+                raise DuplicateClaimConflict(claim_id, occurrence, survivor)
+            superseded_comments.append(occurrence.comment)
+            superseded_comments.extend(terminal_comments)
+        plans.append((claim_id, survivor, tuple(superseded_comments)))
+
+    repairs: list[DuplicateClaimRepair] = []
+    for claim_id, survivor, superseded_comments in plans:
+        body = _neutralized_claim_body(claim_id, survivor)
+        for superseded_comment in superseded_comments:
+            client.neutralize_claim_comment(superseded_comment.identifier, body)
+        repairs.append(
+            DuplicateClaimRepair(
+                claim_id=claim_id,
+                superseded_comment_ids=tuple(
+                    entry.identifier for entry in superseded_comments
+                ),
+                survivor_comment_id=survivor.comment.identifier,
+            )
+        )
+    return tuple(repairs)
+
+
 def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
-    standing = _ledger_claims(client)
+    aggregate = _aggregate_claim_events(client.list_protocol_candidates(LEDGER_ISSUE))
+    if request.claim_id in aggregate.seen_claim_ids:
+        raise ClaimUnavailable(
+            f"claim id {request.claim_id!r} is already on this ledger, active or "
+            "released; release it, then claim again with a fresh --claim-id"
+        )
+    _reject_duplicate_claim_ids(aggregate)
+    standing = aggregate.active
     blocked_by = conflicting_claims(standing, request)
     if blocked_by:
         owner = blocked_by[0]
@@ -875,7 +1066,15 @@ def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
         )
 
     client.post_comment(LEDGER_ISSUE, claim_comment(request))
-    observed = _ledger_claims(client)
+    post_aggregate = _aggregate_claim_events(client.list_protocol_candidates(LEDGER_ISSUE))
+    if request.claim_id in post_aggregate.duplicate_claim_ids:
+        raise ClaimUnavailable(
+            f"claim id {request.claim_id!r} claim race detected: another post reused "
+            "this id while it was being posted; run agent-claim reconcile, then claim "
+            "again with a fresh --claim-id"
+        )
+    _reject_duplicate_claim_ids(post_aggregate)
+    observed = post_aggregate.active
     own = next((claim for claim in observed if claim.claim_id == request.claim_id), None)
     if own is None:
         raise ClaimError(f"issue #{request.issue} did not expose the posted claim id")

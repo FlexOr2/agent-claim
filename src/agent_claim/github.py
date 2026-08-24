@@ -310,6 +310,19 @@ class GitHubIssueComments:
                 f"successor #{issue} must be an open, empty, collaborator-locked issue"
             )
 
+    def _patch_comment_body(self, comment_id: int, body: str) -> None:
+        self._run(
+            [
+                "api",
+                "--method",
+                "PATCH",
+                f"repos/{self.repository}/issues/comments/{comment_id}",
+                "--input",
+                "-",
+            ],
+            input_data=json.dumps({"body": body}).encode("utf-8"),
+        )
+
     def upsert_projection(
         self,
         issue: int,
@@ -358,17 +371,7 @@ class GitHubIssueComments:
         )
         owner, *duplicates = ordered
         if owner.body != validated:
-            self._run(
-                [
-                    "api",
-                    "--method",
-                    "PATCH",
-                    f"repos/{self.repository}/issues/comments/{owner.identifier}",
-                    "--input",
-                    "-",
-                ],
-                input_data=json.dumps({"body": validated}).encode("utf-8"),
-            )
+            self._patch_comment_body(owner.identifier, validated)
         for duplicate in duplicates:
             self._run(
                 [
@@ -379,6 +382,9 @@ class GitHubIssueComments:
                 ]
             )
         return True
+
+    def neutralize_claim_comment(self, comment_id: int, body: str) -> None:
+        self._patch_comment_body(comment_id, _validated_comment(body))
 
     def post_comment(self, issue: int, body: str) -> str:
         encoded = _validated_comment(body).encode("utf-8")
