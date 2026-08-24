@@ -37,7 +37,10 @@ session and whose branch is the current checkout; otherwise it fails closed.
 Omitted `--role` on `release` uses that selected claim's role; an explicit
 `--role` must still match unless `--coordinator-override`. Omitted `--reason` on
 `release` is `landed`. `--coordinator-override` still requires `--role coordinator` and
-`--reason`. `supersede` still requires `--agent` and `--role`.
+`--reason`. `supersede` still requires `--agent` and `--role`. A `--claim-id` already
+present on the ledger, active or released, is refused before anything is posted;
+release the old claim and pass a fresh `--claim-id` instead. Scope extension of an
+existing claim is not supported by reusing its claim id.
 
 Run commands in the repository being coordinated, or pass `--repo
 OWNER/REPOSITORY`. A claim must begin from a clean linked worktree and binds its
@@ -54,6 +57,19 @@ Use `release --coordinator-override` only for an explicit coordinator action.
 Ledger rollover (`supersede`) requires a coordinator whose named claim is the
 only active claim and owns the ledger issue; the successor is a higher-numbered
 open empty collaborator-locked issue, and the freeze is atomic.
+`reconcile` also repairs a duplicated claim id it finds on the ledger, keeping the
+newest occurrence and printing one `REPAIRED claim '<id>': superseded <comments> ->
+survivor #<comment>` line per id it fixes, where `<comments>` lists every superseded
+comment it neutralized (the older CLAIM plus each terminal comment that honored its
+release — there can be more than one, e.g. a release retry) as `#id, #id, ...`.
+An older occurrence only auto-repairs when it is already released, or when it
+shares the survivor's agent and role (a same-agent re-claim, kept newest because
+that reflects the agent's latest intent — this is not scoped to one issue, so a
+same-agent duplicate spanning two issues still only keeps the newer issue's lane
+and silently ends the older one).
+A duplicate still active under two different agents is a real ownership
+conflict; `reconcile` reports it and leaves the whole ledger untouched — for
+every duplicated id, not just the conflicting one — instead of picking a winner.
 
 ## Global loader
 

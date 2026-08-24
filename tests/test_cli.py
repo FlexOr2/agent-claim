@@ -18,6 +18,8 @@ from agent_claim.cli import (  # noqa: E402
     ClaimError,
     ClaimRequest,
     ClaimUnavailable,
+    DuplicateClaimConflict,
+    DuplicateClaimRepair,
     GitHubIssueComments,
     InvalidClaimMarker,
     IssueComment,
@@ -36,6 +38,7 @@ from agent_claim.cli import (  # noqa: E402
     reconcile_issue_label,
     release_claim,
     release_comment,
+    repair_duplicate_claims,
     supersede_comment,
     supersede_ledger,
 )
@@ -351,6 +354,18 @@ class FakeComments:
         entries[:] = [entry for entry in entries if entry.identifier not in duplicate_ids]
         return True
 
+    def neutralize_claim_comment(self, comment_id: int, body: str) -> None:
+        for entries in self.comments.values():
+            for index, entry in enumerate(entries):
+                if entry.identifier == comment_id:
+                    # A real PATCH bumps updated_at; mirror that so the "was edited
+                    # after publication" guard stays live for anything a caller
+                    # neutralizes without also stripping its claim marker prefix.
+                    edited_at = f"2026-08-22T00:00:{entry.identifier:02d}Z"
+                    entries[index] = replace(entry, body=body, updated_at=edited_at)
+                    return
+        raise ClaimError(f"comment {comment_id} not found for neutralization")
+
 
 def marker(
     payload: dict[str, object], *, legacy: bool = False, attributed: bool = True
@@ -443,6 +458,21 @@ def test_edited_protocol_comment_fails_loud() -> None:
         edited.url,
     )
 
+    with pytest.raises(InvalidClaimMarker, match="edited after publication"):
+        parse_claim_event(edited)
+
+
+def test_fake_neutralize_claim_comment_bumps_updated_at_like_a_real_patch() -> None:
+    """`FakeComments.neutralize_claim_comment` must mirror the real PATCH's effect on
+    `updated_at`, so a comment edit that keeps a claim-marker-shaped first line still
+    trips the "was edited after publication" guard in tests, not only in production."""
+    claimed = comment(1, claim_comment(request()))
+    client = FakeComments({LEDGER_ISSUE: [claimed]})
+
+    client.neutralize_claim_comment(1, claimed.body)
+
+    edited = client.comments[LEDGER_ISSUE][0]
+    assert edited.updated_at != edited.created_at
     with pytest.raises(InvalidClaimMarker, match="edited after publication"):
         parse_claim_event(edited)
 
@@ -619,7 +649,10 @@ def test_coordinator_override_is_explicit_and_bound_to_claim_comment() -> None:
         active_claims((comment(1, claimed_body), comment(2, marker(payload))))
 
 
-def test_claim_ids_are_never_reused_and_releases_require_active_claim() -> None:
+def test_active_claims_strict_reader_refuses_reused_claim_ids_and_orphan_releases() -> None:
+    """`active_claims` (the strict reader behind status/claim/release) still refuses a
+    poisoned ledger outright; only `acquire_claim`'s pre-post guard and `reconcile`'s
+    tolerant repair pass are allowed to treat a duplicate claim id as recoverable."""
     claimed_body = claim_comment(request())
     claimed = parse_claim_event(comment(1, claimed_body))
     assert claimed is not None
@@ -964,6 +997,46 @@ def test_same_issue_refuses_a_second_claim_even_with_disjoint_scope() -> None:
             client,
             request("claim-b", "Grok 4.6", issue=72, scope=("src",)),
         )
+
+
+def test_acquire_claim_refuses_reusing_an_active_claim_id_before_posting() -> None:
+    incumbent = comment(1, claim_comment(request("claim-a", issue=72, scope=("old",))))
+    client = FakeComments({LEDGER_ISSUE: [incumbent]}, {72})
+
+    with pytest.raises(ClaimUnavailable, match="claim id 'claim-a' is already"):
+        acquire_claim(
+            client,
+            request("claim-a", "Codex Sol", issue=72, scope=("old", "new")),
+        )
+
+    assert client.comments[LEDGER_ISSUE] == [incumbent]
+
+
+def test_acquire_claim_refuses_reusing_a_released_claim_id_before_posting() -> None:
+    claimed_body = claim_comment(request("claim-a", issue=72))
+    claimed = parse_claim_event(comment(1, claimed_body))
+    assert claimed is not None
+    entries = [comment(1, claimed_body), comment(2, release_event(claimed))]
+    client = FakeComments({LEDGER_ISSUE: list(entries)})
+
+    with pytest.raises(ClaimUnavailable, match="claim id 'claim-a' is already"):
+        acquire_claim(
+            client,
+            request("claim-a", "Grok 4.6", issue=73, scope=("fresh",)),
+        )
+
+    assert client.comments[LEDGER_ISSUE] == entries
+
+
+def test_acquire_claim_translates_a_same_claim_id_post_race_into_a_clear_error() -> None:
+    client = FakeComments()
+    client.inject_after_next_ledger_post = comment(
+        2,
+        claim_comment(request("claim-a", "Grok 4.6", issue=73, scope=("elsewhere",))),
+    )
+
+    with pytest.raises(ClaimUnavailable, match="claim race detected"):
+        acquire_claim(client, request("claim-a", "Codex Sol", issue=72, scope=("mine",)))
 
 
 def test_earlier_ledger_comment_wins_cross_issue_scope_race_and_label_survives() -> None:
@@ -1339,6 +1412,250 @@ def test_reconcile_all_repairs_active_and_stale_labels() -> None:
 
     assert observed == (72,)
     assert client.labels == {72}
+
+
+def test_reconcile_repairs_a_duplicate_claim_id_and_restores_strict_reads() -> None:
+    older_body = claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("old",)))
+    newer_body = claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("new",)))
+    client = FakeComments({LEDGER_ISSUE: [comment(1, older_body), comment(2, newer_body)]})
+
+    with pytest.raises(InvalidClaimMarker, match="was reused"):
+        active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+
+    repaired = repair_duplicate_claims(client)
+
+    assert repaired == (
+        DuplicateClaimRepair(
+            claim_id="claim-a", superseded_comment_ids=(1,), survivor_comment_id=2
+        ),
+    )
+    survivors = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert [claim.comment.identifier for claim in survivors] == [2]
+    assert not is_protocol_candidate(client.comments[LEDGER_ISSUE][0])
+    assert "SUPERSEDED" in client.comments[LEDGER_ISSUE][0].body
+    assert "claim-a" in client.comments[LEDGER_ISSUE][0].body
+
+    assert reconcile_all_labels(client) == (72,)
+    assert client.labels == {72}
+
+
+@pytest.mark.parametrize(
+    ("older_agent", "release_before_reuse", "newer_agent", "expect_repaired"),
+    [
+        pytest.param("Codex Sol", False, "Codex Sol", True, id="same_agent_unreleased"),
+        pytest.param("Codex Sol", True, "Grok 4.6", True, id="released_id_reuse"),
+        pytest.param("Codex Sol", False, "Grok 4.6", False, id="cross_agent_unreleased"),
+    ],
+)
+def test_repair_duplicate_claims_only_auto_resolves_the_safe_cases(
+    older_agent: str,
+    release_before_reuse: bool,
+    newer_agent: str,
+    expect_repaired: bool,
+) -> None:
+    older_body = claim_comment(request("claim-a", older_agent, issue=72, scope=("old",)))
+    older_claim = parse_claim_event(comment(1, older_body))
+    assert older_claim is not None
+    entries = [comment(1, older_body)]
+    if release_before_reuse:
+        entries.append(comment(2, release_event(older_claim)))
+    entries.append(
+        comment(
+            len(entries) + 1,
+            claim_comment(request("claim-a", newer_agent, issue=72, scope=("new",))),
+        )
+    )
+    client = FakeComments({LEDGER_ISSUE: entries})
+
+    if not expect_repaired:
+        before = list(client.comments[LEDGER_ISSUE])
+        with pytest.raises(DuplicateClaimConflict, match="claim id 'claim-a'"):
+            repair_duplicate_claims(client)
+        assert client.comments[LEDGER_ISSUE] == before
+        return
+
+    repaired = repair_duplicate_claims(client)
+
+    expected_superseded_ids = (1, 2) if release_before_reuse else (1,)
+    assert repaired == (
+        DuplicateClaimRepair(
+            claim_id="claim-a",
+            superseded_comment_ids=expected_superseded_ids,
+            survivor_comment_id=entries[-1].identifier,
+        ),
+    )
+    survivors = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert [(claim.claim_id, claim.agent) for claim in survivors] == [("claim-a", newer_agent)]
+    assert not is_protocol_candidate(client.comments[LEDGER_ISSUE][0])
+    if release_before_reuse:
+        assert not is_protocol_candidate(client.comments[LEDGER_ISSUE][1])
+
+
+def test_repair_duplicate_claims_ignores_an_inert_ledger_supersede_as_a_release() -> None:
+    """A `LedgerSupersede` event only really terminates a claim when
+    `_apply_terminal_event` honors it (coordinator role, right ledger issue, right
+    claim comment id, and it was the ledger's only active claim). One that misses
+    any of those conditions is inert and must not be read as a release by repair,
+    even though it parses cleanly and names the right claim id."""
+    original = comment(1, claim_comment(request("claim-a", "Codex Sol", issue=LEDGER_ISSUE)))
+    original_claim = parse_claim_event(original)
+    assert isinstance(original_claim, ActiveClaim)
+    other_active_claim = comment(
+        2, claim_comment(request("other", "Codex Sol", issue=72))
+    )
+    inert_supersede = comment(
+        3,
+        supersede_comment(
+            original_claim, 170, "Fleet Coordinator", "coordinator", "rollover"
+        ),
+    )
+    reused = comment(
+        4, claim_comment(request("claim-a", "Grok 4.6", issue=LEDGER_ISSUE, scope=("new",)))
+    )
+    client = FakeComments(
+        {LEDGER_ISSUE: [original, other_active_claim, inert_supersede, reused]}
+    )
+    before = list(client.comments[LEDGER_ISSUE])
+
+    with pytest.raises(DuplicateClaimConflict, match="claim id 'claim-a'"):
+        repair_duplicate_claims(client)
+
+    assert client.comments[LEDGER_ISSUE] == before
+
+
+def test_repair_duplicate_claims_attributes_a_late_release_to_the_original_occurrence() -> None:
+    """`claim x (A) -> claim x (B, duplicate) -> release x (A)`: the release names
+    the original claimant and must close the FIRST occurrence, letting the safe
+    already-released repair apply, regardless of which agent posted the duplicate."""
+    original = comment(1, claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("old",))))
+    original_claim = parse_claim_event(original)
+    assert isinstance(original_claim, ActiveClaim)
+    duplicate = comment(
+        2, claim_comment(request("claim-a", "Grok 4.6", issue=73, scope=("new",)))
+    )
+    late_release = comment(3, release_event(original_claim))
+    client = FakeComments({LEDGER_ISSUE: [original, duplicate, late_release]})
+
+    repaired = repair_duplicate_claims(client)
+
+    assert repaired == (
+        DuplicateClaimRepair(
+            claim_id="claim-a", superseded_comment_ids=(1, 3), survivor_comment_id=2
+        ),
+    )
+    survivors = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert [(claim.issue, claim.agent) for claim in survivors] == [(73, "Grok 4.6")]
+
+
+@pytest.mark.parametrize(
+    "second_release_body",
+    [
+        pytest.param(
+            lambda claim: release_comment(claim, claim.agent, claim.role, "landed retry"),
+            id="release_retry",
+        ),
+        pytest.param(
+            lambda claim: release_comment(
+                claim,
+                "Fleet Coordinator",
+                "coordinator",
+                "verified handoff",
+                coordinator_override=True,
+            ),
+            id="claimant_then_coordinator_override",
+        ),
+    ],
+)
+def test_repair_duplicate_claims_neutralizes_every_honored_terminal_comment(
+    second_release_body,
+) -> None:
+    """A claim id can legitimately carry more than one honored terminal comment (an
+    idempotent release retry, or a claimant release followed by a coordinator
+    override). Repair must neutralize ALL of them, not only the one whose pop
+    actually emptied `active` — otherwise the surviving terminal comment is left
+    referencing a claim that repair just made invisible, and the ledger stays dead."""
+    original = comment(1, claim_comment(request("claim-a", "Codex Sol", issue=72)))
+    original_claim = parse_claim_event(original)
+    assert isinstance(original_claim, ActiveClaim)
+    first_release = comment(2, release_event(original_claim))
+    second_release = comment(3, second_release_body(original_claim))
+    reused = comment(
+        4, claim_comment(request("claim-a", "Grok 4.6", issue=73, scope=("fresh",)))
+    )
+    client = FakeComments(
+        {LEDGER_ISSUE: [original, first_release, second_release, reused]}
+    )
+
+    repaired = repair_duplicate_claims(client)
+
+    assert repaired == (
+        DuplicateClaimRepair(
+            claim_id="claim-a", superseded_comment_ids=(1, 2, 3), survivor_comment_id=4
+        ),
+    )
+    survivors = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert [(claim.issue, claim.agent) for claim in survivors] == [(73, "Grok 4.6")]
+    # A truly clean repair: nothing left for a second reconcile pass to find or fix.
+    assert repair_duplicate_claims(client) == ()
+
+
+def test_repair_duplicate_claims_validates_every_lifecycle_before_writing_any() -> None:
+    first = comment(1, claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("old",))))
+    middle = comment(2, claim_comment(request("claim-a", "Grok 4.6", issue=72, scope=("mid",))))
+    newest = comment(3, claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("new",))))
+    client = FakeComments({LEDGER_ISSUE: [first, middle, newest]})
+    before = list(client.comments[LEDGER_ISSUE])
+
+    with pytest.raises(DuplicateClaimConflict, match="claim id 'claim-a'"):
+        repair_duplicate_claims(client)
+
+    assert client.comments[LEDGER_ISSUE] == before
+
+
+def test_repair_duplicate_claims_leaves_other_duplicate_ids_untouched_when_one_conflicts() -> None:
+    safe_older = comment(
+        1, claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("old",)))
+    )
+    safe_newer = comment(
+        2, claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("new",)))
+    )
+    conflict_older = comment(
+        3, claim_comment(request("claim-b", "Codex Sol", issue=73, scope=("x",)))
+    )
+    conflict_newer = comment(
+        4, claim_comment(request("claim-b", "Grok 4.6", issue=73, scope=("y",)))
+    )
+    client = FakeComments(
+        {LEDGER_ISSUE: [safe_older, safe_newer, conflict_older, conflict_newer]}
+    )
+    before = list(client.comments[LEDGER_ISSUE])
+
+    with pytest.raises(DuplicateClaimConflict, match="claim id 'claim-b'"):
+        repair_duplicate_claims(client)
+
+    assert client.comments[LEDGER_ISSUE] == before
+
+
+def test_repair_duplicate_claims_same_agent_cross_issue_keeps_only_the_newer_lane() -> None:
+    """Documented tradeoff: same-agent keep-newest is not scoped to one issue. A
+    same-agent duplicate spanning two issues still only keeps the newer issue's
+    lane; the older issue's still-active claim is silently ended, not preserved."""
+    older = comment(1, claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("old",))))
+    newer = comment(2, claim_comment(request("claim-a", "Codex Sol", issue=73, scope=("new",))))
+    client = FakeComments({LEDGER_ISSUE: [older, newer]}, {72, 73})
+
+    repaired = repair_duplicate_claims(client)
+
+    assert repaired == (
+        DuplicateClaimRepair(
+            claim_id="claim-a", superseded_comment_ids=(1,), survivor_comment_id=2
+        ),
+    )
+    survivors = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert [(claim.issue, claim.claim_id) for claim in survivors] == [(73, "claim-a")]
+
+    assert reconcile_all_labels(client) == (73,)
+    assert client.labels == {73}
 
 
 def test_stale_reconcile_removes_label_when_supersede_wins_midflight() -> None:
@@ -2940,6 +3257,58 @@ def _patch_status_cli(
 ) -> None:
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: ledger)
+
+
+def test_cli_reconcile_repairs_a_poisoned_ledger_and_status_reads_it_afterwards(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    older_body = claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("old",)))
+    newer_body = claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("new",)))
+    client = FakeComments({LEDGER_ISSUE: [comment(1, older_body), comment(2, newer_body)]})
+    _patch_status_cli(monkeypatch, client)
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "reconcile"]) == 0
+    reconcile_out = capsys.readouterr().out
+    assert "REPAIRED claim 'claim-a': superseded #1 -> survivor #2" in reconcile_out
+    assert "RECONCILED #72" in reconcile_out
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "status", "72"]) == 0
+    assert "CLAIMED issue #72" in capsys.readouterr().out
+
+
+def test_cli_reconcile_refuses_a_cross_agent_duplicate_with_exit_code_two(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    older_body = claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("old",)))
+    newer_body = claim_comment(request("claim-a", "Grok 4.6", issue=72, scope=("new",)))
+    client = FakeComments({LEDGER_ISSUE: [comment(1, older_body), comment(2, newer_body)]})
+    _patch_status_cli(monkeypatch, client)
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "reconcile"]) == 2
+    assert "claim id 'claim-a'" in capsys.readouterr().err
+
+
+def test_cli_reconcile_still_clears_stale_labels_when_ledger_is_frozen(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    claimed_body = claim_comment(request(issue=LEDGER_ISSUE))
+    claimed = parse_claim_event(comment(1, claimed_body))
+    assert isinstance(claimed, ActiveClaim)
+    frozen_body = supersede_comment(
+        claimed, 170, "Fleet Coordinator", "coordinator", "reviewed rollover ready"
+    )
+    client = FakeComments(
+        {LEDGER_ISSUE: [comment(1, claimed_body), comment(2, frozen_body)]},
+        {LEDGER_ISSUE, 72},
+    )
+    _patch_status_cli(monkeypatch, client)
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "reconcile"]) == 2
+    assert "frozen" in capsys.readouterr().err
+    assert client.labels == set()
 
 
 def test_cli_status_empty_ledger_prints_ledger_then_unclaimed_repository(

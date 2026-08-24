@@ -20,6 +20,8 @@ ClaimError = protocol.ClaimError
 ClaimRequest = protocol.ClaimRequest
 ClaimUnavailable = protocol.ClaimUnavailable
 ClaimantRelease = protocol.ClaimantRelease
+DuplicateClaimConflict = protocol.DuplicateClaimConflict
+DuplicateClaimRepair = protocol.DuplicateClaimRepair
 InvalidClaimMarker = protocol.InvalidClaimMarker
 IssueComment = protocol.IssueComment
 LEDGER_BODY_MARKER = protocol.LEDGER_BODY_MARKER
@@ -48,6 +50,7 @@ is_protocol_candidate = protocol.is_protocol_candidate
 parse_claim_event = protocol.parse_claim_event
 reconcile_all_labels = protocol.reconcile_all_labels
 reconcile_issue_label = protocol.reconcile_issue_label
+repair_duplicate_claims = protocol.repair_duplicate_claims
 release_claim = protocol.release_claim
 release_comment = protocol.release_comment
 supersede_comment = protocol.supersede_comment
@@ -431,6 +434,17 @@ def main(arguments: list[str] | None = None) -> int:
                 f"#{parsed.successor_issue}: {frozen.claim_id}"
             )
             return 0
+        try:
+            for repair in protocol.repair_duplicate_claims(client):
+                superseded = ", ".join(f"#{cid}" for cid in repair.superseded_comment_ids)
+                print(
+                    f"REPAIRED claim {repair.claim_id!r}: superseded {superseded} "
+                    f"-> survivor #{repair.survivor_comment_id}"
+                )
+        except protocol.LedgerSuperseded:
+            # A frozen ledger has nothing left for duplicate repair to fix; let the
+            # label reconciliation below observe the freeze and run its own cleanup.
+            pass
         if parsed.issue is None:
             reconciled = protocol.reconcile_all_labels(client)
         else:
