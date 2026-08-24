@@ -32,8 +32,9 @@ Omitted `--agent` on `claim` and `release` is filled from non-empty
 non-empty `CLAUDE_SESSION_ID` as `Claude {session}`. `GROK_AGENT` is not a name.
 Missing or present-invalid identity fails closed before GitHub work. Omitted
 `--role` on `claim` is `builder`; an explicit `--role` wins. Omitted `--claim-id`
-on `release` selects the unique active claim on that issue whose agent is this
-session and whose branch is the current checkout; otherwise it fails closed.
+on `release` selects the unique active claim on that issue or lane whose agent
+is this session and whose branch is the current checkout; otherwise it fails
+closed.
 Omitted `--role` on `release` uses that selected claim's role; an explicit
 `--role` must still match unless `--coordinator-override`. Omitted `--reason` on
 `release` is `landed`. `--coordinator-override` still requires `--role coordinator` and
@@ -64,12 +65,57 @@ comment it neutralized (the older CLAIM plus each terminal comment that honored 
 release — there can be more than one, e.g. a release retry) as `#id, #id, ...`.
 An older occurrence only auto-repairs when it is already released, or when it
 shares the survivor's agent and role (a same-agent re-claim, kept newest because
-that reflects the agent's latest intent — this is not scoped to one issue, so a
-same-agent duplicate spanning two issues still only keeps the newer issue's lane
-and silently ends the older one).
+that reflects the agent's latest intent — this is not scoped to one identity, so
+a same-agent duplicate spanning two issues, two lanes, or an issue and a lane
+still only keeps the newer identity's workstream and silently ends the older
+one).
 A duplicate still active under two different agents is a real ownership
 conflict; `reconcile` reports it and leaves the whole ledger untouched — for
 every duplicated id, not just the conflicting one — instead of picking a winner.
+
+## Issueless lane claims
+
+`docs/`- and `fix/`-prefixed branches land within one session without a GitHub
+issue. Omit the positional issue number on `claim`/`release` for this lane mode,
+derived from the current checkout branch — no separate `--lane` flag. Lane mode
+is refused with the offending branch name and both remedies (pass an issue
+number, or check out a `docs/`/`fix/` branch) when the branch does not follow
+that convention, so a builder who simply forgot the issue number never gets a
+silent, unlabeled claim:
+
+```bash
+git worktree add ../repo-worktrees/docs-tidy-readme -b docs/tidy-readme
+cd ../repo-worktrees/docs-tidy-readme
+agent-claim claim --agent "Ada" --scope README.md
+agent-claim release
+```
+
+Like an issue claim, a lane claim must begin from a clean linked worktree
+checked out on that branch — `claim` fails outside one.
+
+A lane claim shares the same exclusivity, scope-conflict rules, and release
+path as an issue claim: two lane claims collide on the same branch or an
+overlapping scope, and a lane collides with an issue claim over scope overlap.
+`status` and `protect` show and authorize it the same way. A lane owns no
+GitHub issue, so it gets no projection comment or label, and `reconcile` never
+touches it.
+
+There is no flag to name a lane explicitly on `release`: a lane's only name is
+the checkout branch it was claimed from, so releasing it — including a
+coordinator override — always runs from a checkout of that same lane branch.
+If the original worktree is gone or held by another session, re-create a
+worktree on that branch (`git worktree add <path> <lane-branch>`) and run
+`agent-claim release --claim-id <id> --coordinator-override --role coordinator
+--reason "..."` from inside it, where `<id>` comes from `agent-claim status`
+(omitting `--claim-id` still filters by the releasing agent, coordinator
+override or not, so a foreign stuck claim needs the id).
+
+The lane-claim marker extends the same `agent-claim:v2` event, but with a
+different key set than an issue claim. A pre-issue-38 `agent-claim` cannot
+parse it: it fails loud on the whole ledger, not just the lane claim, until it
+upgrades — deliberate, since an agent that cannot read the live locks must not
+build blindly. Upgrade every `agent-claim` installation together with (or
+before) the first lane claim posted to a shared ledger.
 
 ## Global loader
 

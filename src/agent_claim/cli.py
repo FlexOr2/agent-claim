@@ -24,6 +24,9 @@ DuplicateClaimConflict = protocol.DuplicateClaimConflict
 DuplicateClaimRepair = protocol.DuplicateClaimRepair
 InvalidClaimMarker = protocol.InvalidClaimMarker
 IssueComment = protocol.IssueComment
+IssueIdentity = protocol.IssueIdentity
+LaneIdentity = protocol.LaneIdentity
+ISSUELESS_LANE_BRANCH_PREFIXES = protocol.ISSUELESS_LANE_BRANCH_PREFIXES
 LEDGER_BODY_MARKER = protocol.LEDGER_BODY_MARKER
 LEDGER_LABEL = protocol.LEDGER_LABEL
 LedgerSupersede = protocol.LedgerSupersede
@@ -68,6 +71,34 @@ POLICY_LOADER = (
 DEFAULT_CLAIM_ROLE = "builder"
 
 
+def _resolved_identity(issue: int | None, branch: str) -> protocol.ClaimIdentity:
+    """Resolve the CLI's discriminated identity: an explicit issue, or a lane.
+
+    Omitting the positional issue number means lane mode, derived from `branch`
+    (the same checkout branch `--base`/`--branch` auto-fill and the release
+    branch-matching fallback already use). Lane mode is refused outright unless
+    `branch` follows the issueless-lane convention, so a builder who simply forgot
+    the issue number never gets a silent, unlabeled, non-projected lane claim.
+    """
+    if issue is not None:
+        return protocol.IssueIdentity(issue)
+    if not branch.startswith(protocol.ISSUELESS_LANE_BRANCH_PREFIXES):
+        prefixes = " or ".join(repr(prefix) for prefix in protocol.ISSUELESS_LANE_BRANCH_PREFIXES)
+        raise protocol.ClaimError(
+            f"branch {branch!r} is not an issueless lane; pass an issue number, or "
+            f"check out a branch prefixed {prefixes}"
+        )
+    return protocol.LaneIdentity()
+
+
+def _claim_subject(claim: protocol.ActiveClaim) -> str:
+    return (
+        f"lane {claim.branch}"
+        if isinstance(claim.identity, protocol.LaneIdentity)
+        else f"issue #{claim.identity.issue}"
+    )
+
+
 def _request(arguments: argparse.Namespace) -> protocol.ClaimRequest:
     agent = checkout._resolved_agent(arguments.agent)
     if arguments.base is None:
@@ -78,13 +109,14 @@ def _request(arguments: argparse.Namespace) -> protocol.ClaimRequest:
         branch = checkout._git_output(["branch", "--show-current"])
     else:
         branch = arguments.branch
+    identity = _resolved_identity(arguments.issue, branch)
     payload: dict[str, object] = {
         "action": "claim",
         "agent": agent,
         "base": base,
         "branch": branch,
         "claim_id": arguments.claim_id or uuid.uuid4().hex,
-        "issue": arguments.issue,
+        protocol._identity_marker_key(identity): protocol._identity_marker_value(identity),
         "role": arguments.role,
         "scope": arguments.scope,
     }
@@ -100,7 +132,7 @@ def _request(arguments: argparse.Namespace) -> protocol.ClaimRequest:
     if not isinstance(parsed, protocol.ActiveClaim):
         raise protocol.ClaimError("claim request did not produce a marker")
     request = protocol.ClaimRequest(
-        issue=parsed.issue,
+        identity=parsed.identity,
         agent=parsed.agent,
         role=parsed.role,
         base=parsed.base,
@@ -125,7 +157,12 @@ def _parser() -> argparse.ArgumentParser:
     status.add_argument("--json", action="store_true")
 
     claim = commands.add_parser("claim", help="claim an issue and scope before editing")
-    claim.add_argument("issue", type=int)
+    claim.add_argument(
+        "issue",
+        type=int,
+        nargs="?",
+        help="omit for lane mode, derived from a docs/ or fix/ checkout branch",
+    )
     claim.add_argument("--agent")
     claim.add_argument("--role", default=DEFAULT_CLAIM_ROLE)
     claim.add_argument("--base")
@@ -135,7 +172,12 @@ def _parser() -> argparse.ArgumentParser:
     claim.add_argument("--json", action="store_true")
 
     release = commands.add_parser("release", help="release a landed or abandoned claim")
-    release.add_argument("issue", type=int)
+    release.add_argument(
+        "issue",
+        type=int,
+        nargs="?",
+        help="omit for lane mode, derived from a docs/ or fix/ checkout branch",
+    )
     release.add_argument("--agent")
     release.add_argument("--role")
     release.add_argument("--reason")
@@ -163,10 +205,26 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _identity_json(identity: protocol.ClaimIdentity) -> dict[str, object]:
+    """`issue`/`lane` pair for one claim's discriminated identity, for JSON output.
+
+    A lane claim's name lives in the sibling `branch` field of the same JSON
+    object, so `lane` stays a bare marker instead of duplicating it.
+    """
+    if isinstance(identity, protocol.LaneIdentity):
+        return {"issue": None, "lane": True}
+    return {"issue": identity.issue, "lane": None}
+
+
 def _status_claims(
     claims: tuple[protocol.ActiveClaim, ...], issue: int | None
 ) -> tuple[tuple[protocol.ActiveClaim, ...], set[str]]:
-    selected = tuple(claim for claim in claims if issue is None or claim.issue == issue)
+    selected = tuple(
+        claim
+        for claim in claims
+        if issue is None
+        or (isinstance(claim.identity, protocol.IssueIdentity) and claim.identity.issue == issue)
+    )
     if not selected:
         return (), set()
     index = protocol._claim_conflict_index(claims)
@@ -188,7 +246,7 @@ def _status(claims: tuple[protocol.ActiveClaim, ...], issue: int | None) -> int:
     for claim in related:
         state = "CONFLICT" if claim.claim_id in conflict_ids else "CLAIMED"
         print(
-            f"{state} issue #{claim.issue}: {claim.agent} ({claim.role}) "
+            f"{state} {_claim_subject(claim)}: {claim.agent} ({claim.role}) "
             f"base={claim.base} branch={claim.branch} claim={claim.claim_id}"
         )
         for path in claim.scope:
@@ -212,7 +270,7 @@ def _status_json(
         "state": state,
         "claims": [
             {
-                "issue": claim.issue,
+                **_identity_json(claim.identity),
                 "agent": claim.agent,
                 "role": claim.role,
                 "base": claim.base,
@@ -232,7 +290,7 @@ def _claim_json(claimed: protocol.ActiveClaim) -> int:
     print(
         json.dumps(
             {
-                "issue": claimed.issue,
+                **_identity_json(claimed.identity),
                 "claim_id": claimed.claim_id,
                 "url": claimed.comment.url,
                 "agent": claimed.agent,
@@ -252,7 +310,8 @@ def _release_json(
     print(
         json.dumps(
             {
-                "issue": released.issue,
+                **_identity_json(released.identity),
+                "branch": released.branch,
                 "claim_id": released.claim_id,
                 "agent": agent,
                 "role": role if role is not None else released.role,
@@ -374,9 +433,15 @@ def main(arguments: list[str] | None = None) -> int:
         if parsed.command == "release":
             if parsed.coordinator_override:
                 protocol._require_coordinator_override(parsed.role, parsed.reason)
-            if parsed.claim_id is None:
+            if parsed.issue is None or parsed.claim_id is None:
                 release_branch = checkout._git_output(["branch", "--show-current"])
                 if not release_branch:
+                    if parsed.issue is None:
+                        raise protocol.ClaimUnavailable(
+                            "lane release requires a non-empty current branch; "
+                            "check out the docs/ or fix/ lane branch, or pass "
+                            "an issue number"
+                        )
                     raise protocol.ClaimUnavailable(
                         "release without --claim-id requires a non-empty current branch; "
                         "pass --claim-id"
@@ -403,12 +468,13 @@ def main(arguments: list[str] | None = None) -> int:
             claimed = protocol.acquire_claim(client, _request(parsed))
             if parsed.json:
                 return _claim_json(claimed)
-            print(f"CLAIMED issue #{parsed.issue}: {claimed.claim_id} {claimed.comment.url}")
+            print(f"CLAIMED {_claim_subject(claimed)}: {claimed.claim_id} {claimed.comment.url}")
             return 0
         if parsed.command == "release":
+            identity = _resolved_identity(parsed.issue, release_branch or "")
             released = protocol.release_claim(
                 client,
-                parsed.issue,
+                identity,
                 parsed.agent,
                 parsed.role,
                 parsed.reason,
@@ -418,7 +484,7 @@ def main(arguments: list[str] | None = None) -> int:
             )
             if parsed.json:
                 return _release_json(released, parsed.agent, parsed.role, parsed.reason)
-            print(f"RELEASED issue #{parsed.issue}: {released.claim_id}")
+            print(f"RELEASED {_claim_subject(released)}: {released.claim_id}")
             return 0
         if parsed.command == "supersede":
             frozen = protocol.supersede_ledger(
@@ -450,9 +516,10 @@ def main(arguments: list[str] | None = None) -> int:
         else:
             protocol.reconcile_issue_label(client, parsed.issue)
             reconciled = tuple(
-                claim.issue
+                claim.identity.issue
                 for claim in protocol._ledger_claims(client)
-                if claim.issue == parsed.issue
+                if isinstance(claim.identity, protocol.IssueIdentity)
+                and claim.identity.issue == parsed.issue
             )
         print("RECONCILED " + (", ".join(f"#{issue}" for issue in reconciled) or "no claims"))
         return 0

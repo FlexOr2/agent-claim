@@ -23,6 +23,8 @@ from agent_claim.cli import (  # noqa: E402
     GitHubIssueComments,
     InvalidClaimMarker,
     IssueComment,
+    IssueIdentity,
+    LaneIdentity,
     LedgerSupersede,
     LedgerSuperseded,
     _repository,
@@ -197,17 +199,29 @@ def request(
     claim_id: str = "claim-a",
     agent: str = "Codex Sol",
     *,
-    issue: int = 71,
+    issue: int | None = 71,
+    lane: bool = False,
     role: str = "builder",
     branch: str | None = None,
     scope: tuple[str, ...] = ("docs/COORDINATION.md", "scripts/issue_claim.py"),
 ) -> ClaimRequest:
+    """Build a `ClaimRequest`, issue-identified by default or lane-identified via `lane=True`.
+
+    `issue=None` implies `lane=True` (mirrors the CLI's own "omitted issue number
+    means lane mode" rule) so parametrized tables can drive both identity kinds
+    from one `issue`/`lane` axis without hand-building identities at every call site.
+    """
+    lane = lane or issue is None
+    identity: protocol.ClaimIdentity = (
+        protocol.LaneIdentity() if lane else protocol.IssueIdentity(issue)
+    )
+    default_branch = f"docs/lane-{claim_id}" if lane else f"codex/issue-{issue}-claims"
     return ClaimRequest(
-        issue=issue,
+        identity=identity,
         agent=agent,
         role=role,
         base=BASE,
-        branch=branch or f"codex/issue-{issue}-claims",
+        branch=branch or default_branch,
         scope=scope,
         claim_id=claim_id,
     )
@@ -282,7 +296,7 @@ class FakeComments:
             self.comments.setdefault(protocol.LEDGER_ISSUE, []).append(
                 self.inject_during_next_remove
             )
-            self.labels.add(self.inject_during_next_remove_event.issue)
+            self.labels.add(self.inject_during_next_remove_event.identity.issue)
             self.inject_during_next_remove = None
         self.labels.discard(issue)
 
@@ -389,18 +403,73 @@ def release_event(claim, *, agent: str | None = None, role: str | None = None) -
     )
 
 
-def test_claim_marker_round_trips_visible_contract() -> None:
-    body = claim_comment(request())
+@pytest.mark.parametrize(
+    ("lane", "expected_identity", "expected_branch"),
+    [
+        (False, IssueIdentity(71), "codex/issue-71-claims"),
+        (True, LaneIdentity(), "docs/lane-claim-a"),
+    ],
+)
+def test_claim_marker_round_trips_visible_contract(
+    lane: bool, expected_identity: protocol.ClaimIdentity, expected_branch: str
+) -> None:
+    body = claim_comment(request(lane=lane))
     parsed = parse_claim_event(comment(1, body))
 
     assert parsed is not None
-    assert parsed.issue == 71
+    assert parsed.identity == expected_identity
     assert parsed.claim_id == "claim-a"
     assert parsed.base == BASE
-    assert parsed.branch == "codex/issue-71-claims"
+    assert parsed.branch == expected_branch
     assert parsed.scope == ("docs/COORDINATION.md", "scripts/issue_claim.py")
     assert "Agent: Codex Sol (builder)" in body
     assert "Auto-Runner" in body
+
+
+def _marker_payload_keys(body: str) -> frozenset[str]:
+    first_line = body.partition("\n")[0]
+    encoded = first_line[len(protocol.MARKER_PREFIX) : -len(protocol.MARKER_SUFFIX)]
+    return frozenset(json.loads(encoded))
+
+
+def test_lane_and_issue_claim_markers_use_different_key_sets() -> None:
+    """Compatibility evidence for Entschieden #4: a pre-issue-38 reader always calls
+    `_required_issue` on a non-legacy claim marker before dispatching on action; a
+    lane marker never carries an `issue` key, so that reader fails loud on the whole
+    ledger instead of silently skipping the comment it cannot understand."""
+    issue_keys = _marker_payload_keys(claim_comment(request(lane=False)))
+    lane_keys = _marker_payload_keys(claim_comment(request(lane=True)))
+
+    assert "issue" in issue_keys and "lane" not in issue_keys
+    assert "lane" in lane_keys and "issue" not in lane_keys
+    assert issue_keys != lane_keys
+
+
+@pytest.mark.parametrize(
+    ("payload", "match"),
+    [
+        pytest.param(
+            {"action": "claim", "issue": 71, "lane": True},
+            "must not carry both issue and lane",
+            id="both-issue-and-lane",
+        ),
+        pytest.param(
+            {"action": "claim", "lane": "yes"},
+            "lane field must be true",
+            id="lane-not-exactly-true",
+        ),
+        pytest.param(
+            {"action": "claim"},
+            "issue must be a positive integer",
+            id="neither-issue-nor-lane",
+        ),
+    ],
+)
+def test_marker_identity_discriminator_refuses_ambiguous_or_missing_keys(
+    payload: dict[str, object], match: str
+) -> None:
+    with pytest.raises(InvalidClaimMarker, match=match):
+        parse_claim_event(comment(1, marker(payload)))
 
 
 def test_protocol_parser_returns_action_specific_types() -> None:
@@ -558,8 +627,32 @@ def test_legacy_bootstrap_claim_is_read_only_when_marker_is_first_line() -> None
     parsed = parse_claim_event(comment(1, legacy))
 
     assert parsed is not None
-    assert parsed.issue == LEDGER_ISSUE
+    assert parsed.identity == IssueIdentity(LEDGER_ISSUE)
     assert parsed.claim_id == "bootstrap"
+
+
+def test_legacy_marker_fails_loud_with_a_clear_message_before_ledger_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legacy marker binds to `LEDGER_ISSUE`; parsing one before `configure_ledger`
+    runs must report the real defect (caller/setup), not misreport it as if the
+    marker itself carried an invalid issue number."""
+    monkeypatch.setattr(protocol, "LEDGER_ISSUE", 0)
+    legacy = marker(
+        {
+            "action": "claim",
+            "agent": "Codex Sol",
+            "base": BASE,
+            "branch": "codex/issue-71-claims",
+            "claim_id": "bootstrap",
+            "role": "builder",
+            "scope": ["AGENTS.md"],
+        },
+        legacy=True,
+    )
+
+    with pytest.raises(ClaimError, match="before configure_ledger"):
+        parse_claim_event(comment(1, legacy))
 
 
 @pytest.mark.parametrize(
@@ -910,6 +1003,41 @@ def test_scope_overlap_is_repository_wide_and_path_aware() -> None:
     assert not claims_conflict(left, sibling)
 
 
+@pytest.mark.parametrize(
+    ("right", "expected"),
+    [
+        pytest.param(
+            request("claim-b", lane=True, branch="docs/lane-a", scope=("other",)),
+            True,
+            id="same-lane-disjoint-scope-still-conflicts",
+        ),
+        pytest.param(
+            request("claim-b", lane=True, branch="docs/lane-b", scope=("shared/file.py",)),
+            True,
+            id="different-lanes-overlapping-scope-conflicts",
+        ),
+        pytest.param(
+            request("claim-b", lane=True, branch="docs/lane-b", scope=("other",)),
+            False,
+            id="different-lanes-disjoint-scope-no-conflict",
+        ),
+        pytest.param(
+            request("claim-b", issue=72, scope=("shared/file.py",)),
+            True,
+            id="lane-and-issue-overlapping-scope-conflicts",
+        ),
+        pytest.param(
+            request("claim-b", issue=72, scope=("other",)),
+            False,
+            id="lane-and-issue-disjoint-scope-no-conflict",
+        ),
+    ],
+)
+def test_lane_and_issue_conflict_matrix(right: ClaimRequest, expected: bool) -> None:
+    left = request(lane=True, branch="docs/lane-a", scope=("shared",))
+    assert claims_conflict(left, right) == expected
+
+
 def test_status_scope_index_never_rescans_scope_pairs(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -968,7 +1096,7 @@ def test_disjoint_issues_can_be_claimed_and_are_projected() -> None:
         request("claim-b", "Grok 4.6", issue=73, scope=("src",)),
     )
 
-    assert {first.issue, second.issue} == {72, 73}
+    assert {first.identity.issue, second.identity.issue} == {72, 73}
     assert client.labels == {72, 73}
     assert "🔒 **Claimed**" in client.comments[72][0].body
     assert "🔒 **Claimed**" in client.comments[73][0].body
@@ -996,6 +1124,30 @@ def test_same_issue_refuses_a_second_claim_even_with_disjoint_scope() -> None:
         acquire_claim(
             client,
             request("claim-b", "Grok 4.6", issue=72, scope=("src",)),
+        )
+
+
+def test_same_lane_refuses_a_second_claim_even_with_disjoint_scope() -> None:
+    client = FakeComments()
+    acquire_claim(client, request(lane=True, branch="docs/lane-a", scope=("frontend",)))
+
+    with pytest.raises(ClaimUnavailable, match="lane 'docs/lane-a'"):
+        acquire_claim(
+            client,
+            request("claim-b", "Grok 4.6", lane=True, branch="docs/lane-a", scope=("src",)),
+        )
+
+
+def test_lane_and_issue_claim_with_overlapping_scope_refuses_before_posting() -> None:
+    client = FakeComments()
+    acquire_claim(client, request(issue=72, scope=("shared",)))
+
+    with pytest.raises(ClaimUnavailable, match="lane 'docs/lane-a'"):
+        acquire_claim(
+            client,
+            request(
+                "claim-b", "Grok 4.6", lane=True, branch="docs/lane-a", scope=("shared/file.py",)
+            ),
         )
 
 
@@ -1068,7 +1220,7 @@ def test_release_removes_projection_only_after_claim_is_gone() -> None:
 
     released = release_claim(
         client,
-        72,
+        IssueIdentity(72),
         "Codex Sol",
         "builder",
         "landed",
@@ -1094,7 +1246,7 @@ def test_release_reconciliation_keeps_a_successor_claim_projection_active() -> N
 
     release_claim(
         client,
-        72,
+        IssueIdentity(72),
         "Codex Sol",
         "builder",
         "landed",
@@ -1153,7 +1305,7 @@ def test_successor_adopts_old_projection_but_old_helper_cannot_mutate_it(
     monkeypatch.setattr(protocol, "LEDGER_ISSUE", 170)
     successor_body = issue_claim._active_projection(
         ActiveClaim(
-            72,
+            IssueIdentity(72),
             "successor",
             "Codex Sol",
             "builder",
@@ -1181,7 +1333,7 @@ def test_release_refuses_foreign_actor_without_explicit_override() -> None:
     with pytest.raises(ClaimUnavailable, match="original claimant"):
         release_claim(
             client,
-            72,
+            IssueIdentity(72),
             "Other",
             "builder",
             "takeover",
@@ -1195,7 +1347,7 @@ def test_release_claim_omitted_id_posts_landed_using_selected_role(role: str) ->
         request("mine", "Ada", issue=72, role=role, branch="lane-72", scope=("src",))
     )
 
-    released = release_claim(client, 72, "Ada", None, None, None, branch="lane-72")
+    released = release_claim(client, IssueIdentity(72), "Ada", None, None, None, branch="lane-72")
     posted = parse_claim_event(client.comments[LEDGER_ISSUE][-1])
 
     assert released.claim_id == "mine"
@@ -1219,7 +1371,7 @@ def test_release_claim_omitted_id_releases_when_foreign_peer_exists_on_issue() -
         ),
     )
 
-    released = release_claim(client, 72, "Ada", None, None, None, branch="lane-72")
+    released = release_claim(client, IssueIdentity(72), "Ada", None, None, None, branch="lane-72")
     standing = active_claims(tuple(client.comments[LEDGER_ISSUE]))
     posted = parse_claim_event(client.comments[LEDGER_ISSUE][-1])
 
@@ -1240,7 +1392,7 @@ def test_release_claim_omitted_id_uniqueness_is_issue_scoped() -> None:
         ),
     )
 
-    released = release_claim(client, 72, "Ada", None, None, None, branch="lane-72")
+    released = release_claim(client, IssueIdentity(72), "Ada", None, None, None, branch="lane-72")
     standing = active_claims(tuple(client.comments[LEDGER_ISSUE]))
 
     assert released.claim_id == "on-72"
@@ -1299,7 +1451,7 @@ def test_release_claim_omitted_id_fails_closed_for_wrong_agent_branch_or_two_mat
     protocol_count = len(client.list_protocol_candidates(LEDGER_ISSUE))
 
     with pytest.raises(ClaimUnavailable, match="pass --claim-id") as raised:
-        release_claim(client, 72, agent, None, None, None, branch=branch)
+        release_claim(client, IssueIdentity(72), agent, None, None, None, branch=branch)
 
     assert "conflicting claims" not in str(raised.value)
     assert len(client.list_protocol_candidates(LEDGER_ISSUE)) == protocol_count
@@ -1310,7 +1462,9 @@ def test_release_claim_explicit_id_ignores_branch() -> None:
         request("mine", "Ada", issue=72, role="reviewer", branch="lane-72", scope=("src",))
     )
 
-    released = release_claim(client, 72, "Ada", None, None, "mine", branch="other-lane")
+    released = release_claim(
+        client, IssueIdentity(72), "Ada", None, None, "mine", branch="other-lane"
+    )
     posted = parse_claim_event(client.comments[LEDGER_ISSUE][-1])
 
     assert released.claim_id == "mine"
@@ -1332,10 +1486,10 @@ def test_release_claim_omitted_id_requires_branch_and_does_not_call_git(
     )
 
     with pytest.raises(ClaimUnavailable, match="current branch"):
-        release_claim(client, 72, "Ada", None, None, None)
+        release_claim(client, IssueIdentity(72), "Ada", None, None, None)
     assert len(client.list_protocol_candidates(LEDGER_ISSUE)) == 1
 
-    released = release_claim(client, 72, "Ada", None, None, None, branch="lane-72")
+    released = release_claim(client, IssueIdentity(72), "Ada", None, None, None, branch="lane-72")
     assert released.claim_id == "mine"
 
 
@@ -1357,7 +1511,7 @@ def test_release_claim_override_fails_before_ledger_without_role_and_reason(
     with pytest.raises(ClaimUnavailable, match=expected):
         release_claim(
             client,
-            72,
+            IssueIdentity(72),
             "Ada",
             role,
             reason,
@@ -1399,7 +1553,7 @@ def test_label_failure_is_loud_while_comment_truth_remains() -> None:
         acquire_claim(client, request(issue=72))
 
     assert [
-        claim.issue
+        claim.identity.issue
         for claim in active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
     ] == [72]
 
@@ -1412,6 +1566,51 @@ def test_reconcile_all_repairs_active_and_stale_labels() -> None:
 
     assert observed == (72,)
     assert client.labels == {72}
+
+
+def test_reconcile_all_labels_ignores_lane_claims_on_a_mixed_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lane claim owns no GitHub issue, so reconcile must never label or project
+    it — only the issue claim on the same mixed ledger keeps its usual behaviour."""
+    client = FakeComments()
+    acquire_claim(client, request(issue=72, scope=("backend",)))
+    acquire_claim(
+        client,
+        request("lane-claim", "Grok 4.6", lane=True, branch="docs/lane-a", scope=("docs",)),
+    )
+
+    lane_calls: list[tuple[str, object]] = []
+    original_add_label = client.add_label
+    original_remove_label = client.remove_label
+    original_upsert_projection = client.upsert_projection
+
+    def add_label(issue: object, label: str) -> None:
+        if issue != 72:
+            lane_calls.append(("add_label", issue))
+        return original_add_label(issue, label)
+
+    def remove_label(issue: object, label: str) -> None:
+        if issue != 72:
+            lane_calls.append(("remove_label", issue))
+        return original_remove_label(issue, label)
+
+    def upsert_projection(
+        issue: object, body: str, *, create: bool = True, adopt_stale: bool = False
+    ) -> bool:
+        if issue != 72:
+            lane_calls.append(("upsert_projection", issue))
+        return original_upsert_projection(issue, body, create=create, adopt_stale=adopt_stale)
+
+    monkeypatch.setattr(client, "add_label", add_label)
+    monkeypatch.setattr(client, "remove_label", remove_label)
+    monkeypatch.setattr(client, "upsert_projection", upsert_projection)
+
+    observed = reconcile_all_labels(client)
+
+    assert observed == (72,)
+    assert client.labels == {72}
+    assert lane_calls == []
 
 
 def test_reconcile_repairs_a_duplicate_claim_id_and_restores_strict_reads() -> None:
@@ -1544,7 +1743,7 @@ def test_repair_duplicate_claims_attributes_a_late_release_to_the_original_occur
         ),
     )
     survivors = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
-    assert [(claim.issue, claim.agent) for claim in survivors] == [(73, "Grok 4.6")]
+    assert [(claim.identity.issue, claim.agent) for claim in survivors] == [(73, "Grok 4.6")]
 
 
 @pytest.mark.parametrize(
@@ -1594,7 +1793,7 @@ def test_repair_duplicate_claims_neutralizes_every_honored_terminal_comment(
         ),
     )
     survivors = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
-    assert [(claim.issue, claim.agent) for claim in survivors] == [(73, "Grok 4.6")]
+    assert [(claim.identity.issue, claim.agent) for claim in survivors] == [(73, "Grok 4.6")]
     # A truly clean repair: nothing left for a second reconcile pass to find or fix.
     assert repair_duplicate_claims(client) == ()
 
@@ -1652,7 +1851,7 @@ def test_repair_duplicate_claims_same_agent_cross_issue_keeps_only_the_newer_lan
         ),
     )
     survivors = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
-    assert [(claim.issue, claim.claim_id) for claim in survivors] == [(73, "claim-a")]
+    assert [(claim.identity.issue, claim.claim_id) for claim in survivors] == [(73, "claim-a")]
 
     assert reconcile_all_labels(client) == (73,)
     assert client.labels == {73}
@@ -1906,7 +2105,7 @@ def test_github_projection_update_patches_one_comment_and_deletes_duplicates(
     monkeypatch.setattr(client, "_run", run)
     body = issue_claim._active_projection(
         ActiveClaim(
-            72,
+            IssueIdentity(72),
             "claim-a",
             "Codex Sol",
             "builder",
@@ -3277,6 +3476,25 @@ def test_cli_reconcile_repairs_a_poisoned_ledger_and_status_reads_it_afterwards(
     assert "CLAIMED issue #72" in capsys.readouterr().out
 
 
+def test_cli_reconcile_targeted_issue_succeeds_on_a_mixed_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A targeted `reconcile <issue>` filters its own summary line by identity kind
+    (cli.py's `isinstance(claim.identity, IssueIdentity)` guard); a lane claim
+    coexisting on the same ledger must not make that filter raise."""
+    issue_body = claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("backend",)))
+    lane_body = claim_comment(
+        request("lane-claim", "Grok 4.6", lane=True, branch="docs/lane-a", scope=("docs",))
+    )
+    client = FakeComments({LEDGER_ISSUE: [comment(1, issue_body), comment(2, lane_body)]})
+    _patch_status_cli(monkeypatch, client)
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "reconcile", "72"]) == 0
+    assert "RECONCILED #72" in capsys.readouterr().out
+    assert client.labels == {72}
+
+
 def test_cli_reconcile_refuses_a_cross_agent_duplicate_with_exit_code_two(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -3371,6 +3589,94 @@ def test_cli_status_after_claim_prints_ledger_then_claimed(
         "branch=codex/issue-72 claim=cli-claim\n"
         "  src\n"
     )
+
+
+def test_cli_lane_claim_status_and_release_round_trip_without_issue_number(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The full `Done when` #1 story: a docs/ checkout claims, is visible in
+    `status`, and releases again — all without ever passing an issue number."""
+    _set_agent_identity_env(monkeypatch, {"AGENT_CLAIM_AGENT": "Codex Sol"})
+    client = FakeComments()
+    _patch_status_cli(monkeypatch, client)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    git_values = {("branch", "--show-current"): "docs/lane-cleanup"}
+    monkeypatch.setattr(checkout, "_git_output", lambda arguments: git_values[tuple(arguments)])
+
+    assert (
+        issue_claim.main(
+            [
+                "--repo",
+                "example/agent-claim",
+                "claim",
+                "--role",
+                "builder",
+                "--base",
+                BASE,
+                "--branch",
+                "docs/lane-cleanup",
+                "--scope",
+                "docs",
+                "--claim-id",
+                "cli-lane-claim",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "status"]) == 0
+    assert capsys.readouterr().out == (
+        f"LEDGER #{LEDGER_ISSUE}\n"
+        f"CLAIMED lane docs/lane-cleanup: Codex Sol (builder) base={BASE} "
+        "branch=docs/lane-cleanup claim=cli-lane-claim\n"
+        "  docs\n"
+    )
+
+    released = issue_claim.main(
+        ["--repo", "example/agent-claim", "release", "--reason", "landed"]
+    )
+    assert released == 0
+    assert active_claims(tuple(client.comments[LEDGER_ISSUE])) == ()
+
+
+@pytest.mark.parametrize("command", ["claim", "release"])
+def test_cli_lane_mode_refuses_a_non_conventional_branch(
+    command: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_agent_identity_env(monkeypatch, {"AGENT_CLAIM_AGENT": "Codex Sol"})
+    client = FakeComments()
+    _patch_status_cli(monkeypatch, client)
+    monkeypatch.setattr(
+        checkout, "_git_output", lambda arguments: "codex/issue-38-issueless-claims"
+    )
+
+    arguments = ["--repo", "example/agent-claim", command]
+    if command == "claim":
+        arguments += [
+            "--role",
+            "builder",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-38-issueless-claims",
+            "--scope",
+            "src",
+            "--claim-id",
+            "cli-lane-claim",
+        ]
+    else:
+        arguments += ["--reason", "landed"]
+
+    assert issue_claim.main(arguments) == 2
+    captured = capsys.readouterr()
+    assert "codex/issue-38-issueless-claims" in captured.err
+    assert "issue number" in captured.err
+    assert "'docs/'" in captured.err and "'fix/'" in captured.err
+    assert client.comments == {}
 
 
 def test_cli_status_overlapping_protocol_comments_print_ledger_then_conflict(
@@ -3506,6 +3812,7 @@ def test_cli_status_json_after_claim_prints_claimed_object(
             "claims": [
                 {
                     "issue": 72,
+                    "lane": None,
                     "agent": "Codex Sol",
                     "role": "builder",
                     "base": BASE,
@@ -3548,6 +3855,7 @@ def test_cli_status_json_overlapping_protocol_comments_print_conflict_object(
             "claims": [
                 {
                     "issue": 72,
+                    "lane": None,
                     "agent": "Codex Sol",
                     "role": "builder",
                     "base": BASE,
@@ -3558,6 +3866,7 @@ def test_cli_status_json_overlapping_protocol_comments_print_conflict_object(
                 },
                 {
                     "issue": 73,
+                    "lane": None,
                     "agent": "Grok 4.6",
                     "role": "builder",
                     "base": BASE,
@@ -3602,6 +3911,7 @@ def test_cli_status_json_issue_on_overlap_prints_related_conflict_object(
             "claims": [
                 {
                     "issue": 72,
+                    "lane": None,
                     "agent": "Codex Sol",
                     "role": "builder",
                     "base": BASE,
@@ -3612,6 +3922,7 @@ def test_cli_status_json_issue_on_overlap_prints_related_conflict_object(
                 },
                 {
                     "issue": 73,
+                    "lane": None,
                     "agent": "Grok 4.6",
                     "role": "builder",
                     "base": BASE,
@@ -3708,9 +4019,20 @@ def test_cli_release_without_json_prints_the_released_line(
     assert capsys.readouterr().out == "RELEASED issue #72: mine\n"
 
 
+@pytest.mark.parametrize(
+    ("issue_argument", "branch", "identity_fields"),
+    [
+        (["72"], "codex/issue-72", {"issue": 72, "lane": None}),
+        ([], "docs/lane-cleanup", {"issue": None, "lane": True}),
+    ],
+    ids=["issue", "lane"],
+)
 def test_cli_claim_json_prints_acquired_claim_object(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    issue_argument: list[str],
+    branch: str,
+    identity_fields: dict[str, object],
 ) -> None:
     client = FakeComments()
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
@@ -3722,7 +4044,7 @@ def test_cli_claim_json_prints_acquired_claim_object(
             "--repo",
             "example/agent-claim",
             "claim",
-            "72",
+            *issue_argument,
             "--agent",
             "Codex Sol",
             "--role",
@@ -3730,7 +4052,7 @@ def test_cli_claim_json_prints_acquired_claim_object(
             "--base",
             BASE,
             "--branch",
-            "codex/issue-72",
+            branch,
             "--scope",
             "src",
             "--scope",
@@ -3744,13 +4066,13 @@ def test_cli_claim_json_prints_acquired_claim_object(
     assert claimed == 0
     assert capsys.readouterr().out == json.dumps(
         {
-            "issue": 72,
+            **identity_fields,
             "claim_id": "cli-claim",
             "url": "https://github.com/example/agent-claim/issues/71#issuecomment-1",
             "agent": "Codex Sol",
             "role": "builder",
             "base": BASE,
-            "branch": "codex/issue-72",
+            "branch": branch,
             "scope": ["src", "docs"],
         }
     ) + "\n"
@@ -3760,17 +4082,29 @@ def test_cli_claim_json_prints_acquired_claim_object(
 
 
 @pytest.mark.parametrize(
-    ("standing_role", "flags", "agent", "role", "reason"),
+    (
+        "issue_argument",
+        "branch",
+        "identity_fields",
+        "standing_role",
+        "flags",
+        "agent",
+        "role",
+        "reason",
+    ),
     [
-        ("reviewer", ("--json",), "Ada", "reviewer", "landed"),
         (
-            "reviewer",
-            ("--reason", "abandoned", "--json"),
-            "Ada",
-            "reviewer",
-            "abandoned",
+            ["72"], "lane-72", {"issue": 72, "lane": None},
+            "reviewer", ("--json",), "Ada", "reviewer", "landed",
         ),
         (
+            ["72"], "lane-72", {"issue": 72, "lane": None},
+            "reviewer",
+            ("--reason", "abandoned", "--json"),
+            "Ada", "reviewer", "abandoned",
+        ),
+        (
+            ["72"], "lane-72", {"issue": 72, "lane": None},
             "reviewer",
             (
                 "--claim-id",
@@ -3782,36 +4116,65 @@ def test_cli_claim_json_prints_acquired_claim_object(
                 "verified abandoned",
                 "--json",
             ),
-            "Fleet Coordinator",
-            "coordinator",
-            "verified abandoned",
+            "Fleet Coordinator", "coordinator", "verified abandoned",
+        ),
+        (
+            [], "docs/lane-cleanup", {"issue": None, "lane": True},
+            "reviewer", ("--json",), "Ada", "reviewer", "landed",
+        ),
+        (
+            [], "docs/lane-cleanup", {"issue": None, "lane": True},
+            "reviewer",
+            (
+                "--claim-id",
+                "mine",
+                "--coordinator-override",
+                "--role",
+                "coordinator",
+                "--reason",
+                "verified abandoned",
+                "--json",
+            ),
+            "Fleet Coordinator", "coordinator", "verified abandoned",
         ),
     ],
+    ids=["issue-json", "issue-reason", "issue-override", "lane-json", "lane-override"],
 )
 def test_cli_release_json_prints_effective_posted_identity(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    issue_argument: list[str],
+    branch: str,
+    identity_fields: dict[str, object],
     standing_role: str,
     flags: tuple[str, ...],
     agent: str,
     role: str,
     reason: str,
 ) -> None:
+    lane = not issue_argument
     client = _claims_client(
-        request("mine", "Ada", issue=72, role=standing_role, branch="lane-72", scope=("src",))
+        request(
+            "mine", "Ada", issue=72, lane=lane, role=standing_role, branch=branch, scope=("src",)
+        )
     )
+    # Lane mode always derives its branch from the checkout, even with an explicit
+    # --claim-id (Entschieden #2: LaneIdentity carries no branch of its own), so git
+    # is only forbidden for the issue-mode explicit-claim-id case.
+    forbid_git = bool(issue_argument) and "--claim-id" in flags
     _patch_release_session(
-        monkeypatch, client, agent=agent, forbid_git="--claim-id" in flags
+        monkeypatch, client, agent=agent, branch=branch, forbid_git=forbid_git
     )
 
     released = issue_claim.main(
-        ["--repo", "example/agent-claim", "release", "72", *flags]
+        ["--repo", "example/agent-claim", "release", *issue_argument, *flags]
     )
 
     assert released == 0
     assert capsys.readouterr().out == json.dumps(
         {
-            "issue": 72,
+            **identity_fields,
+            "branch": branch,
             "claim_id": "mine",
             "agent": agent,
             "role": role,
@@ -4081,12 +4444,13 @@ def _patch_protect_claim(
     agent: str = "Grok sess-1",
     scope: tuple[str, ...] = ("src",),
     branch: str = "codex/issue-72-claims",
+    lane: bool = False,
 ) -> FakeComments:
     claimed = comment(
         1,
         claim_comment(
             replace(
-                request("cli-claim", agent, issue=72, scope=scope),
+                request("cli-claim", agent, issue=72, lane=lane, scope=scope),
                 branch=branch,
             )
         ),
@@ -4178,6 +4542,30 @@ def test_protect_grok_camelcase_allows_when_session_claim_covers_path(
         _protect_main(
             monkeypatch,
             {"toolName": tool_name, "toolInput": {path_key: "src/widget.py"}},
+        )
+        == 0
+    )
+    _assert_protect_decision(capsys, decision="allow")
+    assert list(home.iterdir()) == []
+
+
+def test_protect_allows_a_lane_claim_covering_the_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Guardrail (Entschieden #6): `_protect_write` already authorizes purely via
+    agent/branch/scope, so a lane claim (no GitHub issue at all) passes through it
+    unchanged, with no code path change required."""
+    home, work = _isolate_protect_home(monkeypatch, tmp_path)
+    _set_agent_identity_env(monkeypatch, {issue_claim.GROK_SESSION_ID_ENV: "sess-1"})
+    _patch_protect_git(monkeypatch, work, {("branch", "--show-current"): "docs/lane-cleanup"})
+    _patch_protect_claim(monkeypatch, branch="docs/lane-cleanup", lane=True)
+
+    assert (
+        _protect_main(
+            monkeypatch,
+            {"toolName": "write", "toolInput": {"path": "src/widget.py"}},
         )
         == 0
     )
