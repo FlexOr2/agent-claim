@@ -16,6 +16,10 @@ LEDGER_ISSUE = 0
 LEGACY_MARKER_PREFIX = "<!-- agent-claim:v1 "
 MARKER_PREFIX = "<!-- agent-claim:v2 "
 MARKER_SUFFIX = " -->"
+# Coordination-contract convention: the only branch prefixes an issueless lane claim
+# may use, so a builder that forgot its issue number never gets a silent, unlabeled,
+# non-projected claim instead of a loud refusal.
+ISSUELESS_LANE_BRANCH_PREFIXES = ("docs/", "fix/")
 PROJECTION_MARKER_PREFIX = "<!-- agent-claim-projection:v1 ledger="
 PROJECTION_MARKER_PATTERN = re.compile(
     rf"{re.escape(PROJECTION_MARKER_PREFIX)}(?P<ledger>[1-9][0-9]*){re.escape(MARKER_SUFFIX)}"
@@ -70,8 +74,32 @@ class IssueComment:
 
 
 @dataclass(frozen=True)
-class ActiveClaim:
+class IssueIdentity:
+    """A claim scoped to one numbered GitHub issue."""
+
     issue: int
+
+    def __post_init__(self) -> None:
+        if isinstance(self.issue, bool) or not isinstance(self.issue, int) or self.issue < 1:
+            raise ClaimError("issue identity must be a positive integer")
+
+
+@dataclass(frozen=True)
+class LaneIdentity:
+    """A claim scoped to one issueless `docs/`/`fix/` lane.
+
+    Carries no branch of its own: the lane name is owned entirely by the enclosing
+    `ActiveClaim`/`ClaimRequest.branch`, which every lane claim already has. A second
+    branch-shaped field here would give the branch two owners that could drift apart.
+    """
+
+
+ClaimIdentity = IssueIdentity | LaneIdentity
+
+
+@dataclass(frozen=True)
+class ActiveClaim:
+    identity: ClaimIdentity
     claim_id: str
     agent: str
     role: str
@@ -83,7 +111,7 @@ class ActiveClaim:
 
 @dataclass(frozen=True)
 class ClaimantRelease:
-    issue: int
+    identity: ClaimIdentity
     claim_id: str
     agent: str
     role: str
@@ -93,7 +121,7 @@ class ClaimantRelease:
 
 @dataclass(frozen=True)
 class OverrideRelease:
-    issue: int
+    identity: ClaimIdentity
     claim_id: str
     agent: str
     role: str
@@ -104,6 +132,13 @@ class OverrideRelease:
 
 @dataclass(frozen=True)
 class LedgerSupersede:
+    """Terminal event that freezes the whole ledger; always issue(ledger)-scoped.
+
+    No lane variant exists on purpose (Entschieden #6): the ledger itself is the
+    numbered issue configured by `configure_ledger`, and a lane claim can never
+    own it, so `issue` stays a plain int rather than a `ClaimIdentity`.
+    """
+
     issue: int
     claim_id: str
     agent: str
@@ -143,7 +178,7 @@ class LedgerSuperseded(ClaimError):
 
 @dataclass(frozen=True)
 class ClaimRequest:
-    issue: int
+    identity: ClaimIdentity
     agent: str
     role: str
     base: str
@@ -228,6 +263,48 @@ def _required_issue(payload: dict[str, object]) -> int:
     if isinstance(issue, bool) or not isinstance(issue, int) or issue < 1:
         raise InvalidClaimMarker("claim marker issue must be a positive integer")
     return issue
+
+
+LANE_MARKER_KEY = "lane"
+
+
+def _required_identity(payload: dict[str, object]) -> ClaimIdentity:
+    """Dispatch a claim/release/override_release marker to its identity kind.
+
+    Checks for the lane marker key before ever requiring `issue`, so a lane event
+    never triggers `_required_issue`: the natural hard stop for an old reader (which
+    always calls `_required_issue` unconditionally) happens exactly there instead of
+    in a try/except that would silently skip the comment.
+    """
+    has_issue = "issue" in payload
+    has_lane = LANE_MARKER_KEY in payload
+    if has_issue and has_lane:
+        raise InvalidClaimMarker("claim marker must not carry both issue and lane")
+    if has_lane:
+        if payload[LANE_MARKER_KEY] is not True:
+            raise InvalidClaimMarker("claim marker lane field must be true")
+        return LaneIdentity()
+    return IssueIdentity(_required_issue(payload))
+
+
+def _identity_marker_key(identity: ClaimIdentity) -> str:
+    return LANE_MARKER_KEY if isinstance(identity, LaneIdentity) else "issue"
+
+
+def _identity_marker_value(identity: ClaimIdentity) -> int | bool:
+    return True if isinstance(identity, LaneIdentity) else identity.issue
+
+
+def _identity_label(identity: ClaimIdentity, branch: str) -> str:
+    """Human-readable subject line for a claim/release comment body."""
+    if isinstance(identity, LaneIdentity):
+        return f"Lane: `{branch}`"
+    return f"Issue: #{identity.issue}"
+
+
+def _identity_summary(identity: ClaimIdentity, branch: str) -> str:
+    """Human-readable subject for error messages, distinct from `_identity_label`."""
+    return f"lane {branch!r}" if isinstance(identity, LaneIdentity) else f"issue #{identity.issue}"
 
 
 def _valid_branch(payload: dict[str, object]) -> str:
@@ -356,11 +433,11 @@ def _event_identity(
 
 
 def _parse_active_claim(
-    payload: dict[str, object], comment: IssueComment, issue: int, *, legacy: bool
+    payload: dict[str, object], comment: IssueComment, identity: ClaimIdentity, *, legacy: bool
 ) -> ActiveClaim:
     expected = {"action", "agent", "base", "branch", "claim_id", "role", "scope"}
     if not legacy:
-        expected.add("issue")
+        expected.add(_identity_marker_key(identity))
     _strict_keys(payload, frozenset(expected), comment)
     claim_id, agent, role = _event_identity(payload, comment)
     base = _required_text(payload, "base", maximum=40)
@@ -369,7 +446,7 @@ def _parse_active_claim(
             f"trusted comment {comment.url} base must be a full lowercase commit SHA"
         )
     return ActiveClaim(
-        issue=issue,
+        identity=identity,
         claim_id=claim_id,
         agent=agent,
         role=role,
@@ -381,15 +458,15 @@ def _parse_active_claim(
 
 
 def _parse_claimant_release(
-    payload: dict[str, object], comment: IssueComment, issue: int, *, legacy: bool
+    payload: dict[str, object], comment: IssueComment, identity: ClaimIdentity, *, legacy: bool
 ) -> ClaimantRelease:
     expected = {"action", "agent", "claim_id", "reason", "role"}
     if not legacy:
-        expected.add("issue")
+        expected.add(_identity_marker_key(identity))
     _strict_keys(payload, frozenset(expected), comment)
     claim_id, agent, role = _event_identity(payload, comment)
     return ClaimantRelease(
-        issue=issue,
+        identity=identity,
         claim_id=claim_id,
         agent=agent,
         role=role,
@@ -410,7 +487,7 @@ def _required_comment_id(payload: dict[str, object], *, action: str) -> int:
 
 
 def _parse_override_release(
-    payload: dict[str, object], comment: IssueComment, issue: int
+    payload: dict[str, object], comment: IssueComment, identity: ClaimIdentity
 ) -> OverrideRelease:
     _strict_keys(
         payload,
@@ -420,7 +497,7 @@ def _parse_override_release(
                 "agent",
                 "claim_comment_id",
                 "claim_id",
-                "issue",
+                _identity_marker_key(identity),
                 "reason",
                 "role",
             }
@@ -431,7 +508,7 @@ def _parse_override_release(
     if role != "coordinator":
         raise InvalidClaimMarker("override releases require coordinator role")
     return OverrideRelease(
-        issue=issue,
+        identity=identity,
         claim_id=claim_id,
         agent=agent,
         role=role,
@@ -497,16 +574,26 @@ def parse_claim_event(comment: IssueComment) -> ClaimEvent | None:
     if legacy:
         if action not in {"claim", "release"}:
             raise InvalidClaimMarker("legacy claim markers cannot use this action")
-        issue = LEDGER_ISSUE
+        if LEDGER_ISSUE < 1:
+            # IssueIdentity itself would reject 0 as "not a positive integer", which
+            # would misreport this as a marker defect; it is a caller/setup defect.
+            raise ClaimError(
+                "legacy claim marker cannot be parsed before configure_ledger "
+                "binds the ledger issue"
+            )
+        identity: ClaimIdentity = IssueIdentity(LEDGER_ISSUE)
+    elif action == "supersede":
+        # Supersede stays ledger-issue-only (Entschieden #6): no lane branching here.
+        identity = IssueIdentity(_required_issue(payload))
     else:
-        issue = _required_issue(payload)
+        identity = _required_identity(payload)
     if action == "claim":
-        return _parse_active_claim(payload, comment, issue, legacy=legacy)
+        return _parse_active_claim(payload, comment, identity, legacy=legacy)
     if action == "release":
-        return _parse_claimant_release(payload, comment, issue, legacy=legacy)
+        return _parse_claimant_release(payload, comment, identity, legacy=legacy)
     if action == "override_release":
-        return _parse_override_release(payload, comment, issue)
-    return _parse_ledger_supersede(payload, comment, issue)
+        return _parse_override_release(payload, comment, identity)
+    return _parse_ledger_supersede(payload, comment, identity.issue)
 
 
 def _apply_terminal_event(
@@ -527,8 +614,9 @@ def _apply_terminal_event(
     if isinstance(event, LedgerSupersede):
         if (
             claimed is None
-            or claimed.issue != event.issue
-            or claimed.issue != LEDGER_ISSUE
+            or not isinstance(claimed.identity, IssueIdentity)
+            or claimed.identity.issue != event.issue
+            or claimed.identity.issue != LEDGER_ISSUE
             or event.claim_comment_id != claimed.comment.identifier
             or set(active) != {claimed.claim_id}
         ):
@@ -538,9 +626,9 @@ def _apply_terminal_event(
         raise InvalidClaimMarker(
             f"claim id {event.claim_id!r} was released before it was acquired"
         )
-    if claimed.issue != event.issue:
+    if claimed.identity != event.identity:
         raise InvalidClaimMarker(
-            f"claim id {event.claim_id!r} release targets the wrong issue"
+            f"claim id {event.claim_id!r} release targets the wrong claim"
         )
     if isinstance(event, ClaimantRelease):
         if (claimed.agent, claimed.role) != (event.agent, event.role):
@@ -657,8 +745,25 @@ def _scopes_overlap(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
     )
 
 
+def _identity_conflicts(
+    left: ActiveClaim | ClaimRequest, right: ActiveClaim | ClaimRequest
+) -> bool:
+    """Two claims share an identity: same issue number, or same lane branch.
+
+    A lane claim and an issue claim never share an identity by themselves — only
+    scope overlap can put them in conflict.
+    """
+    match left.identity, right.identity:
+        case IssueIdentity(issue=left_issue), IssueIdentity(issue=right_issue):
+            return left_issue == right_issue
+        case LaneIdentity(), LaneIdentity():
+            return left.branch == right.branch
+        case _:
+            return False
+
+
 def claims_conflict(left: ActiveClaim | ClaimRequest, right: ActiveClaim | ClaimRequest) -> bool:
-    if left.issue == right.issue:
+    if _identity_conflicts(left, right):
         return True
     return _scopes_overlap(left.scope, right.scope)
 
@@ -673,10 +778,26 @@ def conflicting_claims(
     )
 
 
+IdentityKey = tuple[str, int | str]
+
+
+def _identity_key(claim: ActiveClaim) -> IdentityKey:
+    """Hashable index key for one claim's identity: an issue number or a lane branch.
+
+    `LaneIdentity` instances all compare equal to each other, so indexing by
+    identity alone would merge every lane into one bucket; the branch already owned
+    by `ActiveClaim.branch` supplies the missing distinction without giving the
+    lane name a second owner.
+    """
+    if isinstance(claim.identity, LaneIdentity):
+        return (LANE_MARKER_KEY, claim.branch)
+    return ("issue", claim.identity.issue)
+
+
 @dataclass(frozen=True)
 class ClaimConflictIndex:
     conflict_ids: set[str]
-    claims_by_issue: dict[int, set[str]]
+    claims_by_identity: dict[IdentityKey, set[str]]
     complete_paths: dict[tuple[str, ...], set[str]]
     descendant_paths: dict[tuple[str, ...], set[str]]
 
@@ -684,16 +805,16 @@ class ClaimConflictIndex:
 def _claim_conflict_index(claims: tuple[ActiveClaim, ...]) -> ClaimConflictIndex:
     """Index active-claim paths once for conflict status and targeted lookup."""
     conflict_ids: set[str] = set()
-    claims_by_issue: dict[int, set[str]] = {}
+    claims_by_identity: dict[IdentityKey, set[str]] = {}
     complete_paths: dict[tuple[str, ...], set[str]] = {}
     descendant_paths: dict[tuple[str, ...], set[str]] = {}
 
     for claim in claims:
-        same_issue = claims_by_issue.setdefault(claim.issue, set())
-        if same_issue:
+        same_identity = claims_by_identity.setdefault(_identity_key(claim), set())
+        if same_identity:
             conflict_ids.add(claim.claim_id)
-            conflict_ids.update(same_issue)
-        same_issue.add(claim.claim_id)
+            conflict_ids.update(same_identity)
+        same_identity.add(claim.claim_id)
 
         for path in claim.scope:
             parts = PurePosixPath(path).parts
@@ -711,7 +832,7 @@ def _claim_conflict_index(claims: tuple[ActiveClaim, ...]) -> ClaimConflictIndex
 
     return ClaimConflictIndex(
         conflict_ids,
-        claims_by_issue,
+        claims_by_identity,
         complete_paths,
         descendant_paths,
     )
@@ -722,7 +843,7 @@ def _related_claim_ids(
 ) -> set[str]:
     related = {claim.claim_id for claim in selected}
     for claim in selected:
-        related.update(index.claims_by_issue[claim.issue])
+        related.update(index.claims_by_identity[_identity_key(claim)])
         for path in claim.scope:
             parts = PurePosixPath(path).parts
             related.update(index.descendant_paths.get(parts, ()))
@@ -756,7 +877,7 @@ def claim_comment(request: ClaimRequest) -> str:
         "base": request.base,
         "branch": request.branch,
         "claim_id": request.claim_id,
-        "issue": request.issue,
+        _identity_marker_key(request.identity): _identity_marker_value(request.identity),
         "role": role,
         "scope": list(request.scope),
     }
@@ -764,7 +885,7 @@ def claim_comment(request: ClaimRequest) -> str:
     return _validated_comment(
         f"{_marker(payload)}\n"
         "## CLAIM — exclusive build lane\n\n"
-        f"- Issue: #{request.issue}\n"
+        f"- {_identity_label(request.identity, request.branch)}\n"
         f"- Owner: {agent} ({role})\n"
         f"- Base: `{request.base}`\n"
         f"- Branch: `{request.branch}`\n"
@@ -793,7 +914,7 @@ def release_comment(
         "action": action,
         "agent": validated_agent,
         "claim_id": claim.claim_id,
-        "issue": claim.issue,
+        _identity_marker_key(claim.identity): _identity_marker_value(claim.identity),
         "reason": validated_reason,
         "role": validated_role,
     }
@@ -802,7 +923,7 @@ def release_comment(
     return _validated_comment(
         f"{_marker(payload)}\n"
         "## RELEASE — build lane\n\n"
-        f"- Issue: #{claim.issue}\n"
+        f"- {_identity_label(claim.identity, claim.branch)}\n"
         f"- Claim ID: `{claim.claim_id}`\n"
         f"- Previous owner: {claim.agent} ({claim.role})\n"
         f"- Released by: {validated_agent} ({validated_role})\n"
@@ -820,6 +941,9 @@ def supersede_comment(
 ) -> str:
     if successor_issue <= LEDGER_ISSUE:
         raise ClaimError("ledger successor must be greater than the current ledger")
+    if not isinstance(claim.identity, IssueIdentity):
+        # Guardrail (Entschieden #6): supersede stays ledger-issue-only, never a lane.
+        raise ClaimError("ledger supersede requires an issue-identified claim")
     validated_agent = _outbound_text(agent, "agent", maximum=128)
     validated_role = _outbound_text(role, "role", maximum=64)
     validated_reason = _outbound_text(reason, "reason", maximum=512)
@@ -828,7 +952,7 @@ def supersede_comment(
         "agent": validated_agent,
         "claim_comment_id": claim.comment.identifier,
         "claim_id": claim.claim_id,
-        "issue": claim.issue,
+        "issue": claim.identity.issue,
         "reason": validated_reason,
         "role": validated_role,
         "successor_issue": successor_issue,
@@ -889,7 +1013,11 @@ def _ledger_claims(client: IssueComments) -> tuple[ActiveClaim, ...]:
 
 
 def _issue_claim(claims: tuple[ActiveClaim, ...], issue: int) -> ActiveClaim | None:
-    matching = tuple(claim for claim in claims if claim.issue == issue)
+    matching = tuple(
+        claim
+        for claim in claims
+        if isinstance(claim.identity, IssueIdentity) and claim.identity.issue == issue
+    )
     if not matching:
         return None
     return min(
@@ -957,7 +1085,11 @@ def reconcile_issue_label(
 
 def reconcile_all_labels(client: IssueComments) -> tuple[int, ...]:
     try:
-        active_issues = {claim.issue for claim in _ledger_claims(client)}
+        active_issues = {
+            claim.identity.issue
+            for claim in _ledger_claims(client)
+            if isinstance(claim.identity, IssueIdentity)
+        }
     except LedgerSuperseded:
         for issue in client.list_claimed_issues():
             client.remove_label(issue, claim_label())
@@ -1005,12 +1137,13 @@ def repair_duplicate_claims(client: IssueComments) -> tuple[DuplicateClaimRepair
     heal the ledger instead of erroring. For each duplicated id, the newest occurrence
     is kept as the survivor: for a released-then-reused id it is the only occurrence
     still live; for a same-agent self-re-claim, keeping the newest is deliberate
-    because it reflects that agent's latest intent (this is not applied across issues:
-    a same-agent duplicate that spans two different issues still only keeps the newer
-    issue's lane, silently ending the older one). An older occurrence only
-    auto-neutralizes when it is already released, or when it shares the survivor's
-    agent and role. A still-active duplicate from a different agent is a real
-    ownership conflict: reconcile refuses it loudly instead of picking a winner.
+    because it reflects that agent's latest intent (this is not applied across
+    identities: a same-agent duplicate that spans two different issues, two different
+    lanes, or an issue and a lane still only keeps the newer identity's workstream,
+    silently ending the older one). An older occurrence only auto-neutralizes when it
+    is already released, or when it shares the survivor's agent and role. A
+    still-active duplicate from a different agent is a real ownership conflict:
+    reconcile refuses it loudly instead of picking a winner.
     Every duplicated id on the ledger is validated before any comment is edited, so
     one unsafe conflict never leaves a different, otherwise-safe repair half-applied.
     """
@@ -1048,6 +1181,18 @@ def repair_duplicate_claims(client: IssueComments) -> tuple[DuplicateClaimRepair
     return tuple(repairs)
 
 
+def _reconcile_identity(
+    client: IssueComments, identity: ClaimIdentity, *, unclaimed_body: str | None = None
+) -> None:
+    """Reconcile the issue label/projection this identity owns, if it owns one.
+
+    A lane claim owns no GitHub issue, so it has no label or projection to
+    reconcile; reconcile_all_labels/reconcile_issue_label stay issue-only.
+    """
+    if isinstance(identity, IssueIdentity):
+        reconcile_issue_label(client, identity.issue, unclaimed_body=unclaimed_body)
+
+
 def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
     aggregate = _aggregate_claim_events(client.list_protocol_candidates(LEDGER_ISSUE))
     if request.claim_id in aggregate.seen_claim_ids:
@@ -1061,8 +1206,9 @@ def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
     if blocked_by:
         owner = blocked_by[0]
         raise ClaimUnavailable(
-            f"issue #{request.issue} or its scope is claimed by {owner.agent} "
-            f"({owner.role}) on issue #{owner.issue} branch {owner.branch}"
+            f"{_identity_summary(request.identity, request.branch)} or its scope is "
+            f"claimed by {owner.agent} ({owner.role}) on "
+            f"{_identity_summary(owner.identity, owner.branch)} branch {owner.branch}"
         )
 
     client.post_comment(LEDGER_ISSUE, claim_comment(request))
@@ -1077,7 +1223,10 @@ def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
     observed = post_aggregate.active
     own = next((claim for claim in observed if claim.claim_id == request.claim_id), None)
     if own is None:
-        raise ClaimError(f"issue #{request.issue} did not expose the posted claim id")
+        raise ClaimError(
+            f"{_identity_summary(request.identity, request.branch)} did not expose "
+            "the posted claim id"
+        )
     competitors = conflicting_claims(observed, own)
     winner = min(
         (own, *competitors),
@@ -1088,14 +1237,15 @@ def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
             LEDGER_ISSUE,
             release_comment(own, request.agent, request.role, "claim race lost"),
         )
-        reconcile_issue_label(client, request.issue)
-        reconcile_issue_label(client, winner.issue)
+        _reconcile_identity(client, request.identity)
+        _reconcile_identity(client, winner.identity)
         raise ClaimUnavailable(
-            f"issue #{request.issue} claim race lost to {winner.agent} "
-            f"({winner.role}) on issue #{winner.issue} branch {winner.branch}"
+            f"{_identity_summary(request.identity, request.branch)} claim race lost to "
+            f"{winner.agent} ({winner.role}) on "
+            f"{_identity_summary(winner.identity, winner.branch)} branch {winner.branch}"
         )
 
-    reconcile_issue_label(client, request.issue)
+    _reconcile_identity(client, request.identity)
     return own
 
 
@@ -1106,9 +1256,38 @@ def _require_coordinator_override(role: str | None, reason: str | None) -> None:
         raise ClaimUnavailable("a coordinator override requires --reason")
 
 
+def _claims_for_identity(
+    claims: tuple[ActiveClaim, ...], identity: ClaimIdentity, branch: str | None
+) -> tuple[ActiveClaim, ...]:
+    """Restrict standing claims to the one issue or lane `identity` names.
+
+    An issue identity already carries its number, so no branch is needed. A lane
+    identity carries none (Entschieden #2), so the caller's checkout branch is the
+    only way to tell which lane is meant — required even when `claim_id` is given
+    explicitly, mirroring how issue release still scopes by issue number first.
+    """
+    if isinstance(identity, IssueIdentity):
+        return tuple(
+            claim
+            for claim in claims
+            if isinstance(claim.identity, IssueIdentity)
+            and claim.identity.issue == identity.issue
+        )
+    if not branch:
+        raise ClaimUnavailable(
+            "lane release requires a non-empty current branch; check out the "
+            "docs/ or fix/ lane branch, or pass an issue number"
+        )
+    return tuple(
+        claim
+        for claim in claims
+        if isinstance(claim.identity, LaneIdentity) and claim.branch == branch
+    )
+
+
 def release_claim(
     client: IssueComments,
-    issue: int,
+    identity: ClaimIdentity,
     agent: str,
     role: str | None,
     reason: str | None,
@@ -1119,9 +1298,11 @@ def release_claim(
 ) -> ActiveClaim:
     if coordinator_override:
         _require_coordinator_override(role, reason)
-    standing = tuple(claim for claim in _ledger_claims(client) if claim.issue == issue)
+    standing = _claims_for_identity(_ledger_claims(client), identity, branch)
     if not standing:
-        raise ClaimUnavailable(f"issue #{issue} has no active build claim")
+        raise ClaimUnavailable(
+            f"{_identity_summary(identity, branch or '')} has no active build claim"
+        )
     if claim_id is None:
         if not branch:
             raise ClaimUnavailable(
@@ -1135,8 +1316,8 @@ def release_claim(
         )
         if len(matches) != 1:
             raise ClaimUnavailable(
-                f"issue #{issue} has no unique claim for this session on branch "
-                f"{branch!r}; pass --claim-id"
+                f"{_identity_summary(identity, branch)} has no unique claim for this "
+                f"session on branch {branch!r}; pass --claim-id"
             )
         selected = matches[0]
     else:
@@ -1145,7 +1326,10 @@ def release_claim(
             None,
         )
         if selected is None:
-            raise ClaimUnavailable(f"issue #{issue} has no active claim {claim_id!r}")
+            raise ClaimUnavailable(
+                f"{_identity_summary(identity, branch or '')} has no active claim "
+                f"{claim_id!r}"
+            )
     if role is None:
         role = selected.role
     if not coordinator_override and (agent, role) != (selected.agent, selected.role):
@@ -1165,9 +1349,9 @@ def release_claim(
             coordinator_override=coordinator_override,
         ),
     )
-    reconcile_issue_label(
+    _reconcile_identity(
         client,
-        issue,
+        identity,
         unclaimed_body=_unclaimed_projection(ledger_url, reason),
     )
     return selected
@@ -1195,7 +1379,8 @@ def supersede_ledger(
     selected = next((claim for claim in standing if claim.claim_id == claim_id), None)
     if (
         selected is None
-        or selected.issue != LEDGER_ISSUE
+        or not isinstance(selected.identity, IssueIdentity)
+        or selected.identity.issue != LEDGER_ISSUE
         or len(standing) != 1
     ):
         raise ClaimUnavailable(
