@@ -1313,15 +1313,32 @@ def test_rescope_refuses_a_foreign_agent() -> None:
         )
 
 
-def test_rescope_race_reverts_to_the_previous_scope() -> None:
+@pytest.mark.parametrize(
+    ("competitor_id", "created_at"),
+    [
+        pytest.param(
+            "earlier",
+            "2026-08-20T23:59:59Z",
+            id="older-competitor",
+        ),
+        pytest.param(
+            "later",
+            "2026-08-21T00:00:50Z",
+            id="newer-competitor",
+        ),
+    ],
+)
+def test_rescope_race_reverts_to_the_previous_scope(
+    competitor_id: str, created_at: str
+) -> None:
     client = FakeComments()
     acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
     competitor = comment(
         50,
         claim_comment(
-            request("earlier", "Grok 4.6", issue=73, scope=("src/new.py",))
+            request(competitor_id, "Grok 4.6", issue=73, scope=("src/new.py",))
         ),
-        created_at="2026-08-20T23:59:59Z",
+        created_at=created_at,
     )
     client.inject_before_next_ledger_post = competitor
 
@@ -1337,8 +1354,9 @@ def test_rescope_race_reverts_to_the_previous_scope() -> None:
 
     standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
     scopes = {claim.claim_id: claim.scope for claim in standing}
+    assert set(scopes) == {"claim-a", competitor_id}
     assert scopes["claim-a"] == ("src/widget.py",)
-    assert scopes["earlier"] == ("src/new.py",)
+    assert scopes[competitor_id] == ("src/new.py",)
 
 
 def test_who_reports_the_claim_holding_a_path() -> None:

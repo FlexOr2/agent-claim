@@ -1388,6 +1388,30 @@ def _combined_scope(
     return _valid_scope(list(combined))
 
 
+def _observe_rescoped_claim(
+    client: IssueComments,
+    identity: ClaimIdentity,
+    selected: ActiveClaim,
+    expected_scope: tuple[str, ...],
+    *,
+    expose: str,
+    observe: str,
+) -> tuple[tuple[ActiveClaim, ...], ActiveClaim]:
+    aggregate = _aggregate_claim_events(client.list_protocol_candidates(LEDGER_ISSUE))
+    _reject_duplicate_claim_ids(aggregate)
+    observed = aggregate.active
+    own = next((claim for claim in observed if claim.claim_id == selected.claim_id), None)
+    if own is None:
+        raise ClaimError(
+            f"{_identity_summary(identity, selected.branch)} did not expose {expose}"
+        )
+    if own.scope != expected_scope:
+        raise ClaimError(
+            f"{_identity_summary(identity, selected.branch)} did not observe {observe}"
+        )
+    return observed, own
+
+
 def rescope_claim(
     client: IssueComments,
     identity: ClaimIdentity,
@@ -1455,36 +1479,38 @@ def rescope_claim(
     client.post_comment(
         LEDGER_ISSUE, rescope_comment(selected, new_scope, agent, selected.role)
     )
-    post_aggregate = _aggregate_claim_events(client.list_protocol_candidates(LEDGER_ISSUE))
-    _reject_duplicate_claim_ids(post_aggregate)
-    observed = post_aggregate.active
-    own = next((claim for claim in observed if claim.claim_id == selected.claim_id), None)
-    if own is None:
-        raise ClaimError(
-            f"{_identity_summary(identity, selected.branch)} did not expose "
-            "the rescoped claim id"
-        )
-    if own.scope != new_scope:
-        raise ClaimError(
-            f"{_identity_summary(identity, selected.branch)} did not observe "
-            "the posted rescope"
-        )
+    observed, own = _observe_rescoped_claim(
+        client,
+        identity,
+        selected,
+        new_scope,
+        expose="the rescoped claim id",
+        observe="the posted rescope",
+    )
     competitors = conflicting_claims(observed, own)
     if competitors:
-        winner = min(
-            (own, *competitors),
+        competitor = min(
+            competitors,
             key=lambda claim: (claim.comment.created_at, claim.comment.identifier),
         )
-        if winner.claim_id != selected.claim_id:
-            client.post_comment(
-                LEDGER_ISSUE,
-                rescope_comment(selected, selected.scope, agent, selected.role),
-            )
-            raise ClaimUnavailable(
-                f"{_identity_summary(identity, selected.branch)} rescope race lost to "
-                f"{winner.agent} ({winner.role}) on "
-                f"{_identity_summary(winner.identity, winner.branch)} branch {winner.branch}"
-            )
+        client.post_comment(
+            LEDGER_ISSUE,
+            rescope_comment(selected, selected.scope, agent, selected.role),
+        )
+        _observe_rescoped_claim(
+            client,
+            identity,
+            selected,
+            selected.scope,
+            expose="the rescope rollback",
+            observe="the rescope rollback",
+        )
+        raise ClaimUnavailable(
+            f"{_identity_summary(identity, selected.branch)} rescope race lost to "
+            f"{competitor.agent} ({competitor.role}) on "
+            f"{_identity_summary(competitor.identity, competitor.branch)} "
+            f"branch {competitor.branch}"
+        )
 
     _reconcile_identity(client, identity)
     return own
