@@ -7,6 +7,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from . import github
 from .protocol import REPOSITORY_PATTERN, ClaimError, ClaimRequest, _outbound_text
 
 GH_TIMEOUT_SECONDS = 60
@@ -26,13 +27,15 @@ def _repository(explicit: str | None) -> str:
                 capture_output=True,
                 text=True,
                 timeout=GH_TIMEOUT_SECONDS,
+                env=github.github_command_environment(),
             )
         except FileNotFoundError as error:
             raise ClaimError("gh is required for issue claims") from error
         except subprocess.TimeoutExpired as error:
             raise ClaimError("gh timed out while resolving the repository") from error
-        if result.returncode == 0 and result.stdout.strip():
-            repository = result.stdout.strip()
+        cleaned = github.strip_ansi(result.stdout).strip()
+        if result.returncode == 0 and cleaned:
+            repository = cleaned
         else:
             remote = _git_output(["config", "--get", "remote.origin.url"])
             match = re.search(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?$", remote)
@@ -63,24 +66,59 @@ def _git_output(arguments: list[str]) -> str:
     return result.stdout.strip()
 
 
-def _validate_checkout(request: ClaimRequest) -> None:
-    if request.branch in {"main", "master"}:
+def _scope_directories(paths: tuple[str, ...]) -> tuple[str, ...]:
+    """Return the scope entries that name a git tree or on-disk directory.
+
+    A directory scope locks every descendant path. Callers must require an
+    explicit --allow-directory reason before storing one.
+    """
+    directories: list[str] = []
+    toplevel: str | None = None
+    for path in paths:
+        try:
+            kind = _git_output(["cat-file", "-t", f"HEAD:{path}"])
+        except ClaimError:
+            kind = ""
+        if kind == "tree":
+            directories.append(path)
+            continue
+        if toplevel is None:
+            try:
+                toplevel = _git_output(["rev-parse", "--show-toplevel"])
+            except ClaimError:
+                toplevel = ""
+        if toplevel and (Path(toplevel) / path).is_dir():
+            directories.append(path)
+    return tuple(directories)
+
+
+def _validate_worktree_branch(branch: str) -> None:
+    """Require an isolated non-main worktree checked out on `branch`.
+
+    Rescope uses this without also binding HEAD to the claim base or requiring
+    a clean tree, so a lane can sharpen scope after it has already committed.
+    """
+    if branch in {"main", "master"}:
         raise ClaimError("build claims require an isolated non-main worktree branch")
-    head = _git_output(["rev-parse", "HEAD"])
-    branch = _git_output(["branch", "--show-current"])
+    current = _git_output(["branch", "--show-current"])
     git_directory = Path(_git_output(["rev-parse", "--git-dir"])).resolve()
     common_directory = Path(_git_output(["rev-parse", "--git-common-dir"])).resolve()
-    dirty = _git_output(["status", "--porcelain"])
+    if current != branch:
+        raise ClaimError(
+            f"claim branch {branch!r} does not match checkout branch {current!r}"
+        )
+    if git_directory == common_directory:
+        raise ClaimError("build claims require a linked isolated worktree checkout")
+
+
+def _validate_checkout(request: ClaimRequest) -> None:
+    head = _git_output(["rev-parse", "HEAD"])
     if head != request.base:
         raise ClaimError(
             f"claim base {request.base} does not match checkout HEAD {head}"
         )
-    if branch != request.branch:
-        raise ClaimError(
-            f"claim branch {request.branch!r} does not match checkout branch {branch!r}"
-        )
-    if git_directory == common_directory:
-        raise ClaimError("build claims require a linked isolated worktree checkout")
+    _validate_worktree_branch(request.branch)
+    dirty = _git_output(["status", "--porcelain"])
     if dirty:
         raise ClaimError("claim must be acquired before the first worktree edit")
 
