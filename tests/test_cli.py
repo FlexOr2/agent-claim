@@ -1576,6 +1576,56 @@ def test_rescope_refuses_a_path_held_by_another_issue() -> None:
     assert scopes[other.claim_id] == ("docs/PRODUCT.md",)
 
 
+def test_rescope_drops_an_unrelated_path_when_the_remainder_already_overlaps() -> None:
+    client = _claims_client(
+        request(issue=72, scope=("docs/product", "tests/tooling")),
+        request("claim-b", "Grok 4.6", issue=73, scope=("docs/product",)),
+    )
+
+    updated = rescope_claim(
+        client,
+        IssueIdentity(72),
+        "Codex Sol",
+        (),
+        ("tests/tooling",),
+        "claim-a",
+    )
+
+    assert updated.claim_id == "claim-a"
+    assert updated.scope == ("docs/product",)
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    scopes = {claim.claim_id: claim.scope for claim in standing}
+    assert scopes["claim-a"] == ("docs/product",)
+    assert scopes["claim-b"] == ("docs/product",)
+
+
+def test_rescope_refuses_adding_a_held_path_when_the_remainder_already_overlaps() -> None:
+    client = _claims_client(
+        request(issue=72, scope=("docs/product", "tests/tooling")),
+        request(
+            "claim-b",
+            "Grok 4.6",
+            issue=73,
+            scope=("docs/product", "src/held.py"),
+        ),
+    )
+
+    with pytest.raises(ClaimUnavailable, match="on issue #73"):
+        rescope_claim(
+            client,
+            IssueIdentity(72),
+            "Codex Sol",
+            ("src/held.py",),
+            (),
+            "claim-a",
+        )
+
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    scopes = {claim.claim_id: claim.scope for claim in standing}
+    assert scopes["claim-a"] == ("docs/product", "tests/tooling")
+    assert scopes["claim-b"] == ("docs/product", "src/held.py")
+
+
 def test_rescope_refuses_dropping_a_path_it_does_not_hold() -> None:
     client = FakeComments()
     acquire_claim(client, request(issue=72, scope=("src/widget.py",)))

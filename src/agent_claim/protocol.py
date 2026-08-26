@@ -1412,6 +1412,20 @@ def _observe_rescoped_claim(
     return observed, own
 
 
+def _rescope_added_conflicts(
+    claims: tuple[ActiveClaim, ...],
+    claim_id: str,
+    added: tuple[str, ...],
+) -> tuple[ActiveClaim, ...]:
+    if not added:
+        return ()
+    return tuple(
+        claim
+        for claim in claims
+        if claim.claim_id != claim_id and _scopes_overlap(claim.scope, added)
+    )
+
+
 def rescope_claim(
     client: IssueComments,
     identity: ClaimIdentity,
@@ -1466,8 +1480,8 @@ def rescope_claim(
             f"claim branch {selected.branch!r} does not match checkout branch {branch!r}"
         )
     new_scope = _combined_scope(selected.scope, add_scope, drop_scope)
-    candidate = replace(selected, scope=new_scope)
-    blocked_by = conflicting_claims(observed, candidate)
+    added = tuple(path for path in new_scope if path not in selected.scope)
+    blocked_by = _rescope_added_conflicts(observed, selected.claim_id, added)
     if blocked_by:
         owner = blocked_by[0]
         raise ClaimUnavailable(
@@ -1487,7 +1501,7 @@ def rescope_claim(
         expose="the rescoped claim id",
         observe="the posted rescope",
     )
-    competitors = conflicting_claims(observed, own)
+    competitors = _rescope_added_conflicts(observed, own.claim_id, added)
     if competitors:
         competitor = min(
             competitors,

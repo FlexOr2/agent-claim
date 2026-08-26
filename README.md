@@ -42,8 +42,9 @@ Omitted `--role` on `release` uses that selected claim's role; an explicit
 present on the ledger, active or released, is refused before anything is posted;
 release the old claim and pass a fresh `--claim-id` instead.
 `rescope <issue> --add <path> [--drop <path>]` changes a live claim's scope
-without releasing it: the claim id and base stay, exclusivity is the same as
-`claim`, and there is no release window. It does not require HEAD to match
+without releasing it: the claim id and base stay, added paths are exclusive
+like `claim`, dropping is not refused for an existing remainder overlap, and
+there is no release window. It does not require HEAD to match
 base or a clean tree. A `rescope` ledger event is a new v2 action; older
 helpers fail loud on the whole ledger until they upgrade.
 
