@@ -5,11 +5,12 @@ import json
 import subprocess
 import sys
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from agent_claim import checkout, discovery, github, protocol
+from agent_claim import board, checkout, discovery, github, protocol
 from agent_claim import cli as issue_claim
 from agent_claim.cli import (  # noqa: E402
     MAX_COMMENT_BYTES,
@@ -379,6 +380,203 @@ class FakeComments:
                     entries[index] = replace(entry, body=body, updated_at=edited_at)
                     return
         raise ClaimError(f"comment {comment_id} not found for neutralization")
+
+
+def test_board_projects_fixture_json_without_github_writes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    issues_json = [
+        {
+            "number": 10,
+            "title": "Security boundary",
+            "labels": ["security"],
+            "body": (
+                "## Now\nInspect.\n\n## Next\nLand #10.\n\n## Blocked by\nNone."
+                "\n\n## Done when\nMerged."
+            ),
+            "createdAt": "2026-08-10T00:00:00Z",
+            "updatedAt": "2026-08-20T00:00:00Z",
+        },
+        {
+            "number": 11,
+            "title": "Product dependency",
+            "labels": ["product"],
+            "body": (
+                "## Now\nImplement.\n\n## Next\nReview implementation.\n\n## Blocked by\n#10"
+                "\n\n## Done when\nReleased."
+            ),
+            "createdAt": "2026-08-12T00:00:00Z",
+            "updatedAt": "2026-08-20T00:00:00Z",
+        },
+        {
+            "number": 12,
+            "title": "Old notes",
+            "labels": ["ux"],
+            "body": "Unstructured notes.",
+            "createdAt": "2026-08-01T00:00:00Z",
+            "updatedAt": "2026-08-10T00:00:00Z",
+        },
+        {
+            "number": 13,
+            "title": "Cleanup landed",
+            "labels": ["cleanup"],
+            "body": (
+                "## Now\nVerify.\n\n## Next\nClose issue.\n\n## Blocked by\nNone."
+                "\n\n## Done when\nReleased."
+            ),
+            "createdAt": "2026-08-02T00:00:00Z",
+            "updatedAt": "2026-08-19T00:00:00Z",
+        },
+    ]
+    open_prs_json = [
+        {"number": 90, "title": "Fixes #10", "body": "", "headRefName": "other", "mergedAt": None},
+        {
+            "number": 91,
+            "title": "In progress",
+            "body": "",
+            "headRefName": "codex/issue-11-claims",
+            "mergedAt": None,
+        },
+        {
+            "number": 93,
+            "title": "Planning note",
+            "body": "Blocked by #12",
+            "headRefName": "notes",
+            "mergedAt": None,
+        },
+    ]
+    merged_prs_json = [
+        {
+            "number": 92,
+            "title": "Fixes #13",
+            "body": "",
+            "headRefName": "codex/issue-13-cleanup",
+            "mergedAt": "2026-08-20T12:00:00Z",
+        }
+    ]
+    active = request("board-claim", issue=11, branch="codex/issue-11-claims")
+    ledger_comment = {
+        "id": 1,
+        "created_at": "2026-08-20T12:00:00Z",
+        "updated_at": "2026-08-20T12:00:00Z",
+        "body": claim_comment(active),
+        "author_association": "OWNER",
+        "html_url": "https://github.com/example/agent-claim/issues/71#issuecomment-1",
+    }
+    client = GitHubIssueComments("example/agent-claim")
+    observed: list[list[str]] = []
+
+    def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
+        assert input_data is None
+        observed.append(arguments)
+        endpoint = next((argument for argument in arguments if argument.startswith("repos/")), "")
+        if "/comments?" in endpoint:
+            rows = [ledger_comment]
+        elif "/issues?" in endpoint:
+            rows = issues_json
+        elif arguments[:2] == ["pr", "list"] and "open" in arguments:
+            rows = open_prs_json
+        elif arguments[:2] == ["pr", "list"] and "merged" in arguments:
+            rows = merged_prs_json
+        else:
+            pytest.fail(f"unexpected board request: {arguments}")
+        return json.dumps(rows) if arguments[:2] == ["pr", "list"] else "\n".join(
+            json.dumps(row) for row in rows
+        )
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 8, 21, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(client, "_run", run)
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(issue_claim, "datetime", FixedDateTime)
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "board"]) == 0
+    rendered = capsys.readouterr().out
+    assert "CONTRACT" in rendered and "NEXT" in rendered
+    assert "#10" in rendered
+    assert "#13" in rendered.split("READY NOW\n", 1)[1].split("\n", 1)[0]
+    assert "#12" in rendered.split("STALE\n", 1)[1]
+    assert all("--method" not in arguments for arguments in observed)
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "board", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    first = payload["items"][0]
+    ten = next(item for item in payload["items"] if item["number"] == 10)
+    assert first["number"] == 10
+    assert ten["stage"] == "in-flight"
+    assert ten["unblocks_count"] == 1
+    assert ten["contract"]["next"] == "Land #10."
+    assert ten["contract_complete"] is True
+    assert next(item for item in payload["items"] if item["number"] == 12)["stage"] == "text-only"
+
+
+def test_board_ranks_a_real_blocker_ahead_of_a_blocked_product_item() -> None:
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    blocker = board.Issue(
+        20,
+        "Unlabelled prerequisite",
+        (),
+        "",
+        "2026-08-20T00:00:00Z",
+        "2026-08-20T00:00:00Z",
+    )
+    product = board.Issue(
+        21,
+        "Product work",
+        ("product",),
+        "## Blocked by\n#20",
+        "2026-08-20T00:00:00Z",
+        "2026-08-20T00:00:00Z",
+    )
+
+    projected = board.build_board(
+        (blocker, product), (), (), (), board.BoardConfig(), now=now
+    )
+
+    assert [item.number for item in projected.items] == [20, 21]
+    assert projected.items[0].unblocks_count == 1
+    assert projected.items[1].open_blockers == (20,)
+
+
+def test_board_category_order_keeps_ci_ahead_of_a_high_scoring_blocker() -> None:
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    ci = board.Issue(30, "CI", ("ci",), "", "2026-08-20T00:00:00Z", "2026-08-20T00:00:00Z")
+    blocker = board.Issue(31, "Blocker", (), "", "2026-08-20T00:00:00Z", "2026-08-20T00:00:00Z")
+    dependent = board.Issue(
+        32,
+        "Dependent",
+        (),
+        "## Blocked by\n#31",
+        "2026-08-20T00:00:00Z",
+        "2026-08-20T00:00:00Z",
+    )
+    open_pull_request = board.PullRequest(90, "Fixes #31", "", "branch")
+
+    projected = board.build_board(
+        (ci, blocker, dependent),
+        (open_pull_request,),
+        (),
+        (),
+        board.BoardConfig(),
+        now=now,
+    )
+
+    assert [item.number for item in projected.items[:2]] == [30, 31]
+    assert projected.items[1].score > projected.items[0].score
+
+
+def test_board_configuration_requires_unique_ordered_labels(tmp_path: Path) -> None:
+    config_path = tmp_path / "board.toml"
+    config_path.write_text('priority_labels = ["ux", "security"]\n')
+    assert board.load_config(config_path).priority_labels == ("ux", "security")
+
+    config_path.write_text("priority_labels = []\n")
+    with pytest.raises(ClaimError, match="priority_labels"):
+        board.load_config(config_path)
 
 
 def marker(

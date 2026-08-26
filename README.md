@@ -73,6 +73,20 @@ A duplicate still active under two different agents is a real ownership
 conflict; `reconcile` reports it and leaves the whole ledger untouched — for
 every duplicated id, not just the conflicting one — instead of picking a winner.
 
+## Read-only board projection
+
+`agent-claim board` reads the open issues, open PRs, PRs merged in the last 14
+days, and the claim ledger, then prints a ranked projection with `READY NOW` and
+`STALE` sections. The table exposes which exact contract headings were found
+and a concise `Next`; JSON includes the complete derived contract state. It
+never writes GitHub. The target defaults to the repository of the current checkout;
+for another GitHub repository run `agent-claim --repo FlexOr2/atelier-2 board`.
+The current checkout may set `priority_labels` as an ordered non-empty list in
+`.agent-claim/board.toml`; absent configuration uses `security`, `data`, `ci`,
+`product`, `ux`, then `cleanup`. The first three configured labels are primary
+buckets, followed by items that unblock other work, then the remaining labels;
+stage and Next bonuses sort only within a bucket.
+
 ## Issueless lane claims
 
 `docs/`- and `fix/`-prefixed branches land within one session without a GitHub
