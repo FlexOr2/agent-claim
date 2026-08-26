@@ -29,11 +29,27 @@ from .protocol import (
 )
 
 TIMESTAMP_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+# gh 2.45 colorizes --jq output when it believes stdout is a TTY.
+ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 COMMENTS_PER_PAGE = 100
 MAX_LEDGER_PAGES = 100
 LEDGER_ROLLOVER_WARNING_PAGES = 80
 MAX_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024
 GH_TIMEOUT_SECONDS = 60
+GH_QUIET_ENVIRONMENT = {
+    "NO_COLOR": "1",
+    "GH_NO_UPDATE_NOTIFIER": "1",
+}
+
+
+def github_command_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.update(GH_QUIET_ENVIRONMENT)
+    return environment
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_ESCAPE.sub("", text)
 
 
 def _stop_process(process: subprocess.Popen[bytes]) -> None:
@@ -66,12 +82,7 @@ def _bounded_command(
             stdin=subprocess.PIPE if input_data is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            env={
-                **os.environ,
-                "NO_COLOR": "1",
-                "CLICOLOR": "0",
-                "GH_NO_UPDATE_NOTIFIER": "1",
-            },
+            env=github_command_environment(),
         )
     except OSError as error:
         if isinstance(error, FileNotFoundError):
@@ -147,7 +158,7 @@ def _bounded_command(
             if process.poll() is None:
                 _stop_process(process)
     try:
-        decoded = output.decode("utf-8").strip()
+        decoded = strip_ansi(output.decode("utf-8")).strip()
     except UnicodeDecodeError as error:
         raise ClaimError(f"{purpose} returned non-UTF-8 output") from error
     if return_code != 0:
@@ -170,23 +181,25 @@ class GitHubIssueComments:
         )
 
     def _json_lines(self, raw: str, description: str) -> tuple[object, ...]:
+        """Parse compact NDJSON, pretty JSON, or a concatenated JSON sequence."""
+        text = strip_ansi(raw).strip()
+        if not text:
+            return ()
+        decoder = json.JSONDecoder()
         values: list[object] = []
+        offset = 0
+        length = len(text)
         try:
-            for line in raw.splitlines():
-                if line.strip():
-                    values.append(json.loads(line))
+            while offset < length:
+                while offset < length and text[offset].isspace():
+                    offset += 1
+                if offset >= length:
+                    break
+                value, offset = decoder.raw_decode(text, offset)
+                values.append(value)
         except json.JSONDecodeError as error:
             raise ClaimError(f"GitHub returned invalid {description} JSON") from error
         return tuple(values)
-
-    def _json_array(self, raw: str, description: str) -> tuple[object, ...]:
-        try:
-            decoded = json.loads(raw)
-        except json.JSONDecodeError as error:
-            raise ClaimError(f"GitHub returned invalid {description} JSON") from error
-        if not isinstance(decoded, list):
-            raise ClaimError(f"GitHub returned a malformed {description} JSON array")
-        return tuple(decoded)
 
     def _comment_page(self, issue: int, page: int) -> tuple[IssueComment, ...]:
         raw = self._run(
@@ -358,11 +371,13 @@ class GitHubIssueComments:
                 "1000",
                 "--json",
                 "number,title,body,headRefName",
+                "--jq",
+                ".[]",
             ]
         )
         return tuple(
             self._board_pull_request(value)
-            for value in self._json_array(raw, "open board pull request")
+            for value in self._json_lines(raw, "open board pull request")
         )
 
     def list_recent_merged_board_pull_requests(
@@ -382,12 +397,14 @@ class GitHubIssueComments:
                 "1000",
                 "--json",
                 "number,title,body,headRefName,mergedAt",
+                "--jq",
+                ".[]",
             ]
         )
         cutoff = since.astimezone(timezone.utc)
         pull_requests = tuple(
             self._board_pull_request(value)
-            for value in self._json_array(raw, "merged board pull request")
+            for value in self._json_lines(raw, "merged board pull request")
         )
         recent: list[board.PullRequest] = []
         for pull_request in pull_requests:

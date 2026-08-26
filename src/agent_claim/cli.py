@@ -48,6 +48,7 @@ bootstrap_ledger = discovery.bootstrap_ledger
 claim_comment = protocol.claim_comment
 claim_label = protocol.claim_label
 claims_conflict = protocol.claims_conflict
+claims_holding_path = protocol.claims_holding_path
 configure_ledger = protocol.configure_ledger
 discover_ledger = discovery.discover_ledger
 is_protocol_candidate = protocol.is_protocol_candidate
@@ -56,7 +57,9 @@ reconcile_all_labels = protocol.reconcile_all_labels
 reconcile_issue_label = protocol.reconcile_issue_label
 repair_duplicate_claims = protocol.repair_duplicate_claims
 release_claim = protocol.release_claim
+rescope_claim = protocol.rescope_claim
 release_comment = protocol.release_comment
+rescope_comment = protocol.rescope_comment
 supersede_comment = protocol.supersede_comment
 supersede_ledger = protocol.supersede_ledger
 
@@ -98,6 +101,18 @@ def _claim_subject(claim: protocol.ActiveClaim) -> str:
         if isinstance(claim.identity, protocol.LaneIdentity)
         else f"issue #{claim.identity.issue}"
     )
+
+
+def _reject_directory_scopes(paths: tuple[str, ...], reason: str | None) -> None:
+    directories = checkout._scope_directories(paths)
+    if not directories:
+        return
+    if reason is None:
+        raise protocol.ClaimError(
+            f"directory scope {directories[0]!r} locks a whole tree; "
+            "pass --allow-directory REASON, or claim files instead"
+        )
+    protocol._outbound_text(reason, "allow-directory reason", maximum=512)
 
 
 def _request(arguments: argparse.Namespace) -> protocol.ClaimRequest:
@@ -142,6 +157,7 @@ def _request(arguments: argparse.Namespace) -> protocol.ClaimRequest:
         claim_id=parsed.claim_id,
     )
     checkout._validate_checkout(request)
+    _reject_directory_scopes(request.scope, getattr(arguments, "allow_directory", None))
     return request
 
 
@@ -171,8 +187,18 @@ def _parser() -> argparse.ArgumentParser:
     claim.add_argument("--role", default=DEFAULT_CLAIM_ROLE)
     claim.add_argument("--base")
     claim.add_argument("--branch")
-    claim.add_argument("--scope", action="append", required=True)
+    claim.add_argument(
+        "--scope",
+        action="append",
+        required=True,
+        help="repository-relative path; comma-joined values equal repeated --scope",
+    )
     claim.add_argument("--claim-id")
+    claim.add_argument(
+        "--allow-directory",
+        metavar="REASON",
+        help="permit a directory scope that locks a whole tree",
+    )
     claim.add_argument("--json", action="store_true")
 
     release = commands.add_parser("release", help="release a landed or abandoned claim")
@@ -188,6 +214,38 @@ def _parser() -> argparse.ArgumentParser:
     release.add_argument("--claim-id")
     release.add_argument("--coordinator-override", action="store_true")
     release.add_argument("--json", action="store_true")
+
+    rescope = commands.add_parser(
+        "rescope", help="add or drop paths on a live claim without releasing"
+    )
+    rescope.add_argument(
+        "issue",
+        type=int,
+        nargs="?",
+        help="omit for lane mode, derived from a docs/ or fix/ checkout branch",
+    )
+    rescope.add_argument("--agent")
+    rescope.add_argument(
+        "--add",
+        action="append",
+        help="repository-relative path to add; comma-joined values equal repeated --add",
+    )
+    rescope.add_argument(
+        "--drop",
+        action="append",
+        help="repository-relative path to drop; comma-joined values equal repeated --drop",
+    )
+    rescope.add_argument("--claim-id")
+    rescope.add_argument(
+        "--allow-directory",
+        metavar="REASON",
+        help="permit adding a directory scope that locks a whole tree",
+    )
+    rescope.add_argument("--json", action="store_true")
+
+    who = commands.add_parser("who", help="show which live claim holds a path")
+    who.add_argument("path")
+    who.add_argument("--json", action="store_true")
 
     reconcile = commands.add_parser("reconcile", help="repair claimed-label projections")
     reconcile.add_argument("issue", type=int, nargs="?")
@@ -288,6 +346,69 @@ def _status_json(
     }
     print(json.dumps(payload))
     return 2 if state == "CONFLICT" else 0
+
+
+def _who(claims: tuple[protocol.ActiveClaim, ...], path: str) -> int:
+    holders = protocol.claims_holding_path(claims, path)
+    if not holders:
+        print(f"UNCLAIMED {path}")
+        return 0
+    state = "CONFLICT" if len(holders) > 1 else "CLAIMED"
+    for claim in holders:
+        print(
+            f"{state} {path} {_claim_subject(claim)}: {claim.agent} ({claim.role}) "
+            f"claim={claim.claim_id}"
+        )
+    return 2 if state == "CONFLICT" else 0
+
+
+def _who_json(
+    claims: tuple[protocol.ActiveClaim, ...], path: str, ledger: int
+) -> int:
+    holders = protocol.claims_holding_path(claims, path)
+    if not holders:
+        state = "UNCLAIMED"
+    elif len(holders) > 1:
+        state = "CONFLICT"
+    else:
+        state = "CLAIMED"
+    payload = {
+        "ledger": ledger,
+        "path": path,
+        "state": state,
+        "claims": [
+            {
+                **_identity_json(claim.identity),
+                "agent": claim.agent,
+                "role": claim.role,
+                "base": claim.base,
+                "branch": claim.branch,
+                "claim_id": claim.claim_id,
+                "scope": list(claim.scope),
+                "state": "CONFLICT" if len(holders) > 1 else "CLAIMED",
+            }
+            for claim in holders
+        ],
+    }
+    print(json.dumps(payload))
+    return 2 if state == "CONFLICT" else 0
+
+
+def _rescope_json(claimed: protocol.ActiveClaim) -> int:
+    print(
+        json.dumps(
+            {
+                **_identity_json(claimed.identity),
+                "claim_id": claimed.claim_id,
+                "agent": claimed.agent,
+                "role": claimed.role,
+                "base": claimed.base,
+                "branch": claimed.branch,
+                "scope": list(claimed.scope),
+            }
+        )
+    )
+    return 0
 
 
 def _claim_json(claimed: protocol.ActiveClaim) -> int:
@@ -446,7 +567,7 @@ def main(arguments: list[str] | None = None) -> int:
     if parsed.command == "protect":
         return _protect(parsed.repo)
     try:
-        if parsed.command in {"claim", "release"}:
+        if parsed.command in {"claim", "release", "rescope"}:
             parsed.agent = checkout._resolved_agent(parsed.agent)
         release_branch: str | None = None
         if parsed.command == "release":
@@ -486,6 +607,37 @@ def main(arguments: list[str] | None = None) -> int:
         if parsed.command == "board":
             projected = _board(client, protocol._ledger_claims(client))
             print(board.board_json(projected) if parsed.json else board.render(projected))
+            return 0
+        if parsed.command == "who":
+            claims = protocol._ledger_claims(client)
+            if parsed.json:
+                return _who_json(claims, parsed.path, ledger)
+            print(f"LEDGER #{ledger}")
+            return _who(claims, parsed.path)
+        if parsed.command == "rescope":
+            rescope_branch = checkout._git_output(["branch", "--show-current"])
+            if not rescope_branch:
+                raise protocol.ClaimUnavailable(
+                    "rescope requires a non-empty current branch; "
+                    "check out the claim branch, or pass an issue number"
+                )
+            checkout._validate_worktree_branch(rescope_branch)
+            identity = _resolved_identity(parsed.issue, rescope_branch)
+            add = protocol._valid_scope(parsed.add) if parsed.add else ()
+            drop = protocol._valid_scope(parsed.drop) if parsed.drop else ()
+            _reject_directory_scopes(add, parsed.allow_directory)
+            rescoped = protocol.rescope_claim(
+                client,
+                identity,
+                parsed.agent,
+                add,
+                drop,
+                parsed.claim_id,
+                branch=rescope_branch,
+            )
+            if parsed.json:
+                return _rescope_json(rescoped)
+            print(f"RESCOPED {_claim_subject(rescoped)}: {rescoped.claim_id}")
             return 0
         if parsed.command == "claim":
             claimed = protocol.acquire_claim(client, _request(parsed))

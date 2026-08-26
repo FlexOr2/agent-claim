@@ -40,14 +40,23 @@ Omitted `--role` on `release` uses that selected claim's role; an explicit
 `release` is `landed`. `--coordinator-override` still requires `--role coordinator` and
 `--reason`. `supersede` still requires `--agent` and `--role`. A `--claim-id` already
 present on the ledger, active or released, is refused before anything is posted;
-release the old claim and pass a fresh `--claim-id` instead. Scope extension of an
-existing claim is not supported by reusing its claim id.
+release the old claim and pass a fresh `--claim-id` instead.
+`rescope <issue> --add <path> [--drop <path>]` changes a live claim's scope
+without releasing it: the claim id and base stay, exclusivity is the same as
+`claim`, and there is no release window. It does not require HEAD to match
+base or a clean tree. A `rescope` ledger event is a new v2 action; older
+helpers fail loud on the whole ledger until they upgrade.
 
 Run commands in the repository being coordinated, or pass `--repo
 OWNER/REPOSITORY`. A claim must begin from a clean linked worktree and binds its
-base commit, branch, issue, and repository-relative scope. Claims collide on the
-same issue or overlapping paths; disjoint scopes can proceed concurrently.
-Agents should read `--json` from `status`, `claim`, and `release`.
+base commit, branch, issue, and repository-relative scope. `--scope a,b` is
+the same as `--scope a --scope b`; each path is stored and compared
+separately, including when an older ledger comment still has one comma-joined
+string. Directory scopes (`docs`, `frontend/src`) lock the whole tree and are
+refused unless `--allow-directory REASON` is set. Claims collide on the same
+issue or overlapping paths; disjoint scopes can proceed concurrently.
+`who <path>` prints the live claim that holds a path.
+Agents should read `--json` from `status`, `claim`, `release`, `rescope`, and `who`.
 
 `bootstrap` adopts the exact `<!-- agent-claim-ledger:v1 -->` issue marker,
 ensures it is locked and labelled, and safely converges concurrent first starts
@@ -165,7 +174,9 @@ an existing hook file. The CLI does not write `~/.grok`.
 
 ## v0.5 boundary
 
-GitHub via the `gh` CLI is supported today. The tool does not automatically
-allocate work, merge code, or operate a lease server. Omitted `--agent` follows
+GitHub via the `gh` CLI is supported today. Invocations set `NO_COLOR=1`
+and `GH_NO_UPDATE_NOTIFIER=1`, strip ANSI from output, and parse pretty or
+compact JSON, so a wrapping `gh` shim is not required. The tool does not
+automatically allocate work, merge code, or operate a lease server. Omitted `--agent` follows
 the documented else-chain; it does not invent an identity. It intentionally
 leaves policy-file generation and non-GitHub adapters for a later release.

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import Protocol
@@ -131,6 +131,22 @@ class OverrideRelease:
 
 
 @dataclass(frozen=True)
+class ClaimRescope:
+    """Append-only scope replacement for a still-active claim.
+
+    Keeps claim id, identity, agent, role, base, and branch. Old helpers that
+    do not know this action fail loud on the whole ledger.
+    """
+
+    identity: ClaimIdentity
+    claim_id: str
+    agent: str
+    role: str
+    scope: tuple[str, ...]
+    comment: IssueComment
+
+
+@dataclass(frozen=True)
 class LedgerSupersede:
     """Terminal event that freezes the whole ledger; always issue(ledger)-scoped.
 
@@ -149,7 +165,7 @@ class LedgerSupersede:
     comment: IssueComment
 
 
-ClaimEvent = ActiveClaim | ClaimantRelease | OverrideRelease | LedgerSupersede
+ClaimEvent = ActiveClaim | ClaimantRelease | OverrideRelease | ClaimRescope | LedgerSupersede
 
 
 class DuplicateClaimConflict(ClaimError):
@@ -328,22 +344,38 @@ def _valid_branch(payload: dict[str, object]) -> str:
     return branch
 
 
-def _valid_scope(scope: object) -> tuple[str, ...]:
+def _scope_list_entries(scope: object) -> list[str]:
+    """Expand a stored or CLI scope list into individual path strings.
+
+    Each list entry may itself be comma-joined: `--scope a,b` equals
+    `--scope a --scope b`. Existing ledger markers that stored one opaque
+    comma-joined string are read the same way, so overlap detection covers
+    them without rewriting the append-only comment.
+    """
     if not isinstance(scope, list) or not scope:
         raise InvalidClaimMarker("claim marker scope must be a non-empty list")
-    if len(scope) > MAX_SCOPE_ENTRIES:
-        raise InvalidClaimMarker(
-            f"claim marker scope exceeds {MAX_SCOPE_ENTRIES} entries"
-        )
-    result: list[str] = []
+    expanded: list[str] = []
     for raw_path in scope:
         if not isinstance(raw_path, str):
             raise InvalidClaimMarker("claim scope entries must be text")
-        path = raw_path.strip()
+        if raw_path.strip() != raw_path or not raw_path:
+            raise InvalidClaimMarker("claim scope entries must be canonical bounded paths")
+        pieces = [piece.strip() for piece in raw_path.split(",")]
+        if any(not piece for piece in pieces):
+            raise InvalidClaimMarker("claim scope entries must be canonical bounded paths")
+        expanded.extend(pieces)
+    if len(expanded) > MAX_SCOPE_ENTRIES:
+        raise InvalidClaimMarker(
+            f"claim marker scope exceeds {MAX_SCOPE_ENTRIES} entries"
+        )
+    return expanded
+
+
+def _valid_scope(scope: object) -> tuple[str, ...]:
+    result: list[str] = []
+    for path in _scope_list_entries(scope):
         if (
-            not path
-            or path != raw_path
-            or len(path) > MAX_SCOPE_PATH_LENGTH
+            len(path) > MAX_SCOPE_PATH_LENGTH
             or "\\" in path
             or any(ord(character) < 32 or ord(character) == 127 for character in path)
         ):
@@ -560,13 +592,41 @@ def _parse_ledger_supersede(
     )
 
 
+def _parse_claim_rescope(
+    payload: dict[str, object], comment: IssueComment, identity: ClaimIdentity
+) -> ClaimRescope:
+    _strict_keys(
+        payload,
+        frozenset(
+            {
+                "action",
+                "agent",
+                "claim_id",
+                _identity_marker_key(identity),
+                "role",
+                "scope",
+            }
+        ),
+        comment,
+    )
+    claim_id, agent, role = _event_identity(payload, comment)
+    return ClaimRescope(
+        identity=identity,
+        claim_id=claim_id,
+        agent=agent,
+        role=role,
+        scope=_valid_scope(payload.get("scope")),
+        comment=comment,
+    )
+
+
 def parse_claim_event(comment: IssueComment) -> ClaimEvent | None:
     parsed_marker = _marker_payload(comment)
     if parsed_marker is None:
         return None
     payload, legacy = parsed_marker
     action = _required_text(payload, "action", maximum=32)
-    if action not in {"claim", "release", "override_release", "supersede"}:
+    if action not in {"claim", "release", "override_release", "rescope", "supersede"}:
         raise InvalidClaimMarker(
             f"trusted comment {comment.url} has unknown action {action!r}"
         )
@@ -593,6 +653,8 @@ def parse_claim_event(comment: IssueComment) -> ClaimEvent | None:
         return _parse_claimant_release(payload, comment, identity, legacy=legacy)
     if action == "override_release":
         return _parse_override_release(payload, comment, identity)
+    if action == "rescope":
+        return _parse_claim_rescope(payload, comment, identity)
     return _parse_ledger_supersede(payload, comment, identity.issue)
 
 
@@ -693,6 +755,26 @@ def _aggregate_claim_events(comments: tuple[IssueComment, ...]) -> ClaimLedgerAg
             acquired[event.claim_id] = event
             active[event.claim_id] = event
             continue
+        if isinstance(event, ClaimRescope):
+            current = active.get(event.claim_id)
+            if current is None:
+                if event.claim_id in acquired:
+                    raise InvalidClaimMarker(
+                        f"claim id {event.claim_id!r} was rescoped after it was released"
+                    )
+                raise InvalidClaimMarker(
+                    f"claim id {event.claim_id!r} was rescoped before it was acquired"
+                )
+            if current.identity != event.identity:
+                raise InvalidClaimMarker(
+                    f"claim id {event.claim_id!r} rescope targets the wrong claim"
+                )
+            if (current.agent, current.role) != (event.agent, event.role):
+                raise InvalidClaimMarker(
+                    f"claim id {event.claim_id!r} can only be rescoped by its claimant"
+                )
+            active[event.claim_id] = replace(current, scope=event.scope)
+            continue
         if _apply_terminal_event(event, active, acquired):
             terminated_by.setdefault(event.claim_id, []).append(event.comment)
 
@@ -766,6 +848,15 @@ def claims_conflict(left: ActiveClaim | ClaimRequest, right: ActiveClaim | Claim
     if _identity_conflicts(left, right):
         return True
     return _scopes_overlap(left.scope, right.scope)
+
+
+def claims_holding_path(
+    claims: tuple[ActiveClaim, ...], path: str
+) -> tuple[ActiveClaim, ...]:
+    target = _valid_scope([path])
+    if len(target) != 1:
+        raise ClaimError("who requires a single repository-relative path")
+    return tuple(claim for claim in claims if _scopes_overlap(claim.scope, target))
 
 
 def conflicting_claims(
@@ -895,6 +986,34 @@ def claim_comment(request: ClaimRequest) -> str:
         "Repository-wide ledger event. No edit starts before this claim is re-read live. "
         "Read-only review remains parallel. No Auto-Runner.\n\n"
         f"Agent: {agent} ({role})"
+    )
+
+
+def rescope_comment(claim: ActiveClaim, scope: tuple[str, ...], agent: str, role: str) -> str:
+    validated_agent = _outbound_text(agent, "agent", maximum=128)
+    validated_role = _outbound_text(role, "role", maximum=64)
+    payload: dict[str, object] = {
+        "action": "rescope",
+        "agent": validated_agent,
+        "claim_id": claim.claim_id,
+        _identity_marker_key(claim.identity): _identity_marker_value(claim.identity),
+        "role": validated_role,
+        "scope": list(scope),
+    }
+    scope_lines = "\n".join(f"- `{path}`" for path in scope)
+    return _validated_comment(
+        f"{_marker(payload)}\n"
+        "## RESCOPE — exclusive build lane\n\n"
+        f"- {_identity_label(claim.identity, claim.branch)}\n"
+        f"- Owner: {validated_agent} ({validated_role})\n"
+        f"- Base: `{claim.base}`\n"
+        f"- Branch: `{claim.branch}`\n"
+        f"- Claim ID: `{claim.claim_id}`\n"
+        "- Write scope:\n"
+        f"{scope_lines}\n\n"
+        "Repository-wide ledger event. Claim id and base are unchanged. "
+        "No Auto-Runner.\n\n"
+        f"Agent: {validated_agent} ({validated_role})"
     )
 
 
@@ -1246,6 +1365,154 @@ def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
         )
 
     _reconcile_identity(client, request.identity)
+    return own
+
+
+def _combined_scope(
+    current: tuple[str, ...], add: tuple[str, ...], drop: tuple[str, ...]
+) -> tuple[str, ...]:
+    current_set = set(current)
+    missing = next((path for path in drop if path not in current_set), None)
+    if missing is not None:
+        raise ClaimUnavailable(
+            f"cannot drop {missing!r}; it is not in this claim's scope"
+        )
+    drop_set = set(drop)
+    kept = tuple(path for path in current if path not in drop_set)
+    added = tuple(path for path in add if path not in kept)
+    if not kept and not added:
+        raise ClaimUnavailable("rescope must leave a non-empty scope")
+    combined = kept + added
+    if combined == current:
+        raise ClaimUnavailable("rescope does not change the claim scope")
+    return _valid_scope(list(combined))
+
+
+def _observe_rescoped_claim(
+    client: IssueComments,
+    identity: ClaimIdentity,
+    selected: ActiveClaim,
+    expected_scope: tuple[str, ...],
+    *,
+    expose: str,
+    observe: str,
+) -> tuple[tuple[ActiveClaim, ...], ActiveClaim]:
+    aggregate = _aggregate_claim_events(client.list_protocol_candidates(LEDGER_ISSUE))
+    _reject_duplicate_claim_ids(aggregate)
+    observed = aggregate.active
+    own = next((claim for claim in observed if claim.claim_id == selected.claim_id), None)
+    if own is None:
+        raise ClaimError(
+            f"{_identity_summary(identity, selected.branch)} did not expose {expose}"
+        )
+    if own.scope != expected_scope:
+        raise ClaimError(
+            f"{_identity_summary(identity, selected.branch)} did not observe {observe}"
+        )
+    return observed, own
+
+
+def rescope_claim(
+    client: IssueComments,
+    identity: ClaimIdentity,
+    agent: str,
+    add: tuple[str, ...],
+    drop: tuple[str, ...],
+    claim_id: str | None,
+    *,
+    branch: str | None = None,
+) -> ActiveClaim:
+    if not add and not drop:
+        raise ClaimUnavailable("rescope requires --add or --drop")
+    add_scope = _valid_scope(list(add)) if add else ()
+    drop_scope = _valid_scope(list(drop)) if drop else ()
+    observed = _ledger_claims(client)
+    standing = _claims_for_identity(observed, identity, branch)
+    if not standing:
+        raise ClaimUnavailable(
+            f"{_identity_summary(identity, branch or '')} has no active build claim"
+        )
+    if claim_id is None:
+        if not branch:
+            raise ClaimUnavailable(
+                "rescope without --claim-id requires a non-empty current branch; "
+                "pass --claim-id"
+            )
+        matches = tuple(
+            claim
+            for claim in standing
+            if claim.agent == agent and claim.branch == branch
+        )
+        if len(matches) != 1:
+            raise ClaimUnavailable(
+                f"{_identity_summary(identity, branch)} has no unique claim for this "
+                f"session on branch {branch!r}; pass --claim-id"
+            )
+        selected = matches[0]
+    else:
+        selected = next(
+            (claim for claim in standing if claim.claim_id == claim_id),
+            None,
+        )
+        if selected is None:
+            raise ClaimUnavailable(
+                f"{_identity_summary(identity, branch or '')} has no active claim "
+                f"{claim_id!r}"
+            )
+    if agent != selected.agent:
+        raise ClaimUnavailable("only the original claimant may rescope")
+    if branch and selected.branch != branch:
+        raise ClaimUnavailable(
+            f"claim branch {selected.branch!r} does not match checkout branch {branch!r}"
+        )
+    new_scope = _combined_scope(selected.scope, add_scope, drop_scope)
+    candidate = replace(selected, scope=new_scope)
+    blocked_by = conflicting_claims(observed, candidate)
+    if blocked_by:
+        owner = blocked_by[0]
+        raise ClaimUnavailable(
+            f"{_identity_summary(identity, selected.branch)} or its scope is "
+            f"claimed by {owner.agent} ({owner.role}) on "
+            f"{_identity_summary(owner.identity, owner.branch)} branch {owner.branch}"
+        )
+
+    client.post_comment(
+        LEDGER_ISSUE, rescope_comment(selected, new_scope, agent, selected.role)
+    )
+    observed, own = _observe_rescoped_claim(
+        client,
+        identity,
+        selected,
+        new_scope,
+        expose="the rescoped claim id",
+        observe="the posted rescope",
+    )
+    competitors = conflicting_claims(observed, own)
+    if competitors:
+        competitor = min(
+            competitors,
+            key=lambda claim: (claim.comment.created_at, claim.comment.identifier),
+        )
+        client.post_comment(
+            LEDGER_ISSUE,
+            rescope_comment(selected, selected.scope, agent, selected.role),
+        )
+        _observe_rescoped_claim(
+            client,
+            identity,
+            selected,
+            selected.scope,
+            expose="the rescope rollback",
+            observe="the rescope rollback",
+        )
+        raise ClaimUnavailable(
+            f"{_identity_summary(identity, selected.branch)} rescope race lost to "
+            f"{competitor.agent} ({competitor.role}) on "
+            f"{_identity_summary(competitor.identity, competitor.branch)} "
+            f"branch {competitor.branch}"
+        )
+
+    _reconcile_identity(client, identity)
     return own
 
 

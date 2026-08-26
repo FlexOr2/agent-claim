@@ -35,6 +35,7 @@ from agent_claim.cli import (  # noqa: E402
     claim_comment,
     claim_label,
     claims_conflict,
+    claims_holding_path,
     is_protocol_candidate,
     parse_claim_event,
     reconcile_all_labels,
@@ -42,6 +43,7 @@ from agent_claim.cli import (  # noqa: E402
     release_claim,
     release_comment,
     repair_duplicate_claims,
+    rescope_claim,
     supersede_comment,
     supersede_ledger,
 )
@@ -495,9 +497,7 @@ def test_board_projects_fixture_json_without_github_writes(
             rows = merged_prs_json
         else:
             pytest.fail(f"unexpected board request: {arguments}")
-        return json.dumps(rows) if arguments[:2] == ["pr", "list"] else "\n".join(
-            json.dumps(row) for row in rows
-        )
+        return "\n".join(json.dumps(row) for row in rows)
 
     class FixedDateTime(datetime):
         @classmethod
@@ -514,6 +514,7 @@ def test_board_projects_fixture_json_without_github_writes(
     assert "CONTRACT" in rendered and "NEXT" in rendered
     assert "#10" in rendered
     assert all("--method" not in arguments for arguments in observed)
+    assert all("--jq" in arguments for arguments in observed)
     merged_request = next(arguments for arguments in observed if "merged" in arguments)
     assert "merged:>=2026-08-07" in merged_request
 
@@ -1321,6 +1322,112 @@ def test_scope_overlap_is_repository_wide_and_path_aware() -> None:
     assert not claims_conflict(left, sibling)
 
 
+def test_comma_joined_scope_marker_is_read_as_distinct_paths() -> None:
+    parsed = parse_claim_event(
+        comment(
+            1,
+            marker(
+                {
+                    "action": "claim",
+                    "agent": "Codex Sol",
+                    "base": BASE,
+                    "branch": "codex/issue-71-claims",
+                    "claim_id": "claim-a",
+                    "issue": 71,
+                    "role": "builder",
+                    "scope": [
+                        "docs/PRODUCT.md,src/atelier2/adapters/dbos/run_transitions.py"
+                    ],
+                }
+            ),
+        )
+    )
+
+    assert isinstance(parsed, ActiveClaim)
+    assert parsed.scope == (
+        "docs/PRODUCT.md",
+        "src/atelier2/adapters/dbos/run_transitions.py",
+    )
+
+
+def test_comma_joined_scope_on_another_issue_refuses_a_claim_for_one_of_the_paths() -> None:
+    incumbent = comment(
+        1,
+        marker(
+            {
+                "action": "claim",
+                "agent": "Codex Sol",
+                "base": BASE,
+                "branch": "codex/issue-72-claims",
+                "claim_id": "joined",
+                "issue": 72,
+                "role": "builder",
+                "scope": [
+                    "docs/PRODUCT.md,src/atelier2/adapters/dbos/run_transitions.py"
+                ],
+            }
+        ),
+    )
+    client = FakeComments({LEDGER_ISSUE: [incumbent]}, {72})
+
+    with pytest.raises(ClaimUnavailable, match="on issue #72"):
+        acquire_claim(
+            client,
+            request("challenger", "Grok 4.6", issue=73, scope=("docs/PRODUCT.md",)),
+        )
+
+    assert len(client.comments[LEDGER_ISSUE]) == 1
+
+
+def test_comma_joined_scope_with_spaces_equals_repeated_entries() -> None:
+    parsed = parse_claim_event(
+        comment(
+            1,
+            marker(
+                {
+                    "action": "claim",
+                    "agent": "Codex Sol",
+                    "base": BASE,
+                    "branch": "codex/issue-71-claims",
+                    "claim_id": "claim-a",
+                    "issue": 71,
+                    "role": "builder",
+                    "scope": ["docs/PRODUCT.md, src/widget.py"],
+                }
+            ),
+        )
+    )
+
+    assert isinstance(parsed, ActiveClaim)
+    assert parsed.scope == ("docs/PRODUCT.md", "src/widget.py")
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        ["docs/PRODUCT.md,"],
+        [",src/widget.py"],
+        ["docs/PRODUCT.md,,src/widget.py"],
+        [" docs/PRODUCT.md"],
+        ["docs/PRODUCT.md "],
+    ],
+)
+def test_comma_joined_scope_refuses_empty_or_padded_entries(scope: list[str]) -> None:
+    payload = {
+        "action": "claim",
+        "agent": "Codex Sol",
+        "base": BASE,
+        "branch": "codex/issue-71-claims",
+        "claim_id": "claim-a",
+        "issue": 71,
+        "role": "builder",
+        "scope": scope,
+    }
+
+    with pytest.raises(InvalidClaimMarker, match="canonical bounded paths"):
+        parse_claim_event(comment(1, marker(payload)))
+
+
 @pytest.mark.parametrize(
     ("right", "expected"),
     [
@@ -1403,6 +1510,199 @@ def test_existing_scope_on_another_issue_refuses_before_posting() -> None:
         )
 
     assert len(client.comments[LEDGER_ISSUE]) == 1
+
+
+def test_rescope_adds_a_path_without_changing_claim_id_or_base() -> None:
+    client = FakeComments()
+    acquired = acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
+
+    updated = rescope_claim(
+        client,
+        IssueIdentity(72),
+        "Codex Sol",
+        ("src/new.py",),
+        (),
+        acquired.claim_id,
+    )
+
+    assert updated.claim_id == acquired.claim_id
+    assert updated.base == acquired.base
+    assert updated.branch == acquired.branch
+    assert updated.agent == acquired.agent
+    assert updated.scope == ("src/widget.py", "src/new.py")
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert [claim.scope for claim in standing] == [("src/widget.py", "src/new.py")]
+
+
+def test_rescope_drop_and_add_replace_paths_atomically() -> None:
+    client = FakeComments()
+    acquired = acquire_claim(
+        client, request(issue=72, scope=("src/old.py", "src/keep.py"))
+    )
+
+    updated = rescope_claim(
+        client,
+        IssueIdentity(72),
+        "Codex Sol",
+        ("src/new.py",),
+        ("src/old.py",),
+        acquired.claim_id,
+    )
+
+    assert updated.claim_id == acquired.claim_id
+    assert updated.scope == ("src/keep.py", "src/new.py")
+
+
+def test_rescope_refuses_a_path_held_by_another_issue() -> None:
+    client = FakeComments()
+    acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
+    other = acquire_claim(
+        client, request("claim-b", "Grok 4.6", issue=73, scope=("docs/PRODUCT.md",))
+    )
+
+    with pytest.raises(ClaimUnavailable, match="on issue #73"):
+        rescope_claim(
+            client,
+            IssueIdentity(72),
+            "Codex Sol",
+            ("docs/PRODUCT.md",),
+            (),
+            "claim-a",
+        )
+
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    scopes = {claim.claim_id: claim.scope for claim in standing}
+    assert scopes["claim-a"] == ("src/widget.py",)
+    assert scopes[other.claim_id] == ("docs/PRODUCT.md",)
+
+
+def test_rescope_refuses_dropping_a_path_it_does_not_hold() -> None:
+    client = FakeComments()
+    acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
+
+    with pytest.raises(ClaimUnavailable, match="cannot drop 'docs/PRODUCT.md'"):
+        rescope_claim(
+            client,
+            IssueIdentity(72),
+            "Codex Sol",
+            (),
+            ("docs/PRODUCT.md",),
+            "claim-a",
+        )
+
+
+def test_rescope_refuses_an_empty_or_unchanged_scope() -> None:
+    client = FakeComments()
+    acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
+
+    with pytest.raises(ClaimUnavailable, match="non-empty scope"):
+        rescope_claim(
+            client,
+            IssueIdentity(72),
+            "Codex Sol",
+            (),
+            ("src/widget.py",),
+            "claim-a",
+        )
+    with pytest.raises(ClaimUnavailable, match="does not change"):
+        rescope_claim(
+            client,
+            IssueIdentity(72),
+            "Codex Sol",
+            ("src/widget.py",),
+            (),
+            "claim-a",
+        )
+
+
+def test_rescope_refuses_a_foreign_agent() -> None:
+    client = FakeComments()
+    acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
+
+    with pytest.raises(ClaimUnavailable, match="only the original claimant"):
+        rescope_claim(
+            client,
+            IssueIdentity(72),
+            "Grok 4.6",
+            ("src/new.py",),
+            (),
+            "claim-a",
+        )
+
+
+@pytest.mark.parametrize(
+    ("competitor_id", "created_at"),
+    [
+        pytest.param(
+            "earlier",
+            "2026-08-20T23:59:59Z",
+            id="older-competitor",
+        ),
+        pytest.param(
+            "later",
+            "2026-08-21T00:00:50Z",
+            id="newer-competitor",
+        ),
+    ],
+)
+def test_rescope_race_reverts_to_the_previous_scope(
+    competitor_id: str, created_at: str
+) -> None:
+    client = FakeComments()
+    acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
+    competitor = comment(
+        50,
+        claim_comment(
+            request(competitor_id, "Grok 4.6", issue=73, scope=("src/new.py",))
+        ),
+        created_at=created_at,
+    )
+    client.inject_before_next_ledger_post = competitor
+
+    with pytest.raises(ClaimUnavailable, match="rescope race lost to Grok 4.6"):
+        rescope_claim(
+            client,
+            IssueIdentity(72),
+            "Codex Sol",
+            ("src/new.py",),
+            (),
+            "claim-a",
+        )
+
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    scopes = {claim.claim_id: claim.scope for claim in standing}
+    assert set(scopes) == {"claim-a", competitor_id}
+    assert scopes["claim-a"] == ("src/widget.py",)
+    assert scopes[competitor_id] == ("src/new.py",)
+
+
+def test_who_reports_the_claim_holding_a_path() -> None:
+    first = parse_claim_event(
+        comment(1, claim_comment(request(issue=72, scope=("docs/PRODUCT.md",))))
+    )
+    second = parse_claim_event(
+        comment(2, claim_comment(request("claim-b", issue=73, scope=("src/widget.py",))))
+    )
+    assert first is not None and second is not None
+    claims = (first, second)
+
+    assert claims_holding_path(claims, "docs/PRODUCT.md") == (first,)
+    assert claims_holding_path(claims, "src/widget.py") == (second,)
+    assert claims_holding_path(claims, "README.md") == ()
+
+
+def test_who_reports_a_directory_claim_for_a_descendant_path() -> None:
+    parent = parse_claim_event(
+        comment(1, claim_comment(request(issue=72, scope=("docs",))))
+    )
+    assert parent is not None
+
+    assert claims_holding_path((parent,), "docs/decisions/one.md") == (parent,)
+
+
+def test_who_refuses_a_comma_joined_path() -> None:
+    with pytest.raises(ClaimError, match="single repository-relative path"):
+        claims_holding_path((), "docs/PRODUCT.md,src/widget.py")
 
 
 def test_disjoint_issues_can_be_claimed_and_are_projected() -> None:
@@ -2351,6 +2651,87 @@ def test_github_comment_reader_accepts_paginated_json_lines(
     assert observed[0].body == protocol_row["body"]
 
 
+def _comment_row(identifier: int, body: str = "ordinary prose") -> dict[str, object]:
+    stamp = f"2026-08-21T{identifier:02d}:00:00Z"
+    return {
+        "id": identifier,
+        "created_at": stamp,
+        "updated_at": stamp,
+        "body": body,
+        "author_association": "OWNER",
+        "html_url": (
+            f"https://github.com/example/agent-claim/issues/71#issuecomment-{identifier}"
+        ),
+    }
+
+
+def test_github_comment_reader_accepts_pretty_and_ansi_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _comment_row(10, claim_comment(request()))
+    second = _comment_row(11, "ordinary prose")
+    pretty = json.dumps(first, indent=2) + "\n" + json.dumps(second, indent=2)
+    colored = f"\x1b[32m{pretty}\x1b[0m"
+    client = GitHubIssueComments("example/agent-claim")
+    monkeypatch.setattr(client, "_run", lambda arguments: colored)
+
+    observed = client.list_protocol_candidates(71)
+
+    assert [entry.identifier for entry in observed] == [10]
+    assert observed[0].body == first["body"]
+
+
+def test_github_comment_reader_accepts_concatenated_pretty_json_objects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _comment_row(10, claim_comment(request()))
+    second = _comment_row(11, claim_comment(request("claim-b", issue=72)))
+    raw = json.dumps(first, indent=2) + json.dumps(second, indent=2)
+    client = GitHubIssueComments("example/agent-claim")
+    monkeypatch.setattr(client, "_run", lambda arguments: raw)
+
+    observed = client.list_protocol_candidates(71)
+
+    assert [entry.identifier for entry in observed] == [10, 11]
+
+
+def test_bounded_command_sets_github_quiet_environment() -> None:
+    observed = issue_claim._bounded_command(
+        [
+            sys.executable,
+            "-c",
+            "import os; print(os.environ['NO_COLOR']); "
+            "print(os.environ['GH_NO_UPDATE_NOTIFIER'])",
+        ],
+        purpose="env probe",
+    )
+
+    assert observed.splitlines() == ["1", "1"]
+
+
+def test_repository_resolution_uses_github_quiet_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run(*arguments, **kwargs):
+        command = arguments[0]
+        observed["command"] = command
+        observed["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(
+            command, 0, "\x1b[32mowner/repository\x1b[0m\n", ""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert _repository(None) == "owner/repository"
+    assert observed["command"][0] == "gh"
+    env = observed["env"]
+    assert isinstance(env, dict)
+    assert env["NO_COLOR"] == "1"
+    assert env["GH_NO_UPDATE_NOTIFIER"] == "1"
+
+
 def test_fake_and_github_adapters_expose_only_common_protocol_candidates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2857,6 +3238,37 @@ def test_bounded_command_reaps_child_on_cancellation(
     assert observed["process"].stdout.closed
 
 
+def test_scope_directories_detects_a_git_tree(monkeypatch: pytest.MonkeyPatch) -> None:
+    def git(arguments: list[str]) -> str:
+        if arguments == ["cat-file", "-t", "HEAD:docs"]:
+            return "tree"
+        if arguments == ["cat-file", "-t", "HEAD:README.md"]:
+            return "blob"
+        raise ClaimError("not a git object")
+
+    monkeypatch.setattr(checkout, "_git_output", git)
+
+    assert checkout._scope_directories(("docs", "README.md")) == ("docs",)
+
+
+def test_scope_directories_detects_an_untracked_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "scratch").mkdir()
+    (tmp_path / "file.py").write_text("x\n")
+
+    def git(arguments: list[str]) -> str:
+        if arguments[:2] == ["cat-file", "-t"]:
+            raise ClaimError("not in HEAD")
+        if arguments == ["rev-parse", "--show-toplevel"]:
+            return str(tmp_path)
+        raise ClaimError("unexpected git")
+
+    monkeypatch.setattr(checkout, "_git_output", git)
+
+    assert checkout._scope_directories(("scratch", "file.py")) == ("scratch",)
+
+
 def test_checkout_validation_binds_clean_head_and_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3074,6 +3486,7 @@ def test_claim_request_binds_omitted_base_and_branch_to_checkout(
     monkeypatch.setattr(
         checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
     )
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
     parsed = _parse_claim_command(*flags)
     if "--base" not in flags:
         assert parsed.base is None
@@ -3143,6 +3556,7 @@ def test_cli_claim_omitted_role_posts_default_and_explicit_wins(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     claimed = issue_claim.main(
         [
@@ -3178,6 +3592,7 @@ def test_cli_claim_empty_role_fails_closed_without_posting_builder(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
     argv = [
         "--repo",
         "example/agent-claim",
@@ -3289,6 +3704,7 @@ def test_request_and_cli_claim_fill_agent_from_documented_else_chain(
     monkeypatch.setattr(
         checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
     )
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
     command = _claim_without_agent_args()
     if explicit is not None:
         command.extend(["--agent", explicit])
@@ -3390,6 +3806,7 @@ def test_cli_same_filled_agent_can_claim_and_release_without_flag(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     claimed = issue_claim.main(
         [
@@ -3440,6 +3857,7 @@ def test_cli_two_session_claimants_cannot_release_without_extra_comment(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     assert (
         issue_claim.main(
@@ -3693,6 +4111,7 @@ def test_cli_claim_omitted_base_and_branch_posts_filled_checkout(
     monkeypatch.setattr(
         checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
     )
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     claimed = issue_claim.main(
         [
@@ -3728,6 +4147,7 @@ def test_cli_status_claim_release_and_adapter_error_exit_codes(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     claimed = issue_claim.main(
         [
@@ -3886,6 +4306,7 @@ def test_cli_status_after_claim_prints_ledger_then_claimed(
 ) -> None:
     _patch_status_cli(monkeypatch, FakeComments())
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     assert (
         issue_claim.main(
@@ -3932,6 +4353,7 @@ def test_cli_lane_claim_status_and_release_round_trip_without_issue_number(
     client = FakeComments()
     _patch_status_cli(monkeypatch, client)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
     git_values = {("branch", "--show-current"): "docs/lane-cleanup"}
     monkeypatch.setattr(checkout, "_git_output", lambda arguments: git_values[tuple(arguments)])
 
@@ -4105,6 +4527,7 @@ def test_cli_status_json_after_claim_prints_claimed_object(
 ) -> None:
     _patch_status_cli(monkeypatch, FakeComments())
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     assert (
         issue_claim.main(
@@ -4306,6 +4729,7 @@ def test_cli_claim_without_json_prints_the_claimed_line(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     claimed = issue_claim.main(
         [
@@ -4333,6 +4757,428 @@ def test_cli_claim_without_json_prints_the_claimed_line(
         "CLAIMED issue #72: cli-claim "
         "https://github.com/example/agent-claim/issues/71#issuecomment-1\n"
     )
+
+
+def test_cli_comma_joined_scope_is_stored_as_distinct_paths_and_overlaps(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+
+    claimed = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "ReproAgentA",
+            "--role",
+            "builder",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "docs/PRODUCT.md,src/atelier2/adapters/dbos/run_transitions.py",
+            "--claim-id",
+            "joined",
+        ]
+    )
+
+    assert claimed == 0
+    posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])
+    assert isinstance(posted, ActiveClaim)
+    assert posted.scope == (
+        "docs/PRODUCT.md",
+        "src/atelier2/adapters/dbos/run_transitions.py",
+    )
+
+    refused = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "73",
+            "--agent",
+            "ReproAgentB",
+            "--role",
+            "builder",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-73",
+            "--scope",
+            "docs/PRODUCT.md",
+            "--claim-id",
+            "single",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert refused == 2
+    assert captured.out == (
+        "CLAIMED issue #72: joined "
+        "https://github.com/example/agent-claim/issues/71#issuecomment-1\n"
+    )
+    assert captured.err.startswith("ERROR:")
+    assert "issue #72" in captured.err
+    assert len(client.list_protocol_candidates(LEDGER_ISSUE)) == 1
+
+
+def test_cli_comma_joined_scope_flag_equals_repeated_scope_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeComments()
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+
+    joined = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "docs/PRODUCT.md,src/widget.py",
+            "--claim-id",
+            "joined",
+        ]
+    )
+    repeated_client = FakeComments()
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: repeated_client)
+    repeated = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "73",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-73",
+            "--scope",
+            "docs/PRODUCT.md",
+            "--scope",
+            "src/widget.py",
+            "--claim-id",
+            "repeated",
+        ]
+    )
+
+    assert (joined, repeated) == (0, 0)
+    first = parse_claim_event(client.comments[LEDGER_ISSUE][0])
+    second = parse_claim_event(repeated_client.comments[LEDGER_ISSUE][0])
+    assert isinstance(first, ActiveClaim) and isinstance(second, ActiveClaim)
+    assert first.scope == second.scope == ("docs/PRODUCT.md", "src/widget.py")
+
+
+def test_cli_rescope_adds_a_path_without_matching_head_or_a_clean_tree(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    acquired = acquire_claim(
+        client,
+        request(issue=72, branch="codex/issue-72", scope=("src/widget.py",)),
+    )
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    git_values = _git_checkout(head="b" * 40, dirty=" M file")
+    monkeypatch.setattr(
+        checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
+    )
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+    _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Codex Sol"})
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "rescope",
+            "72",
+            "--add",
+            "src/new.py",
+        ]
+    )
+
+    assert status == 0
+    assert capsys.readouterr().out == f"RESCOPED issue #72: {acquired.claim_id}\n"
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert standing[0].claim_id == acquired.claim_id
+    assert standing[0].base == BASE
+    assert standing[0].scope == ("src/widget.py", "src/new.py")
+
+
+def test_cli_rescope_json_prints_updated_scope_and_same_claim_id(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    acquire_claim(
+        client,
+        request("cli-claim", "Ada", issue=72, branch="codex/issue-72", scope=("src/widget.py",)),
+    )
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    git_values = _git_checkout()
+    monkeypatch.setattr(
+        checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
+    )
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+    _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Ada"})
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "rescope",
+            "72",
+            "--add",
+            "docs/PRODUCT.md,src/new.py",
+            "--drop",
+            "src/widget.py",
+            "--json",
+        ]
+    )
+
+    assert status == 0
+    assert capsys.readouterr().out == json.dumps(
+        {
+            "issue": 72,
+            "lane": None,
+            "claim_id": "cli-claim",
+            "agent": "Ada",
+            "role": "builder",
+            "base": BASE,
+            "branch": "codex/issue-72",
+            "scope": ["docs/PRODUCT.md", "src/new.py"],
+        }
+    ) + "\n"
+
+
+def test_cli_rescope_without_add_or_drop_is_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    acquire_claim(
+        client,
+        request(issue=72, branch="codex/issue-72", scope=("src/widget.py",)),
+    )
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    git_values = _git_checkout()
+    monkeypatch.setattr(
+        checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
+    )
+    _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Codex Sol"})
+
+    status = issue_claim.main(["--repo", "example/agent-claim", "rescope", "72"])
+    captured = capsys.readouterr()
+
+    assert status == 2
+    assert captured.out == ""
+    assert "ERROR:" in captured.err
+    assert "--add" in captured.err or "rescope requires" in captured.err
+
+
+def test_cli_rescope_refuses_primary_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    acquire_claim(
+        client,
+        request(issue=72, branch="codex/issue-72", scope=("src/widget.py",)),
+    )
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    git_values = _git_checkout(git_directory="/repo/.git", common_directory="/repo/.git")
+    monkeypatch.setattr(
+        checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
+    )
+    _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Codex Sol"})
+
+    status = issue_claim.main(
+        ["--repo", "example/agent-claim", "rescope", "72", "--add", "src/new.py"]
+    )
+    captured = capsys.readouterr()
+
+    assert status == 2
+    assert captured.out == ""
+    assert "linked isolated worktree" in captured.err
+
+
+def test_cli_claim_refuses_a_directory_scope_without_allow_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(
+        checkout, "_scope_directories", lambda paths: tuple(p for p in paths if p == "docs")
+    )
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "docs",
+            "--claim-id",
+            "tree",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert status == 2
+    assert captured.out == ""
+    assert "directory scope 'docs'" in captured.err
+    assert "--allow-directory" in captured.err
+    assert LEDGER_ISSUE not in client.comments
+
+
+def test_cli_claim_allows_a_directory_scope_with_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeComments()
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(
+        checkout, "_scope_directories", lambda paths: tuple(p for p in paths if p == "docs")
+    )
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "docs",
+            "--allow-directory",
+            "rewrite the docs tree",
+            "--claim-id",
+            "tree",
+        ]
+    )
+
+    assert status == 0
+    posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])
+    assert isinstance(posted, ActiveClaim)
+    assert posted.scope == ("docs",)
+
+
+def test_cli_who_prints_the_claim_holding_a_path(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = _claims_client(
+        request("mine", "Ada", issue=72, scope=("docs/PRODUCT.md", "src/widget.py"))
+    )
+    _patch_status_cli(monkeypatch, client)
+
+    claimed = issue_claim.main(
+        ["--repo", "example/agent-claim", "who", "docs/PRODUCT.md"]
+    )
+    free = issue_claim.main(["--repo", "example/agent-claim", "who", "README.md"])
+    claimed_out = capsys.readouterr().out
+
+    assert claimed == 0
+    assert free == 0
+    assert "CLAIMED docs/PRODUCT.md issue #72: Ada (builder) claim=mine" in claimed_out
+    assert "UNCLAIMED README.md" in claimed_out
+
+
+def test_cli_who_json_prints_holder_or_unclaimed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = _claims_client(request("mine", "Ada", issue=72, scope=("docs",)))
+    _patch_status_cli(monkeypatch, client)
+
+    descendant = issue_claim.main(
+        ["--repo", "example/agent-claim", "who", "docs/decisions/one.md", "--json"]
+    )
+    claimed = json.loads(capsys.readouterr().out)
+    free = issue_claim.main(
+        ["--repo", "example/agent-claim", "who", "src/widget.py", "--json"]
+    )
+    unclaimed = json.loads(capsys.readouterr().out)
+
+    assert descendant == 0
+    assert claimed["state"] == "CLAIMED"
+    assert claimed["path"] == "docs/decisions/one.md"
+    assert claimed["claims"][0]["claim_id"] == "mine"
+    assert free == 0
+    assert unclaimed == {
+        "ledger": LEDGER_ISSUE,
+        "path": "src/widget.py",
+        "state": "UNCLAIMED",
+        "claims": [],
+    }
+
+
+def test_cli_rescope_refuses_adding_a_directory_without_allow_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    acquire_claim(
+        client,
+        request(issue=72, branch="codex/issue-72", scope=("src/widget.py",)),
+    )
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    git_values = _git_checkout()
+    monkeypatch.setattr(
+        checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
+    )
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: paths)
+    _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Codex Sol"})
+
+    status = issue_claim.main(
+        ["--repo", "example/agent-claim", "rescope", "72", "--add", "docs"]
+    )
+    captured = capsys.readouterr()
+
+    assert status == 2
+    assert captured.out == ""
+    assert "directory scope 'docs'" in captured.err
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert standing[0].scope == ("src/widget.py",)
 
 
 def test_cli_release_without_json_prints_the_released_line(
@@ -4369,6 +5215,7 @@ def test_cli_claim_json_prints_acquired_claim_object(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     claimed = issue_claim.main(
         [
@@ -4554,6 +5401,7 @@ def test_cli_claim_json_conflict_errors_without_success_json(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
     protocol_count = len(client.list_protocol_candidates(LEDGER_ISSUE))
 
     claimed = issue_claim.main(
