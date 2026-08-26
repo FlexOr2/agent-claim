@@ -7,6 +7,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from . import github
 from .protocol import REPOSITORY_PATTERN, ClaimError, ClaimRequest, _outbound_text
 
 GH_TIMEOUT_SECONDS = 60
@@ -26,13 +27,15 @@ def _repository(explicit: str | None) -> str:
                 capture_output=True,
                 text=True,
                 timeout=GH_TIMEOUT_SECONDS,
+                env=github.github_command_environment(),
             )
         except FileNotFoundError as error:
             raise ClaimError("gh is required for issue claims") from error
         except subprocess.TimeoutExpired as error:
             raise ClaimError("gh timed out while resolving the repository") from error
-        if result.returncode == 0 and result.stdout.strip():
-            repository = result.stdout.strip()
+        cleaned = github.strip_ansi(result.stdout).strip()
+        if result.returncode == 0 and cleaned:
+            repository = cleaned
         else:
             remote = _git_output(["config", "--get", "remote.origin.url"])
             match = re.search(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?$", remote)

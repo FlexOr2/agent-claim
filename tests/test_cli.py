@@ -2286,6 +2286,87 @@ def test_github_comment_reader_accepts_paginated_json_lines(
     assert observed[0].body == protocol_row["body"]
 
 
+def _comment_row(identifier: int, body: str = "ordinary prose") -> dict[str, object]:
+    stamp = f"2026-08-21T{identifier:02d}:00:00Z"
+    return {
+        "id": identifier,
+        "created_at": stamp,
+        "updated_at": stamp,
+        "body": body,
+        "author_association": "OWNER",
+        "html_url": (
+            f"https://github.com/example/agent-claim/issues/71#issuecomment-{identifier}"
+        ),
+    }
+
+
+def test_github_comment_reader_accepts_pretty_and_ansi_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _comment_row(10, claim_comment(request()))
+    second = _comment_row(11, "ordinary prose")
+    pretty = json.dumps(first, indent=2) + "\n" + json.dumps(second, indent=2)
+    colored = f"\x1b[32m{pretty}\x1b[0m"
+    client = GitHubIssueComments("example/agent-claim")
+    monkeypatch.setattr(client, "_run", lambda arguments: colored)
+
+    observed = client.list_protocol_candidates(71)
+
+    assert [entry.identifier for entry in observed] == [10]
+    assert observed[0].body == first["body"]
+
+
+def test_github_comment_reader_accepts_concatenated_pretty_json_objects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _comment_row(10, claim_comment(request()))
+    second = _comment_row(11, claim_comment(request("claim-b", issue=72)))
+    raw = json.dumps(first, indent=2) + json.dumps(second, indent=2)
+    client = GitHubIssueComments("example/agent-claim")
+    monkeypatch.setattr(client, "_run", lambda arguments: raw)
+
+    observed = client.list_protocol_candidates(71)
+
+    assert [entry.identifier for entry in observed] == [10, 11]
+
+
+def test_bounded_command_sets_github_quiet_environment() -> None:
+    observed = issue_claim._bounded_command(
+        [
+            sys.executable,
+            "-c",
+            "import os; print(os.environ['NO_COLOR']); "
+            "print(os.environ['GH_NO_UPDATE_NOTIFIER'])",
+        ],
+        purpose="env probe",
+    )
+
+    assert observed.splitlines() == ["1", "1"]
+
+
+def test_repository_resolution_uses_github_quiet_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run(*arguments, **kwargs):
+        command = arguments[0]
+        observed["command"] = command
+        observed["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(
+            command, 0, "\x1b[32mowner/repository\x1b[0m\n", ""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert _repository(None) == "owner/repository"
+    assert observed["command"][0] == "gh"
+    env = observed["env"]
+    assert isinstance(env, dict)
+    assert env["NO_COLOR"] == "1"
+    assert env["GH_NO_UPDATE_NOTIFIER"] == "1"
+
+
 def test_fake_and_github_adapters_expose_only_common_protocol_candidates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -158,7 +158,9 @@ an existing hook file. The CLI does not write `~/.grok`.
 
 ## v0.5 boundary
 
-GitHub via the `gh` CLI is supported today. The tool does not automatically
-allocate work, merge code, or operate a lease server. Omitted `--agent` follows
+GitHub via the `gh` CLI is supported today. Invocations set `NO_COLOR=1`
+and `GH_NO_UPDATE_NOTIFIER=1`, strip ANSI from output, and parse pretty or
+compact JSON, so a wrapping `gh` shim is not required. The tool does not
+automatically allocate work, merge code, or operate a lease server. Omitted `--agent` follows
 the documented else-chain; it does not invent an identity. It intentionally
 leaves policy-file generation and non-GitHub adapters for a later release.
