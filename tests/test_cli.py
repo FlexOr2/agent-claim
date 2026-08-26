@@ -34,6 +34,7 @@ from agent_claim.cli import (  # noqa: E402
     claim_comment,
     claim_label,
     claims_conflict,
+    claims_holding_path,
     is_protocol_candidate,
     parse_claim_event,
     reconcile_all_labels,
@@ -1338,6 +1339,35 @@ def test_rescope_race_reverts_to_the_previous_scope() -> None:
     scopes = {claim.claim_id: claim.scope for claim in standing}
     assert scopes["claim-a"] == ("src/widget.py",)
     assert scopes["earlier"] == ("src/new.py",)
+
+
+def test_who_reports_the_claim_holding_a_path() -> None:
+    first = parse_claim_event(
+        comment(1, claim_comment(request(issue=72, scope=("docs/PRODUCT.md",))))
+    )
+    second = parse_claim_event(
+        comment(2, claim_comment(request("claim-b", issue=73, scope=("src/widget.py",))))
+    )
+    assert first is not None and second is not None
+    claims = (first, second)
+
+    assert claims_holding_path(claims, "docs/PRODUCT.md") == (first,)
+    assert claims_holding_path(claims, "src/widget.py") == (second,)
+    assert claims_holding_path(claims, "README.md") == ()
+
+
+def test_who_reports_a_directory_claim_for_a_descendant_path() -> None:
+    parent = parse_claim_event(
+        comment(1, claim_comment(request(issue=72, scope=("docs",))))
+    )
+    assert parent is not None
+
+    assert claims_holding_path((parent,), "docs/decisions/one.md") == (parent,)
+
+
+def test_who_refuses_a_comma_joined_path() -> None:
+    with pytest.raises(ClaimError, match="single repository-relative path"):
+        claims_holding_path((), "docs/PRODUCT.md,src/widget.py")
 
 
 def test_disjoint_issues_can_be_claimed_and_are_projected() -> None:
@@ -2860,6 +2890,37 @@ def test_bounded_command_reaps_child_on_cancellation(
     assert observed["process"].stdout.closed
 
 
+def test_scope_directories_detects_a_git_tree(monkeypatch: pytest.MonkeyPatch) -> None:
+    def git(arguments: list[str]) -> str:
+        if arguments == ["cat-file", "-t", "HEAD:docs"]:
+            return "tree"
+        if arguments == ["cat-file", "-t", "HEAD:README.md"]:
+            return "blob"
+        raise ClaimError("not a git object")
+
+    monkeypatch.setattr(checkout, "_git_output", git)
+
+    assert checkout._scope_directories(("docs", "README.md")) == ("docs",)
+
+
+def test_scope_directories_detects_an_untracked_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "scratch").mkdir()
+    (tmp_path / "file.py").write_text("x\n")
+
+    def git(arguments: list[str]) -> str:
+        if arguments[:2] == ["cat-file", "-t"]:
+            raise ClaimError("not in HEAD")
+        if arguments == ["rev-parse", "--show-toplevel"]:
+            return str(tmp_path)
+        raise ClaimError("unexpected git")
+
+    monkeypatch.setattr(checkout, "_git_output", git)
+
+    assert checkout._scope_directories(("scratch", "file.py")) == ("scratch",)
+
+
 def test_checkout_validation_binds_clean_head_and_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3077,6 +3138,7 @@ def test_claim_request_binds_omitted_base_and_branch_to_checkout(
     monkeypatch.setattr(
         checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
     )
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
     parsed = _parse_claim_command(*flags)
     if "--base" not in flags:
         assert parsed.base is None
@@ -3146,6 +3208,7 @@ def test_cli_claim_omitted_role_posts_default_and_explicit_wins(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     claimed = issue_claim.main(
         [
@@ -3181,6 +3244,7 @@ def test_cli_claim_empty_role_fails_closed_without_posting_builder(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
     argv = [
         "--repo",
         "example/agent-claim",
@@ -3292,6 +3356,7 @@ def test_request_and_cli_claim_fill_agent_from_documented_else_chain(
     monkeypatch.setattr(
         checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
     )
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
     command = _claim_without_agent_args()
     if explicit is not None:
         command.extend(["--agent", explicit])
@@ -3393,6 +3458,7 @@ def test_cli_same_filled_agent_can_claim_and_release_without_flag(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     claimed = issue_claim.main(
         [
@@ -3443,6 +3509,7 @@ def test_cli_two_session_claimants_cannot_release_without_extra_comment(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     assert (
         issue_claim.main(
@@ -3696,6 +3763,7 @@ def test_cli_claim_omitted_base_and_branch_posts_filled_checkout(
     monkeypatch.setattr(
         checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
     )
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     claimed = issue_claim.main(
         [
@@ -3731,6 +3799,7 @@ def test_cli_status_claim_release_and_adapter_error_exit_codes(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     claimed = issue_claim.main(
         [
@@ -3889,6 +3958,7 @@ def test_cli_status_after_claim_prints_ledger_then_claimed(
 ) -> None:
     _patch_status_cli(monkeypatch, FakeComments())
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     assert (
         issue_claim.main(
@@ -3935,6 +4005,7 @@ def test_cli_lane_claim_status_and_release_round_trip_without_issue_number(
     client = FakeComments()
     _patch_status_cli(monkeypatch, client)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
     git_values = {("branch", "--show-current"): "docs/lane-cleanup"}
     monkeypatch.setattr(checkout, "_git_output", lambda arguments: git_values[tuple(arguments)])
 
@@ -4108,6 +4179,7 @@ def test_cli_status_json_after_claim_prints_claimed_object(
 ) -> None:
     _patch_status_cli(monkeypatch, FakeComments())
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     assert (
         issue_claim.main(
@@ -4309,6 +4381,7 @@ def test_cli_claim_without_json_prints_the_claimed_line(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     claimed = issue_claim.main(
         [
@@ -4346,6 +4419,7 @@ def test_cli_comma_joined_scope_is_stored_as_distinct_paths_and_overlaps(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     claimed = issue_claim.main(
         [
@@ -4415,6 +4489,7 @@ def test_cli_comma_joined_scope_flag_equals_repeated_scope_flags(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     joined = issue_claim.main(
         [
@@ -4479,6 +4554,7 @@ def test_cli_rescope_adds_a_path_without_matching_head_or_a_clean_tree(
     monkeypatch.setattr(
         checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
     )
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
     _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Codex Sol"})
 
     status = issue_claim.main(
@@ -4515,6 +4591,7 @@ def test_cli_rescope_json_prints_updated_scope_and_same_claim_id(
     monkeypatch.setattr(
         checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
     )
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
     _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Ada"})
 
     status = issue_claim.main(
@@ -4599,6 +4676,163 @@ def test_cli_rescope_refuses_primary_checkout(
     assert "linked isolated worktree" in captured.err
 
 
+def test_cli_claim_refuses_a_directory_scope_without_allow_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(
+        checkout, "_scope_directories", lambda paths: tuple(p for p in paths if p == "docs")
+    )
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "docs",
+            "--claim-id",
+            "tree",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert status == 2
+    assert captured.out == ""
+    assert "directory scope 'docs'" in captured.err
+    assert "--allow-directory" in captured.err
+    assert LEDGER_ISSUE not in client.comments
+
+
+def test_cli_claim_allows_a_directory_scope_with_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeComments()
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(
+        checkout, "_scope_directories", lambda paths: tuple(p for p in paths if p == "docs")
+    )
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "docs",
+            "--allow-directory",
+            "rewrite the docs tree",
+            "--claim-id",
+            "tree",
+        ]
+    )
+
+    assert status == 0
+    posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])
+    assert isinstance(posted, ActiveClaim)
+    assert posted.scope == ("docs",)
+
+
+def test_cli_who_prints_the_claim_holding_a_path(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = _claims_client(
+        request("mine", "Ada", issue=72, scope=("docs/PRODUCT.md", "src/widget.py"))
+    )
+    _patch_status_cli(monkeypatch, client)
+
+    claimed = issue_claim.main(
+        ["--repo", "example/agent-claim", "who", "docs/PRODUCT.md"]
+    )
+    free = issue_claim.main(["--repo", "example/agent-claim", "who", "README.md"])
+    claimed_out = capsys.readouterr().out
+
+    assert claimed == 0
+    assert free == 0
+    assert "CLAIMED docs/PRODUCT.md issue #72: Ada (builder) claim=mine" in claimed_out
+    assert "UNCLAIMED README.md" in claimed_out
+
+
+def test_cli_who_json_prints_holder_or_unclaimed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = _claims_client(request("mine", "Ada", issue=72, scope=("docs",)))
+    _patch_status_cli(monkeypatch, client)
+
+    descendant = issue_claim.main(
+        ["--repo", "example/agent-claim", "who", "docs/decisions/one.md", "--json"]
+    )
+    claimed = json.loads(capsys.readouterr().out)
+    free = issue_claim.main(
+        ["--repo", "example/agent-claim", "who", "src/widget.py", "--json"]
+    )
+    unclaimed = json.loads(capsys.readouterr().out)
+
+    assert descendant == 0
+    assert claimed["state"] == "CLAIMED"
+    assert claimed["path"] == "docs/decisions/one.md"
+    assert claimed["claims"][0]["claim_id"] == "mine"
+    assert free == 0
+    assert unclaimed == {
+        "ledger": LEDGER_ISSUE,
+        "path": "src/widget.py",
+        "state": "UNCLAIMED",
+        "claims": [],
+    }
+
+
+def test_cli_rescope_refuses_adding_a_directory_without_allow_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    acquire_claim(
+        client,
+        request(issue=72, branch="codex/issue-72", scope=("src/widget.py",)),
+    )
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    git_values = _git_checkout()
+    monkeypatch.setattr(
+        checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
+    )
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: paths)
+    _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Codex Sol"})
+
+    status = issue_claim.main(
+        ["--repo", "example/agent-claim", "rescope", "72", "--add", "docs"]
+    )
+    captured = capsys.readouterr()
+
+    assert status == 2
+    assert captured.out == ""
+    assert "directory scope 'docs'" in captured.err
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert standing[0].scope == ("src/widget.py",)
+
+
 def test_cli_release_without_json_prints_the_released_line(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -4633,6 +4867,7 @@ def test_cli_claim_json_prints_acquired_claim_object(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
     claimed = issue_claim.main(
         [
@@ -4818,6 +5053,7 @@ def test_cli_claim_json_conflict_errors_without_success_json(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
     protocol_count = len(client.list_protocol_candidates(LEDGER_ISSUE))
 
     claimed = issue_claim.main(

@@ -850,6 +850,15 @@ def claims_conflict(left: ActiveClaim | ClaimRequest, right: ActiveClaim | Claim
     return _scopes_overlap(left.scope, right.scope)
 
 
+def claims_holding_path(
+    claims: tuple[ActiveClaim, ...], path: str
+) -> tuple[ActiveClaim, ...]:
+    target = _valid_scope([path])
+    if len(target) != 1:
+        raise ClaimError("who requires a single repository-relative path")
+    return tuple(claim for claim in claims if _scopes_overlap(claim.scope, target))
+
+
 def conflicting_claims(
     claims: tuple[ActiveClaim, ...], candidate: ActiveClaim | ClaimRequest
 ) -> tuple[ActiveClaim, ...]:

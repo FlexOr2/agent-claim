@@ -47,6 +47,7 @@ bootstrap_ledger = discovery.bootstrap_ledger
 claim_comment = protocol.claim_comment
 claim_label = protocol.claim_label
 claims_conflict = protocol.claims_conflict
+claims_holding_path = protocol.claims_holding_path
 configure_ledger = protocol.configure_ledger
 discover_ledger = discovery.discover_ledger
 is_protocol_candidate = protocol.is_protocol_candidate
@@ -101,6 +102,18 @@ def _claim_subject(claim: protocol.ActiveClaim) -> str:
     )
 
 
+def _reject_directory_scopes(paths: tuple[str, ...], reason: str | None) -> None:
+    directories = checkout._scope_directories(paths)
+    if not directories:
+        return
+    if reason is None:
+        raise protocol.ClaimError(
+            f"directory scope {directories[0]!r} locks a whole tree; "
+            "pass --allow-directory REASON, or claim files instead"
+        )
+    protocol._outbound_text(reason, "allow-directory reason", maximum=512)
+
+
 def _request(arguments: argparse.Namespace) -> protocol.ClaimRequest:
     agent = checkout._resolved_agent(arguments.agent)
     if arguments.base is None:
@@ -143,6 +156,7 @@ def _request(arguments: argparse.Namespace) -> protocol.ClaimRequest:
         claim_id=parsed.claim_id,
     )
     checkout._validate_checkout(request)
+    _reject_directory_scopes(request.scope, getattr(arguments, "allow_directory", None))
     return request
 
 
@@ -176,6 +190,11 @@ def _parser() -> argparse.ArgumentParser:
         help="repository-relative path; comma-joined values equal repeated --scope",
     )
     claim.add_argument("--claim-id")
+    claim.add_argument(
+        "--allow-directory",
+        metavar="REASON",
+        help="permit a directory scope that locks a whole tree",
+    )
     claim.add_argument("--json", action="store_true")
 
     release = commands.add_parser("release", help="release a landed or abandoned claim")
@@ -213,7 +232,16 @@ def _parser() -> argparse.ArgumentParser:
         help="repository-relative path to drop; comma-joined values equal repeated --drop",
     )
     rescope.add_argument("--claim-id")
+    rescope.add_argument(
+        "--allow-directory",
+        metavar="REASON",
+        help="permit adding a directory scope that locks a whole tree",
+    )
     rescope.add_argument("--json", action="store_true")
+
+    who = commands.add_parser("who", help="show which live claim holds a path")
+    who.add_argument("path")
+    who.add_argument("--json", action="store_true")
 
     reconcile = commands.add_parser("reconcile", help="repair claimed-label projections")
     reconcile.add_argument("issue", type=int, nargs="?")
@@ -310,6 +338,52 @@ def _status_json(
                 "state": "CONFLICT" if claim.claim_id in conflict_ids else "CLAIMED",
             }
             for claim in related
+        ],
+    }
+    print(json.dumps(payload))
+    return 2 if state == "CONFLICT" else 0
+
+
+def _who(claims: tuple[protocol.ActiveClaim, ...], path: str) -> int:
+    holders = protocol.claims_holding_path(claims, path)
+    if not holders:
+        print(f"UNCLAIMED {path}")
+        return 0
+    state = "CONFLICT" if len(holders) > 1 else "CLAIMED"
+    for claim in holders:
+        print(
+            f"{state} {path} {_claim_subject(claim)}: {claim.agent} ({claim.role}) "
+            f"claim={claim.claim_id}"
+        )
+    return 2 if state == "CONFLICT" else 0
+
+
+def _who_json(
+    claims: tuple[protocol.ActiveClaim, ...], path: str, ledger: int
+) -> int:
+    holders = protocol.claims_holding_path(claims, path)
+    if not holders:
+        state = "UNCLAIMED"
+    elif len(holders) > 1:
+        state = "CONFLICT"
+    else:
+        state = "CLAIMED"
+    payload = {
+        "ledger": ledger,
+        "path": path,
+        "state": state,
+        "claims": [
+            {
+                **_identity_json(claim.identity),
+                "agent": claim.agent,
+                "role": claim.role,
+                "base": claim.base,
+                "branch": claim.branch,
+                "claim_id": claim.claim_id,
+                "scope": list(claim.scope),
+                "state": "CONFLICT" if len(holders) > 1 else "CLAIMED",
+            }
+            for claim in holders
         ],
     }
     print(json.dumps(payload))
@@ -511,6 +585,12 @@ def main(arguments: list[str] | None = None) -> int:
                 return _status_json(claims, parsed.issue, ledger)
             print(f"LEDGER #{ledger}")
             return _status(claims, parsed.issue)
+        if parsed.command == "who":
+            claims = protocol._ledger_claims(client)
+            if parsed.json:
+                return _who_json(claims, parsed.path, ledger)
+            print(f"LEDGER #{ledger}")
+            return _who(claims, parsed.path)
         if parsed.command == "rescope":
             rescope_branch = checkout._git_output(["branch", "--show-current"])
             if not rescope_branch:
@@ -522,6 +602,7 @@ def main(arguments: list[str] | None = None) -> int:
             identity = _resolved_identity(parsed.issue, rescope_branch)
             add = protocol._valid_scope(parsed.add) if parsed.add else ()
             drop = protocol._valid_scope(parsed.drop) if parsed.drop else ()
+            _reject_directory_scopes(add, parsed.allow_directory)
             rescoped = protocol.rescope_claim(
                 client,
                 identity,

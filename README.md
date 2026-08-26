@@ -52,9 +52,11 @@ OWNER/REPOSITORY`. A claim must begin from a clean linked worktree and binds its
 base commit, branch, issue, and repository-relative scope. `--scope a,b` is
 the same as `--scope a --scope b`; each path is stored and compared
 separately, including when an older ledger comment still has one comma-joined
-string. Claims collide on the same issue or overlapping paths; disjoint
-scopes can proceed concurrently.
-Agents should read `--json` from `status`, `claim`, and `release`.
+string. Directory scopes (`docs`, `frontend/src`) lock the whole tree and are
+refused unless `--allow-directory REASON` is set. Claims collide on the same
+issue or overlapping paths; disjoint scopes can proceed concurrently.
+`who <path>` prints the live claim that holds a path.
+Agents should read `--json` from `status`, `claim`, `release`, `rescope`, and `who`.
 
 `bootstrap` adopts the exact `<!-- agent-claim-ledger:v1 -->` issue marker,
 ensures it is locked and labelled, and safely converges concurrent first starts

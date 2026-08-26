@@ -66,6 +66,32 @@ def _git_output(arguments: list[str]) -> str:
     return result.stdout.strip()
 
 
+def _scope_directories(paths: tuple[str, ...]) -> tuple[str, ...]:
+    """Return the scope entries that name a git tree or on-disk directory.
+
+    A directory scope locks every descendant path. Callers must require an
+    explicit --allow-directory reason before storing one.
+    """
+    directories: list[str] = []
+    toplevel: str | None = None
+    for path in paths:
+        try:
+            kind = _git_output(["cat-file", "-t", f"HEAD:{path}"])
+        except ClaimError:
+            kind = ""
+        if kind == "tree":
+            directories.append(path)
+            continue
+        if toplevel is None:
+            try:
+                toplevel = _git_output(["rev-parse", "--show-toplevel"])
+            except ClaimError:
+                toplevel = ""
+        if toplevel and (Path(toplevel) / path).is_dir():
+            directories.append(path)
+    return tuple(directories)
+
+
 def _validate_worktree_branch(branch: str) -> None:
     """Require an isolated non-main worktree checked out on `branch`.
 
