@@ -6,9 +6,10 @@ import argparse
 import json
 import sys
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import __version__, checkout, discovery, github, protocol
+from . import __version__, board, checkout, discovery, github, protocol
 
 AGENT_CLAIM_AGENT_ENV = checkout.AGENT_CLAIM_AGENT_ENV
 CLAUDE_SESSION_ID_ENV = checkout.CLAUDE_SESSION_ID_ENV
@@ -171,6 +172,9 @@ def _parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status", help="show repository-wide build claims")
     status.add_argument("issue", type=int, nargs="?")
     status.add_argument("--json", action="store_true")
+
+    board_command = commands.add_parser("board", help="project the open work board without writes")
+    board_command.add_argument("--json", action="store_true")
 
     claim = commands.add_parser("claim", help="claim an issue and scope before editing")
     claim.add_argument(
@@ -443,6 +447,21 @@ def _release_json(
     return 0
 
 
+def _board(
+    client: github.GitHubIssueComments, claims: tuple[protocol.ActiveClaim, ...]
+) -> board.Board:
+    now = datetime.now(timezone.utc)
+    toplevel = Path(checkout._git_output(["rev-parse", "--show-toplevel"]))
+    return board.build_board(
+        client.list_open_board_issues(),
+        client.list_open_board_pull_requests(),
+        client.list_recent_merged_board_pull_requests(now - timedelta(days=14)),
+        claims,
+        board.load_config(toplevel / ".agent-claim" / "board.toml"),
+        now=now,
+    )
+
+
 MUTATING_HOOK_TOOLS = frozenset({"Edit", "MultiEdit", "Write", "search_replace", "write"})
 
 
@@ -585,6 +604,10 @@ def main(arguments: list[str] | None = None) -> int:
                 return _status_json(claims, parsed.issue, ledger)
             print(f"LEDGER #{ledger}")
             return _status(claims, parsed.issue)
+        if parsed.command == "board":
+            projected = _board(client, protocol._ledger_claims(client))
+            print(board.board_json(projected) if parsed.json else board.render(projected))
+            return 0
         if parsed.command == "who":
             claims = protocol._ledger_claims(client)
             if parsed.json:

@@ -9,8 +9,9 @@ import selectors
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 
-from . import protocol
+from . import board, protocol
 from .protocol import (
     MAX_PROTOCOL_BYTES,
     MAX_PROTOCOL_EVENTS,
@@ -292,6 +293,130 @@ class GitHubIssueComments:
         ):
             raise ClaimError("GitHub returned a malformed issue-comment entry")
         return IssueComment(identifier, created_at, updated_at, body, association, url)
+
+    def _board_issue(self, value: object) -> board.Issue:
+        if not isinstance(value, dict):
+            raise ClaimError("GitHub returned a malformed board issue")
+        number = value.get("number")
+        title = value.get("title")
+        labels = value.get("labels")
+        body = value.get("body")
+        created_at = value.get("createdAt")
+        updated_at = value.get("updatedAt")
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, int)
+            or number < 1
+            or not isinstance(title, str)
+            or not isinstance(labels, list)
+            or not all(isinstance(label, str) for label in labels)
+            or not isinstance(body, str)
+            or not isinstance(created_at, str)
+            or TIMESTAMP_PATTERN.fullmatch(created_at) is None
+            or not isinstance(updated_at, str)
+            or TIMESTAMP_PATTERN.fullmatch(updated_at) is None
+        ):
+            raise ClaimError("GitHub returned a malformed board issue")
+        return board.Issue(number, title, tuple(labels), body, created_at, updated_at)
+
+    def _board_pull_request(self, value: object) -> board.PullRequest:
+        if not isinstance(value, dict):
+            raise ClaimError("GitHub returned a malformed board pull request")
+        number = value.get("number")
+        title = value.get("title")
+        body = value.get("body")
+        if body is None:
+            body = ""
+        head_ref_name = value.get("headRefName")
+        merged_at = value.get("mergedAt")
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, int)
+            or number < 1
+            or not isinstance(title, str)
+            or not isinstance(body, str)
+            or not isinstance(head_ref_name, str)
+            or (merged_at is not None and not isinstance(merged_at, str))
+            or (isinstance(merged_at, str) and TIMESTAMP_PATTERN.fullmatch(merged_at) is None)
+        ):
+            raise ClaimError("GitHub returned a malformed board pull request")
+        return board.PullRequest(number, title, body, head_ref_name, merged_at)
+
+    def list_open_board_issues(self) -> tuple[board.Issue, ...]:
+        raw = self._run(
+            [
+                "api",
+                "--paginate",
+                f"repos/{self.repository}/issues?state=open&per_page=100",
+                "--jq",
+                (
+                    '.[] | select(has("pull_request") | not) | '
+                    '{number,title,labels:(.labels | map(.name)),body:(.body // ""),'
+                    'createdAt:.created_at,updatedAt:.updated_at}'
+                ),
+            ]
+        )
+        return tuple(self._board_issue(value) for value in self._json_lines(raw, "board issue"))
+
+    def list_open_board_pull_requests(self) -> tuple[board.PullRequest, ...]:
+        raw = self._run(
+            [
+                "pr",
+                "list",
+                "--repo",
+                self.repository,
+                "--state",
+                "open",
+                "--limit",
+                "1000",
+                "--json",
+                "number,title,body,headRefName",
+                "--jq",
+                ".[]",
+            ]
+        )
+        return tuple(
+            self._board_pull_request(value)
+            for value in self._json_lines(raw, "open board pull request")
+        )
+
+    def list_recent_merged_board_pull_requests(
+        self, since: datetime
+    ) -> tuple[board.PullRequest, ...]:
+        raw = self._run(
+            [
+                "pr",
+                "list",
+                "--repo",
+                self.repository,
+                "--state",
+                "merged",
+                "--search",
+                f"merged:>={since.date().isoformat()}",
+                "--limit",
+                "1000",
+                "--json",
+                "number,title,body,headRefName,mergedAt",
+                "--jq",
+                ".[]",
+            ]
+        )
+        cutoff = since.astimezone(timezone.utc)
+        pull_requests = tuple(
+            self._board_pull_request(value)
+            for value in self._json_lines(raw, "merged board pull request")
+        )
+        recent: list[board.PullRequest] = []
+        for pull_request in pull_requests:
+            if pull_request.merged_at is None:
+                continue
+            try:
+                merged_at = datetime.fromisoformat(pull_request.merged_at.replace("Z", "+00:00"))
+            except ValueError as error:
+                raise ClaimError("GitHub returned a malformed merged board pull request") from error
+            if merged_at >= cutoff:
+                recent.append(pull_request)
+        return tuple(recent)
 
     def list_claimed_issues(self) -> tuple[int, ...]:
         raw = self._run(
