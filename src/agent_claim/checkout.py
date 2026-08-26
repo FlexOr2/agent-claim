@@ -63,24 +63,33 @@ def _git_output(arguments: list[str]) -> str:
     return result.stdout.strip()
 
 
-def _validate_checkout(request: ClaimRequest) -> None:
-    if request.branch in {"main", "master"}:
+def _validate_worktree_branch(branch: str) -> None:
+    """Require an isolated non-main worktree checked out on `branch`.
+
+    Rescope uses this without also binding HEAD to the claim base or requiring
+    a clean tree, so a lane can sharpen scope after it has already committed.
+    """
+    if branch in {"main", "master"}:
         raise ClaimError("build claims require an isolated non-main worktree branch")
-    head = _git_output(["rev-parse", "HEAD"])
-    branch = _git_output(["branch", "--show-current"])
+    current = _git_output(["branch", "--show-current"])
     git_directory = Path(_git_output(["rev-parse", "--git-dir"])).resolve()
     common_directory = Path(_git_output(["rev-parse", "--git-common-dir"])).resolve()
-    dirty = _git_output(["status", "--porcelain"])
+    if current != branch:
+        raise ClaimError(
+            f"claim branch {branch!r} does not match checkout branch {current!r}"
+        )
+    if git_directory == common_directory:
+        raise ClaimError("build claims require a linked isolated worktree checkout")
+
+
+def _validate_checkout(request: ClaimRequest) -> None:
+    head = _git_output(["rev-parse", "HEAD"])
     if head != request.base:
         raise ClaimError(
             f"claim base {request.base} does not match checkout HEAD {head}"
         )
-    if branch != request.branch:
-        raise ClaimError(
-            f"claim branch {request.branch!r} does not match checkout branch {branch!r}"
-        )
-    if git_directory == common_directory:
-        raise ClaimError("build claims require a linked isolated worktree checkout")
+    _validate_worktree_branch(request.branch)
+    dirty = _git_output(["status", "--porcelain"])
     if dirty:
         raise ClaimError("claim must be acquired before the first worktree edit")
 

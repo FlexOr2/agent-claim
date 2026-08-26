@@ -55,7 +55,9 @@ reconcile_all_labels = protocol.reconcile_all_labels
 reconcile_issue_label = protocol.reconcile_issue_label
 repair_duplicate_claims = protocol.repair_duplicate_claims
 release_claim = protocol.release_claim
+rescope_claim = protocol.rescope_claim
 release_comment = protocol.release_comment
+rescope_comment = protocol.rescope_comment
 supersede_comment = protocol.supersede_comment
 supersede_ledger = protocol.supersede_ledger
 
@@ -190,6 +192,29 @@ def _parser() -> argparse.ArgumentParser:
     release.add_argument("--coordinator-override", action="store_true")
     release.add_argument("--json", action="store_true")
 
+    rescope = commands.add_parser(
+        "rescope", help="add or drop paths on a live claim without releasing"
+    )
+    rescope.add_argument(
+        "issue",
+        type=int,
+        nargs="?",
+        help="omit for lane mode, derived from a docs/ or fix/ checkout branch",
+    )
+    rescope.add_argument("--agent")
+    rescope.add_argument(
+        "--add",
+        action="append",
+        help="repository-relative path to add; comma-joined values equal repeated --add",
+    )
+    rescope.add_argument(
+        "--drop",
+        action="append",
+        help="repository-relative path to drop; comma-joined values equal repeated --drop",
+    )
+    rescope.add_argument("--claim-id")
+    rescope.add_argument("--json", action="store_true")
+
     reconcile = commands.add_parser("reconcile", help="repair claimed-label projections")
     reconcile.add_argument("issue", type=int, nargs="?")
 
@@ -289,6 +314,23 @@ def _status_json(
     }
     print(json.dumps(payload))
     return 2 if state == "CONFLICT" else 0
+
+
+def _rescope_json(claimed: protocol.ActiveClaim) -> int:
+    print(
+        json.dumps(
+            {
+                **_identity_json(claimed.identity),
+                "claim_id": claimed.claim_id,
+                "agent": claimed.agent,
+                "role": claimed.role,
+                "base": claimed.base,
+                "branch": claimed.branch,
+                "scope": list(claimed.scope),
+            }
+        )
+    )
+    return 0
 
 
 def _claim_json(claimed: protocol.ActiveClaim) -> int:
@@ -432,7 +474,7 @@ def main(arguments: list[str] | None = None) -> int:
     if parsed.command == "protect":
         return _protect(parsed.repo)
     try:
-        if parsed.command in {"claim", "release"}:
+        if parsed.command in {"claim", "release", "rescope"}:
             parsed.agent = checkout._resolved_agent(parsed.agent)
         release_branch: str | None = None
         if parsed.command == "release":
@@ -469,6 +511,30 @@ def main(arguments: list[str] | None = None) -> int:
                 return _status_json(claims, parsed.issue, ledger)
             print(f"LEDGER #{ledger}")
             return _status(claims, parsed.issue)
+        if parsed.command == "rescope":
+            rescope_branch = checkout._git_output(["branch", "--show-current"])
+            if not rescope_branch:
+                raise protocol.ClaimUnavailable(
+                    "rescope requires a non-empty current branch; "
+                    "check out the claim branch, or pass an issue number"
+                )
+            checkout._validate_worktree_branch(rescope_branch)
+            identity = _resolved_identity(parsed.issue, rescope_branch)
+            add = protocol._valid_scope(parsed.add) if parsed.add else ()
+            drop = protocol._valid_scope(parsed.drop) if parsed.drop else ()
+            rescoped = protocol.rescope_claim(
+                client,
+                identity,
+                parsed.agent,
+                add,
+                drop,
+                parsed.claim_id,
+                branch=rescope_branch,
+            )
+            if parsed.json:
+                return _rescope_json(rescoped)
+            print(f"RESCOPED {_claim_subject(rescoped)}: {rescoped.claim_id}")
+            return 0
         if parsed.command == "claim":
             claimed = protocol.acquire_claim(client, _request(parsed))
             if parsed.json:

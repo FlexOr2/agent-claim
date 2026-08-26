@@ -40,8 +40,12 @@ Omitted `--role` on `release` uses that selected claim's role; an explicit
 `release` is `landed`. `--coordinator-override` still requires `--role coordinator` and
 `--reason`. `supersede` still requires `--agent` and `--role`. A `--claim-id` already
 present on the ledger, active or released, is refused before anything is posted;
-release the old claim and pass a fresh `--claim-id` instead. Scope extension of an
-existing claim is not supported by reusing its claim id.
+release the old claim and pass a fresh `--claim-id` instead.
+`rescope <issue> --add <path> [--drop <path>]` changes a live claim's scope
+without releasing it: the claim id and base stay, exclusivity is the same as
+`claim`, and there is no release window. It does not require HEAD to match
+base or a clean tree. A `rescope` ledger event is a new v2 action; older
+helpers fail loud on the whole ledger until they upgrade.
 
 Run commands in the repository being coordinated, or pass `--repo
 OWNER/REPOSITORY`. A claim must begin from a clean linked worktree and binds its

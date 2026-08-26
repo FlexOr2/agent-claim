@@ -41,6 +41,7 @@ from agent_claim.cli import (  # noqa: E402
     release_claim,
     release_comment,
     repair_duplicate_claims,
+    rescope_claim,
     supersede_comment,
     supersede_ledger,
 )
@@ -1191,6 +1192,152 @@ def test_existing_scope_on_another_issue_refuses_before_posting() -> None:
         )
 
     assert len(client.comments[LEDGER_ISSUE]) == 1
+
+
+def test_rescope_adds_a_path_without_changing_claim_id_or_base() -> None:
+    client = FakeComments()
+    acquired = acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
+
+    updated = rescope_claim(
+        client,
+        IssueIdentity(72),
+        "Codex Sol",
+        ("src/new.py",),
+        (),
+        acquired.claim_id,
+    )
+
+    assert updated.claim_id == acquired.claim_id
+    assert updated.base == acquired.base
+    assert updated.branch == acquired.branch
+    assert updated.agent == acquired.agent
+    assert updated.scope == ("src/widget.py", "src/new.py")
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert [claim.scope for claim in standing] == [("src/widget.py", "src/new.py")]
+
+
+def test_rescope_drop_and_add_replace_paths_atomically() -> None:
+    client = FakeComments()
+    acquired = acquire_claim(
+        client, request(issue=72, scope=("src/old.py", "src/keep.py"))
+    )
+
+    updated = rescope_claim(
+        client,
+        IssueIdentity(72),
+        "Codex Sol",
+        ("src/new.py",),
+        ("src/old.py",),
+        acquired.claim_id,
+    )
+
+    assert updated.claim_id == acquired.claim_id
+    assert updated.scope == ("src/keep.py", "src/new.py")
+
+
+def test_rescope_refuses_a_path_held_by_another_issue() -> None:
+    client = FakeComments()
+    acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
+    other = acquire_claim(
+        client, request("claim-b", "Grok 4.6", issue=73, scope=("docs/PRODUCT.md",))
+    )
+
+    with pytest.raises(ClaimUnavailable, match="on issue #73"):
+        rescope_claim(
+            client,
+            IssueIdentity(72),
+            "Codex Sol",
+            ("docs/PRODUCT.md",),
+            (),
+            "claim-a",
+        )
+
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    scopes = {claim.claim_id: claim.scope for claim in standing}
+    assert scopes["claim-a"] == ("src/widget.py",)
+    assert scopes[other.claim_id] == ("docs/PRODUCT.md",)
+
+
+def test_rescope_refuses_dropping_a_path_it_does_not_hold() -> None:
+    client = FakeComments()
+    acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
+
+    with pytest.raises(ClaimUnavailable, match="cannot drop 'docs/PRODUCT.md'"):
+        rescope_claim(
+            client,
+            IssueIdentity(72),
+            "Codex Sol",
+            (),
+            ("docs/PRODUCT.md",),
+            "claim-a",
+        )
+
+
+def test_rescope_refuses_an_empty_or_unchanged_scope() -> None:
+    client = FakeComments()
+    acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
+
+    with pytest.raises(ClaimUnavailable, match="non-empty scope"):
+        rescope_claim(
+            client,
+            IssueIdentity(72),
+            "Codex Sol",
+            (),
+            ("src/widget.py",),
+            "claim-a",
+        )
+    with pytest.raises(ClaimUnavailable, match="does not change"):
+        rescope_claim(
+            client,
+            IssueIdentity(72),
+            "Codex Sol",
+            ("src/widget.py",),
+            (),
+            "claim-a",
+        )
+
+
+def test_rescope_refuses_a_foreign_agent() -> None:
+    client = FakeComments()
+    acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
+
+    with pytest.raises(ClaimUnavailable, match="only the original claimant"):
+        rescope_claim(
+            client,
+            IssueIdentity(72),
+            "Grok 4.6",
+            ("src/new.py",),
+            (),
+            "claim-a",
+        )
+
+
+def test_rescope_race_reverts_to_the_previous_scope() -> None:
+    client = FakeComments()
+    acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
+    competitor = comment(
+        50,
+        claim_comment(
+            request("earlier", "Grok 4.6", issue=73, scope=("src/new.py",))
+        ),
+        created_at="2026-08-20T23:59:59Z",
+    )
+    client.inject_before_next_ledger_post = competitor
+
+    with pytest.raises(ClaimUnavailable, match="rescope race lost to Grok 4.6"):
+        rescope_claim(
+            client,
+            IssueIdentity(72),
+            "Codex Sol",
+            ("src/new.py",),
+            (),
+            "claim-a",
+        )
+
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    scopes = {claim.claim_id: claim.scope for claim in standing}
+    assert scopes["claim-a"] == ("src/widget.py",)
+    assert scopes["earlier"] == ("src/new.py",)
 
 
 def test_disjoint_issues_can_be_claimed_and_are_projected() -> None:
@@ -4234,6 +4381,141 @@ def test_cli_comma_joined_scope_flag_equals_repeated_scope_flags(
     second = parse_claim_event(repeated_client.comments[LEDGER_ISSUE][0])
     assert isinstance(first, ActiveClaim) and isinstance(second, ActiveClaim)
     assert first.scope == second.scope == ("docs/PRODUCT.md", "src/widget.py")
+
+
+def test_cli_rescope_adds_a_path_without_matching_head_or_a_clean_tree(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    acquired = acquire_claim(
+        client,
+        request(issue=72, branch="codex/issue-72", scope=("src/widget.py",)),
+    )
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    git_values = _git_checkout(head="b" * 40, dirty=" M file")
+    monkeypatch.setattr(
+        checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
+    )
+    _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Codex Sol"})
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "rescope",
+            "72",
+            "--add",
+            "src/new.py",
+        ]
+    )
+
+    assert status == 0
+    assert capsys.readouterr().out == f"RESCOPED issue #72: {acquired.claim_id}\n"
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert standing[0].claim_id == acquired.claim_id
+    assert standing[0].base == BASE
+    assert standing[0].scope == ("src/widget.py", "src/new.py")
+
+
+def test_cli_rescope_json_prints_updated_scope_and_same_claim_id(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    acquire_claim(
+        client,
+        request("cli-claim", "Ada", issue=72, branch="codex/issue-72", scope=("src/widget.py",)),
+    )
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    git_values = _git_checkout()
+    monkeypatch.setattr(
+        checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
+    )
+    _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Ada"})
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "rescope",
+            "72",
+            "--add",
+            "docs/PRODUCT.md,src/new.py",
+            "--drop",
+            "src/widget.py",
+            "--json",
+        ]
+    )
+
+    assert status == 0
+    assert capsys.readouterr().out == json.dumps(
+        {
+            "issue": 72,
+            "lane": None,
+            "claim_id": "cli-claim",
+            "agent": "Ada",
+            "role": "builder",
+            "base": BASE,
+            "branch": "codex/issue-72",
+            "scope": ["docs/PRODUCT.md", "src/new.py"],
+        }
+    ) + "\n"
+
+
+def test_cli_rescope_without_add_or_drop_is_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    acquire_claim(
+        client,
+        request(issue=72, branch="codex/issue-72", scope=("src/widget.py",)),
+    )
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    git_values = _git_checkout()
+    monkeypatch.setattr(
+        checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
+    )
+    _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Codex Sol"})
+
+    status = issue_claim.main(["--repo", "example/agent-claim", "rescope", "72"])
+    captured = capsys.readouterr()
+
+    assert status == 2
+    assert captured.out == ""
+    assert "ERROR:" in captured.err
+    assert "--add" in captured.err or "rescope requires" in captured.err
+
+
+def test_cli_rescope_refuses_primary_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    acquire_claim(
+        client,
+        request(issue=72, branch="codex/issue-72", scope=("src/widget.py",)),
+    )
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    git_values = _git_checkout(git_directory="/repo/.git", common_directory="/repo/.git")
+    monkeypatch.setattr(
+        checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
+    )
+    _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Codex Sol"})
+
+    status = issue_claim.main(
+        ["--repo", "example/agent-claim", "rescope", "72", "--add", "src/new.py"]
+    )
+    captured = capsys.readouterr()
+
+    assert status == 2
+    assert captured.out == ""
+    assert "linked isolated worktree" in captured.err
 
 
 def test_cli_release_without_json_prints_the_released_line(
