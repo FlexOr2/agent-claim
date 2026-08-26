@@ -427,6 +427,14 @@ def test_board_projects_fixture_json_without_github_writes(
             "createdAt": "2026-08-02T00:00:00Z",
             "updatedAt": "2026-08-19T00:00:00Z",
         },
+        {
+            "number": 14,
+            "title": "Older cleanup",
+            "labels": ["cleanup"],
+            "body": "Unstructured notes.",
+            "createdAt": "2026-08-02T00:00:00Z",
+            "updatedAt": "2026-08-20T00:00:00Z",
+        },
     ]
     open_prs_json = [
         {"number": 90, "title": "Fixes #10", "body": "", "headRefName": "other", "mergedAt": None},
@@ -440,7 +448,7 @@ def test_board_projects_fixture_json_without_github_writes(
         {
             "number": 93,
             "title": "Planning note",
-            "body": "Blocked by #12",
+            "body": None,
             "headRefName": "notes",
             "mergedAt": None,
         },
@@ -452,6 +460,13 @@ def test_board_projects_fixture_json_without_github_writes(
             "body": "",
             "headRefName": "codex/issue-13-cleanup",
             "mergedAt": "2026-08-20T12:00:00Z",
+        },
+        {
+            "number": 94,
+            "title": "Fixes #14",
+            "body": "",
+            "headRefName": "codex/issue-14-cleanup",
+            "mergedAt": "2026-08-06T23:59:59Z",
         }
     ]
     active = request("board-claim", issue=11, branch="codex/issue-11-claims")
@@ -498,20 +513,125 @@ def test_board_projects_fixture_json_without_github_writes(
     rendered = capsys.readouterr().out
     assert "CONTRACT" in rendered and "NEXT" in rendered
     assert "#10" in rendered
-    assert "#13" in rendered.split("READY NOW\n", 1)[1].split("\n", 1)[0]
-    assert "#12" in rendered.split("STALE\n", 1)[1]
     assert all("--method" not in arguments for arguments in observed)
+    merged_request = next(arguments for arguments in observed if "merged" in arguments)
+    assert "merged:>=2026-08-07" in merged_request
 
     assert issue_claim.main(["--repo", "example/agent-claim", "board", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     first = payload["items"][0]
     ten = next(item for item in payload["items"] if item["number"] == 10)
+    eleven = next(item for item in payload["items"] if item["number"] == 11)
+    thirteen = next(item for item in payload["items"] if item["number"] == 13)
+    fourteen = next(item for item in payload["items"] if item["number"] == 14)
     assert first["number"] == 10
     assert ten["stage"] == "in-flight"
     assert ten["unblocks_count"] == 1
     assert ten["contract"]["next"] == "Land #10."
     assert ten["contract_complete"] is True
+    assert eleven["active_claim"] == "Codex Sol (builder)"
+    assert thirteen["stage"] == "code-landed"
+    assert fourteen["stage"] == "text-only"
+    assert [item["number"] for item in payload["ready_now"]] == [10, 13]
+    assert [item["number"] for item in payload["stale"]] == [12]
     assert next(item for item in payload["items"] if item["number"] == 12)["stage"] == "text-only"
+    assert 11 not in [item["number"] for item in payload["ready_now"]]
+
+
+def test_board_parses_the_last_atelier_contract_projection() -> None:
+    contract = board.parse_contract(
+        "## Earlier section\n"
+        "**Now:** An earlier section-local status.\n"
+        "Next: An earlier section-local next step.\n"
+        "**Blocked by:** #99\n"
+        "Done when: The earlier section is complete.\n\n"
+        "## Current projection\n"
+        "**Now:** Fix the board parser.\n"
+        "Next: Add a regression test.\n"
+        "**Blocked by:** #47\n"
+        "Done when: The review findings are resolved.\n"
+    )
+
+    assert contract == board.Contract(
+        now="Fix the board parser.",
+        next="Add a regression test.",
+        blocked_by="#47",
+        done_when="The review findings are resolved.",
+    )
+
+
+def test_board_reads_priority_configuration_from_the_checkout_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    toplevel = tmp_path / "checkout"
+    configuration_directory = toplevel / ".agent-claim"
+    configuration_directory.mkdir(parents=True)
+    (configuration_directory / "board.toml").write_text(
+        'priority_labels = ["ux", "security"]\n'
+    )
+    nested_directory = toplevel / "src" / "agent_claim"
+    nested_directory.mkdir(parents=True)
+    monkeypatch.chdir(nested_directory)
+    observed: list[list[str]] = []
+
+    def git_output(arguments: list[str]) -> str:
+        observed.append(arguments)
+        return str(toplevel)
+
+    class BoardClient:
+        def list_open_board_issues(self) -> tuple[board.Issue, ...]:
+            return (
+                board.Issue(
+                    20,
+                    "Security issue",
+                    ("security",),
+                    "",
+                    "2026-08-20T00:00:00Z",
+                    "2026-08-20T00:00:00Z",
+                ),
+                board.Issue(
+                    21,
+                    "UX issue",
+                    ("ux",),
+                    "",
+                    "2026-08-20T00:00:00Z",
+                    "2026-08-20T00:00:00Z",
+                ),
+            )
+
+        def list_open_board_pull_requests(self) -> tuple[board.PullRequest, ...]:
+            return ()
+
+        def list_recent_merged_board_pull_requests(
+            self, since: datetime
+        ) -> tuple[board.PullRequest, ...]:
+            return ()
+
+    monkeypatch.setattr(checkout, "_git_output", git_output)
+
+    projected = issue_claim._board(BoardClient(), ())
+
+    assert [item.number for item in projected.items] == [21, 20]
+    assert observed == [["rev-parse", "--show-toplevel"]]
+
+
+@pytest.mark.parametrize(
+    ("updated_at", "expected_stale"),
+    [
+        ("2026-08-14T00:00:00Z", False),
+        ("2026-08-13T00:00:00Z", True),
+    ],
+)
+def test_board_marks_text_only_items_stale_only_after_seven_idle_days(
+    updated_at: str, expected_stale: bool
+) -> None:
+    issue = board.Issue(22, "Idle issue", (), "", "2026-08-01T00:00:00Z", updated_at)
+
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert [item.number for item in projected.stale] == ([22] if expected_stale else [])
 
 
 def test_board_ranks_a_real_blocker_ahead_of_a_blocked_product_item() -> None:
@@ -2529,6 +2649,19 @@ def test_bounded_command_stops_before_unbounded_output(
             [sys.executable, "-c", "print('x' * 1000)"],
             purpose="test command",
         )
+
+
+def test_bounded_command_disables_github_update_notifications() -> None:
+    observed = issue_claim._bounded_command(
+        [
+            sys.executable,
+            "-c",
+            "import os; print(os.environ['GH_NO_UPDATE_NOTIFIER'])",
+        ],
+        purpose="update notifier probe",
+    )
+
+    assert observed == "1"
 
 
 def test_bounded_command_streams_stdin_without_putting_it_in_argv() -> None:

@@ -15,7 +15,11 @@ from . import protocol
 DEFAULT_PRIORITY_LABELS = ("security", "data", "ci", "product", "ux", "cleanup")
 CONFIG_PATH = Path(".agent-claim/board.toml")
 CONTRACT_HEADING_PATTERN = re.compile(
-    r"(?m)^#{1,6} (Now|Next|Blocked by|Done when)[ \t]*$"
+    r"(?m)^#{1,6}[ \t]+(?P<name>Now|Next|Blocked by|Done when)[ \t]*$"
+)
+CONTRACT_FIELD_PATTERN = re.compile(
+    r"(?m)^(?:\*\*(?P<bold_name>Now|Next|Blocked by|Done when):\*\*|"
+    r"(?P<plain_name>Now|Next|Blocked by|Done when):)[ \t]*(?P<value>[^\r\n]*)$"
 )
 MARKDOWN_HEADING_PATTERN = re.compile(r"(?m)^#{1,6} .*$")
 REFERENCE_PATTERN = re.compile(r"(?<![A-Za-z0-9_])#([1-9][0-9]*)")
@@ -118,19 +122,28 @@ def load_config(path: Path = CONFIG_PATH) -> BoardConfig:
 
 def parse_contract(body: str) -> Contract:
     sections: dict[str, str] = {}
-    headings = tuple(CONTRACT_HEADING_PATTERN.finditer(body))
-    for index, heading in enumerate(headings):
-        following = headings[index + 1].start() if index + 1 < len(headings) else len(body)
-        next_heading = MARKDOWN_HEADING_PATTERN.search(body, heading.end(), following)
-        end = next_heading.start() if next_heading is not None else following
-        value = body[heading.end() : end].strip()
-        if heading.group(1) not in sections and value:
-            sections[heading.group(1)] = value
+    matches = sorted(
+        (
+            *CONTRACT_HEADING_PATTERN.finditer(body),
+            *CONTRACT_FIELD_PATTERN.finditer(body),
+        ),
+        key=re.Match.start,
+    )
+    for match in matches:
+        if match.re is CONTRACT_HEADING_PATTERN:
+            name = match.group("name")
+            next_heading = MARKDOWN_HEADING_PATTERN.search(body, match.end())
+            end = next_heading.start() if next_heading is not None else len(body)
+            value = body[match.end() : end].strip()
+        else:
+            name = match.group("bold_name") or match.group("plain_name")
+            value = match.group("value").strip()
+        sections[name] = value
     return Contract(
-        now=sections.get("Now"),
-        next=sections.get("Next"),
-        blocked_by=sections.get("Blocked by"),
-        done_when=sections.get("Done when"),
+        now=sections.get("Now") or None,
+        next=sections.get("Next") or None,
+        blocked_by=sections.get("Blocked by") or None,
+        done_when=sections.get("Done when") or None,
     )
 
 

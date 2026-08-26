@@ -330,12 +330,13 @@ def _board(
     client: github.GitHubIssueComments, claims: tuple[protocol.ActiveClaim, ...]
 ) -> board.Board:
     now = datetime.now(timezone.utc)
+    toplevel = Path(checkout._git_output(["rev-parse", "--show-toplevel"]))
     return board.build_board(
         client.list_open_board_issues(),
         client.list_open_board_pull_requests(),
         client.list_recent_merged_board_pull_requests(now - timedelta(days=14)),
         claims,
-        board.load_config(),
+        board.load_config(toplevel / ".agent-claim" / "board.toml"),
         now=now,
     )
 

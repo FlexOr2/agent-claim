@@ -66,7 +66,12 @@ def _bounded_command(
             stdin=subprocess.PIPE if input_data is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            env={**os.environ, "NO_COLOR": "1", "CLICOLOR": "0"},
+            env={
+                **os.environ,
+                "NO_COLOR": "1",
+                "CLICOLOR": "0",
+                "GH_NO_UPDATE_NOTIFIER": "1",
+            },
         )
     except OSError as error:
         if isinstance(error, FileNotFoundError):
@@ -307,6 +312,8 @@ class GitHubIssueComments:
         number = value.get("number")
         title = value.get("title")
         body = value.get("body")
+        if body is None:
+            body = ""
         head_ref_name = value.get("headRefName")
         merged_at = value.get("mergedAt")
         if (
