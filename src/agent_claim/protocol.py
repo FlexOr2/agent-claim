@@ -328,22 +328,38 @@ def _valid_branch(payload: dict[str, object]) -> str:
     return branch
 
 
-def _valid_scope(scope: object) -> tuple[str, ...]:
+def _scope_list_entries(scope: object) -> list[str]:
+    """Expand a stored or CLI scope list into individual path strings.
+
+    Each list entry may itself be comma-joined: `--scope a,b` equals
+    `--scope a --scope b`. Existing ledger markers that stored one opaque
+    comma-joined string are read the same way, so overlap detection covers
+    them without rewriting the append-only comment.
+    """
     if not isinstance(scope, list) or not scope:
         raise InvalidClaimMarker("claim marker scope must be a non-empty list")
-    if len(scope) > MAX_SCOPE_ENTRIES:
-        raise InvalidClaimMarker(
-            f"claim marker scope exceeds {MAX_SCOPE_ENTRIES} entries"
-        )
-    result: list[str] = []
+    expanded: list[str] = []
     for raw_path in scope:
         if not isinstance(raw_path, str):
             raise InvalidClaimMarker("claim scope entries must be text")
-        path = raw_path.strip()
+        if raw_path.strip() != raw_path or not raw_path:
+            raise InvalidClaimMarker("claim scope entries must be canonical bounded paths")
+        pieces = [piece.strip() for piece in raw_path.split(",")]
+        if any(not piece for piece in pieces):
+            raise InvalidClaimMarker("claim scope entries must be canonical bounded paths")
+        expanded.extend(pieces)
+    if len(expanded) > MAX_SCOPE_ENTRIES:
+        raise InvalidClaimMarker(
+            f"claim marker scope exceeds {MAX_SCOPE_ENTRIES} entries"
+        )
+    return expanded
+
+
+def _valid_scope(scope: object) -> tuple[str, ...]:
+    result: list[str] = []
+    for path in _scope_list_entries(scope):
         if (
-            not path
-            or path != raw_path
-            or len(path) > MAX_SCOPE_PATH_LENGTH
+            len(path) > MAX_SCOPE_PATH_LENGTH
             or "\\" in path
             or any(ord(character) < 32 or ord(character) == 127 for character in path)
         ):

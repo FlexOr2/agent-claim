@@ -167,7 +167,12 @@ def _parser() -> argparse.ArgumentParser:
     claim.add_argument("--role", default=DEFAULT_CLAIM_ROLE)
     claim.add_argument("--base")
     claim.add_argument("--branch")
-    claim.add_argument("--scope", action="append", required=True)
+    claim.add_argument(
+        "--scope",
+        action="append",
+        required=True,
+        help="repository-relative path; comma-joined values equal repeated --scope",
+    )
     claim.add_argument("--claim-id")
     claim.add_argument("--json", action="store_true")
 

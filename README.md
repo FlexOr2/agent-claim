@@ -45,8 +45,11 @@ existing claim is not supported by reusing its claim id.
 
 Run commands in the repository being coordinated, or pass `--repo
 OWNER/REPOSITORY`. A claim must begin from a clean linked worktree and binds its
-base commit, branch, issue, and repository-relative scope. Claims collide on the
-same issue or overlapping paths; disjoint scopes can proceed concurrently.
+base commit, branch, issue, and repository-relative scope. `--scope a,b` is
+the same as `--scope a --scope b`; each path is stored and compared
+separately, including when an older ledger comment still has one comma-joined
+string. Claims collide on the same issue or overlapping paths; disjoint
+scopes can proceed concurrently.
 Agents should read `--json` from `status`, `claim`, and `release`.
 
 `bootstrap` adopts the exact `<!-- agent-claim-ledger:v1 -->` issue marker,
