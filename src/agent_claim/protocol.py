@@ -201,6 +201,7 @@ class ClaimRequest:
     branch: str
     scope: tuple[str, ...]
     claim_id: str
+    out_of_order_reason: str | None = None
 
 
 class IssueComments(Protocol):
@@ -973,6 +974,10 @@ def claim_comment(request: ClaimRequest) -> str:
         "scope": list(request.scope),
     }
     scope = "\n".join(f"- `{path}`" for path in request.scope)
+    out_of_order = ""
+    if request.out_of_order_reason is not None:
+        reason = _outbound_text(request.out_of_order_reason, "out-of-order reason", maximum=512)
+        out_of_order = f"- Out-of-order reason: {reason}\n"
     return _validated_comment(
         f"{_marker(payload)}\n"
         "## CLAIM — exclusive build lane\n\n"
@@ -981,6 +986,7 @@ def claim_comment(request: ClaimRequest) -> str:
         f"- Base: `{request.base}`\n"
         f"- Branch: `{request.branch}`\n"
         f"- Claim ID: `{request.claim_id}`\n"
+        f"{out_of_order}"
         "- Write scope:\n"
         f"{scope}\n\n"
         "Repository-wide ledger event. No edit starts before this claim is re-read live. "
@@ -1681,4 +1687,3 @@ def supersede_ledger(
             return selected
         raise
     raise ClaimError("ledger supersede event was not observed after publication")
-

@@ -62,7 +62,12 @@ class Contract:
 
     @property
     def complete(self) -> bool:
-        return all((self.now, self.next, self.blocked_by, self.done_when))
+        return (
+            self.now is not None
+            and self.next is not None
+            and self.blocked_by is not None
+            and self.done_when is not None
+        )
 
 
 class Stage(StrEnum):
@@ -88,6 +93,8 @@ class BoardItem:
     unblocks_count: int
     single_concrete_next: bool
     score: int
+    actionable: bool
+    actionable_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -142,7 +149,7 @@ def parse_contract(body: str) -> Contract:
     return Contract(
         now=sections.get("Now") or None,
         next=sections.get("Next") or None,
-        blocked_by=sections.get("Blocked by") or None,
+        blocked_by=sections.get("Blocked by"),
         done_when=sections.get("Done when") or None,
     )
 
@@ -261,6 +268,11 @@ def build_board(
         score += 20 * unblocks[issue.number]
         score += {Stage.IN_FLIGHT: 30, Stage.CODE_LANDED: 20, Stage.TEXT_ONLY: -20}[stage]
         score += 10 if single_next else 0
+        actionable_reason = _actionable_reason(
+            active_claim=f"{claim.agent} ({claim.role})" if claim else None,
+            open_blockers=blockers[issue.number],
+            contract_complete=contract.complete,
+        )
         items.append(
             BoardItem(
                 number=issue.number,
@@ -278,6 +290,8 @@ def build_board(
                 unblocks_count=unblocks[issue.number],
                 single_concrete_next=single_next,
                 score=score,
+                actionable=actionable_reason is None,
+                actionable_reason=actionable_reason,
             )
         )
     ordered = tuple(
@@ -288,7 +302,7 @@ def build_board(
         ready_now=tuple(
             item
             for item in ordered
-            if not item.open_blockers and item.active_claim is None and item.contract_complete
+            if item.actionable
         ),
         stale=tuple(
             item
@@ -296,6 +310,10 @@ def build_board(
             if item.idle_days > 7 and item.stage is Stage.TEXT_ONLY
         ),
     )
+
+
+def highest_scored_actionable(board: Board) -> BoardItem | None:
+    return max(board.ready_now, key=lambda item: item.score, default=None)
 
 
 def board_json(board: Board) -> str:
@@ -314,6 +332,7 @@ def render(board: Board) -> str:
             "AGE",
             "IDLE",
             "CLAIM",
+            "ACTIONABLE",
             "BLOCKERS",
             "UNBLOCKS",
             "TITLE",
@@ -329,6 +348,7 @@ def render(board: Board) -> str:
                 str(item.age_days),
                 str(item.idle_days),
                 item.active_claim or "-",
+                "yes" if item.actionable else f"no: {item.actionable_reason}",
                 ",".join(f"#{number}" for number in item.open_blockers) or "-",
                 str(item.unblocks_count),
                 item.title,
@@ -358,6 +378,18 @@ def _contract_summary(contract: Contract) -> str:
         if value is not None
     )
     return ", ".join(present) or "-"
+
+
+def _actionable_reason(
+    *, active_claim: str | None, open_blockers: tuple[int, ...], contract_complete: bool
+) -> str | None:
+    if active_claim is not None:
+        return "claimed"
+    if open_blockers:
+        return f"blocked by #{open_blockers[0]}"
+    if not contract_complete:
+        return "body incomplete"
+    return None
 
 
 def _brief(value: str | None, *, maximum: int = 48) -> str:
