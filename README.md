@@ -97,6 +97,12 @@ The current checkout may set `priority_labels` as an ordered non-empty list in
 buckets, followed by items that unblock other work, then the remaining labels;
 stage and Next bonuses sort only within a bucket.
 
+Use `agent-claim next` (or `agent-claim next --json`) to name the highest-scored
+actionable item: it is open, free, unblocked, and has a complete
+Now/Next/Blocked by/Done when contract; it exits 3 when none qualifies. `claim`
+still allows work out of order, but warns when a higher-scored actionable item is
+free; pass `--out-of-order REASON` to preserve why in the claim comment.
+
 ## Issueless lane claims
 
 `docs/`- and `fix/`-prefixed branches land within one session without a GitHub

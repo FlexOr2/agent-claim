@@ -253,6 +253,9 @@ class FakeComments:
     inject_during_next_remove: IssueComment | None = None
     fail_add_label: bool = False
     fail_remove_label: bool = False
+    board_issues: tuple[board.Issue, ...] = ()
+    board_open_pull_requests: tuple[board.PullRequest, ...] = ()
+    board_merged_pull_requests: tuple[board.PullRequest, ...] = ()
 
     def list_protocol_candidates(self, issue: int) -> tuple[IssueComment, ...]:
         return tuple(
@@ -312,6 +315,17 @@ class FakeComments:
 
     def list_claimed_issues(self) -> tuple[int, ...]:
         return tuple(sorted(self.labels))
+
+    def list_open_board_issues(self) -> tuple[board.Issue, ...]:
+        return self.board_issues
+
+    def list_open_board_pull_requests(self) -> tuple[board.PullRequest, ...]:
+        return self.board_open_pull_requests
+
+    def list_recent_merged_board_pull_requests(
+        self, since: datetime
+    ) -> tuple[board.PullRequest, ...]:
+        return self.board_merged_pull_requests
 
     def validate_successor(self, issue: int) -> None:
         if issue not in self.valid_successors:
@@ -511,8 +525,9 @@ def test_board_projects_fixture_json_without_github_writes(
 
     assert issue_claim.main(["--repo", "example/agent-claim", "board"]) == 0
     rendered = capsys.readouterr().out
-    assert "CONTRACT" in rendered and "NEXT" in rendered
+    assert "CONTRACT" in rendered and "NEXT" in rendered and "ACTIONABLE" in rendered
     assert "#10" in rendered
+    assert "no: claimed" in rendered
     assert all("--method" not in arguments for arguments in observed)
     assert all("--jq" in arguments for arguments in observed)
     merged_request = next(arguments for arguments in observed if "merged" in arguments)
@@ -530,13 +545,260 @@ def test_board_projects_fixture_json_without_github_writes(
     assert ten["unblocks_count"] == 1
     assert ten["contract"]["next"] == "Land #10."
     assert ten["contract_complete"] is True
+    assert ten["actionable"] is True
+    assert ten["actionable_reason"] is None
     assert eleven["active_claim"] == "Codex Sol (builder)"
+    assert eleven["actionable_reason"] == "claimed"
     assert thirteen["stage"] == "code-landed"
     assert fourteen["stage"] == "text-only"
+    assert fourteen["actionable_reason"] == "body incomplete"
     assert [item["number"] for item in payload["ready_now"]] == [10, 13]
     assert [item["number"] for item in payload["stale"]] == [12]
     assert next(item for item in payload["items"] if item["number"] == 12)["stage"] == "text-only"
     assert 11 not in [item["number"] for item in payload["ready_now"]]
+
+
+def board_issue(
+    number: int,
+    title: str,
+    body: str,
+    *,
+    labels: tuple[str, ...] = (),
+) -> board.Issue:
+    return board.Issue(
+        number,
+        title,
+        labels,
+        body,
+        "2026-08-20T00:00:00Z",
+        "2026-08-20T00:00:00Z",
+    )
+
+
+def complete_contract(next_step: str, *, blocked_by: str = "") -> str:
+    return (
+        "## Now\nWork is ready.\n\n"
+        f"## Next\n{next_step}\n\n"
+        f"## Blocked by\n{blocked_by}\n\n"
+        "## Done when\nThe work is merged."
+    )
+
+
+@pytest.mark.parametrize(
+    ("issues", "claims", "arguments", "expected_exit", "expected_output"),
+    [
+        pytest.param(
+            (
+                board_issue(10, "Lower work", complete_contract("Claim #10.")),
+                board_issue(11, "Top work", complete_contract("Claim #11.")),
+                board_issue(12, "Depends on top", "## Blocked by\n#11"),
+            ),
+            (),
+            ("next",),
+            0,
+            "#11 score 10: Top work\nNext: Claim #11.\n",
+            id="names_the_highest_scored_actionable_item",
+        ),
+        pytest.param(
+            (
+                board_issue(10, "Lower work", complete_contract("Claim #10.")),
+                board_issue(11, "Top work", complete_contract("Claim #11.")),
+                board_issue(12, "Depends on top", "## Blocked by\n#11"),
+            ),
+            (),
+            ("next", "--json"),
+            0,
+            {
+                "number": 11,
+                "score": 10,
+                "title": "Top work",
+                "next": "Claim #11.",
+            },
+            id="emits_the_highest_scored_actionable_item_as_json",
+        ),
+        pytest.param(
+            (board_issue(10, "Incomplete", "## Now\nInvestigate."),),
+            (),
+            ("next",),
+            3,
+            "",
+            id="returns_three_when_every_item_is_incomplete",
+        ),
+        pytest.param(
+            (board_issue(10, "Claimed", complete_contract("Claim #10.")),),
+            (request(issue=10),),
+            ("next",),
+            3,
+            "",
+            id="returns_three_when_every_item_is_claimed",
+        ),
+        pytest.param(
+            (
+                board_issue(9, "Open blocker", complete_contract("Claim #9.")),
+                board_issue(10, "Blocked", complete_contract("Claim #10.", blocked_by="#9")),
+            ),
+            (),
+            ("next",),
+            0,
+            "#9 score 10: Open blocker\nNext: Claim #9.\n",
+            id="excludes_items_with_open_blockers",
+        ),
+    ],
+)
+def test_next_reports_the_highest_scored_actionable_item(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    issues: tuple[board.Issue, ...],
+    claims: tuple[ClaimRequest, ...],
+    arguments: tuple[str, ...],
+    expected_exit: int,
+    expected_output: str | dict[str, object],
+) -> None:
+    client = _claims_client(*claims)
+    monkeypatch.setattr(client, "list_open_board_issues", lambda: issues)
+    monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
+    monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+
+    assert issue_claim.main(["--repo", "example/agent-claim", *arguments]) == expected_exit
+    rendered = capsys.readouterr().out
+
+    if isinstance(expected_output, str):
+        assert rendered == expected_output
+    else:
+        assert json.loads(rendered) == expected_output
+
+
+@pytest.mark.parametrize(
+    ("out_of_order_reason", "expected_comment_reason"),
+    [
+        pytest.param(
+            None,
+            None,
+            id="warns_without_a_reason",
+        ),
+        pytest.param(
+            "Urgent customer incident.",
+            "Out-of-order reason: Urgent customer incident.",
+            id="records_an_explicit_reason",
+        ),
+    ],
+)
+def test_claim_warns_about_a_higher_scored_actionable_item(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    out_of_order_reason: str | None,
+    expected_comment_reason: str | None,
+) -> None:
+    client = _claims_client()
+    issues = (
+        board_issue(10, "Lower work", complete_contract("Claim #10.")),
+        board_issue(11, "Top work", complete_contract("Claim #11.")),
+        board_issue(12, "Depends on top", "## Blocked by\n#11"),
+    )
+    claimed_request = replace(
+        request("out-of-order", issue=10, scope=("src/lower.py",)),
+        out_of_order_reason=out_of_order_reason,
+    )
+    monkeypatch.setattr(client, "list_open_board_issues", lambda: issues)
+    monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
+    monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+    monkeypatch.setattr(issue_claim, "_request", lambda _arguments: claimed_request)
+
+    arguments = [
+        "--repo",
+        "example/agent-claim",
+        "claim",
+        "10",
+        "--agent",
+        "Codex Sol",
+        "--scope",
+        "src/lower.py",
+    ]
+    if out_of_order_reason is not None:
+        arguments.extend(("--out-of-order", out_of_order_reason))
+
+    assert issue_claim.main(arguments) == 0
+    output = capsys.readouterr().out
+
+    assert "WARNING" in output
+    assert "#11" in output
+    comment_body = client.comments[LEDGER_ISSUE][-1].body
+    if expected_comment_reason is None:
+        assert "Out-of-order reason:" not in comment_body
+    else:
+        assert expected_comment_reason in comment_body
+
+
+@pytest.mark.parametrize(
+    ("issue", "claims", "blocker_is_open", "expected"),
+    [
+        pytest.param(
+            board_issue(10, "Ready", complete_contract("Claim #10.")),
+            (),
+            True,
+            (True, None),
+            id="ready",
+        ),
+        pytest.param(
+            board_issue(10, "Claimed", complete_contract("Claim #10.")),
+            (request(issue=10),),
+            True,
+            (False, "claimed"),
+            id="claimed",
+        ),
+        pytest.param(
+            board_issue(10, "Blocked", complete_contract("Claim #10.", blocked_by="#9")),
+            (),
+            True,
+            (False, "blocked by #9"),
+            id="blocked",
+        ),
+        pytest.param(
+            board_issue(10, "Unblocked", complete_contract("Claim #10.", blocked_by="#9")),
+            (),
+            False,
+            (True, None),
+            id="closed_blocker",
+        ),
+        pytest.param(
+            board_issue(10, "Incomplete", "## Now\nInvestigate."),
+            (),
+            True,
+            (False, "body incomplete"),
+            id="incomplete",
+        ),
+    ],
+)
+def test_board_reports_each_item_actionability_reason(
+    issue: board.Issue,
+    claims: tuple[ClaimRequest, ...],
+    blocker_is_open: bool,
+    expected: tuple[bool, str | None],
+) -> None:
+    blocker = board_issue(9, "Blocker", complete_contract("Claim #9."))
+    projected = board.build_board(
+        (blocker, issue) if blocker_is_open else (issue,),
+        (),
+        (),
+        tuple(
+            claim
+            for request_value in claims
+            if (claim := parse_claim_event(comment(1, claim_comment(request_value)))) is not None
+        ),
+        board.BoardConfig(),
+        now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+    )
+    item = next(item for item in projected.items if item.number == issue.number)
+
+    assert (item.actionable, item.actionable_reason) == expected
 
 
 def test_board_parses_the_last_atelier_contract_projection() -> None:
@@ -3405,6 +3667,7 @@ def _git_checkout(
 ) -> dict[tuple[str, str], str]:
     return {
         ("rev-parse", "HEAD"): head,
+        ("rev-parse", "--show-toplevel"): "/repo",
         ("branch", "--show-current"): branch,
         ("rev-parse", "--git-dir"): git_directory,
         ("rev-parse", "--git-common-dir"): common_directory,

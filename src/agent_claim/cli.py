@@ -155,6 +155,7 @@ def _request(arguments: argparse.Namespace) -> protocol.ClaimRequest:
         branch=parsed.branch,
         scope=parsed.scope,
         claim_id=parsed.claim_id,
+        out_of_order_reason=arguments.out_of_order,
     )
     checkout._validate_checkout(request)
     _reject_directory_scopes(request.scope, getattr(arguments, "allow_directory", None))
@@ -176,6 +177,9 @@ def _parser() -> argparse.ArgumentParser:
     board_command = commands.add_parser("board", help="project the open work board without writes")
     board_command.add_argument("--json", action="store_true")
 
+    next_command = commands.add_parser("next", help="show the highest-scored actionable item")
+    next_command.add_argument("--json", action="store_true")
+
     claim = commands.add_parser("claim", help="claim an issue and scope before editing")
     claim.add_argument(
         "issue",
@@ -194,6 +198,11 @@ def _parser() -> argparse.ArgumentParser:
         help="repository-relative path; comma-joined values equal repeated --scope",
     )
     claim.add_argument("--claim-id")
+    claim.add_argument(
+        "--out-of-order",
+        metavar="REASON",
+        help="record why this claim proceeds ahead of a higher-scored actionable item",
+    )
     claim.add_argument(
         "--allow-directory",
         metavar="REASON",
@@ -462,6 +471,40 @@ def _board(
     )
 
 
+def _next_json(item: board.BoardItem) -> int:
+    print(
+        json.dumps(
+            {
+                "number": item.number,
+                "score": item.score,
+                "title": item.title,
+                "next": item.contract.next,
+            }
+        )
+    )
+    return 0
+
+
+def _next(item: board.BoardItem) -> int:
+    print(f"#{item.number} score {item.score}: {item.title}\nNext: {item.contract.next}")
+    return 0
+
+
+def _out_of_order_warning(
+    projected: board.Board, issue: int | None
+) -> str | None:
+    highest = board.highest_scored_actionable(projected)
+    if highest is None or issue is None:
+        return None
+    claimed_item = next((item for item in projected.items if item.number == issue), None)
+    if claimed_item is None or highest.score <= claimed_item.score:
+        return None
+    return (
+        f"WARNING: higher-scored actionable item #{highest.number} "
+        f"(score {highest.score}) is free: {highest.title}"
+    )
+
+
 MUTATING_HOOK_TOOLS = frozenset({"Edit", "MultiEdit", "Write", "search_replace", "write"})
 
 
@@ -608,6 +651,12 @@ def main(arguments: list[str] | None = None) -> int:
             projected = _board(client, protocol._ledger_claims(client))
             print(board.board_json(projected) if parsed.json else board.render(projected))
             return 0
+        if parsed.command == "next":
+            projected = _board(client, protocol._ledger_claims(client))
+            item = board.highest_scored_actionable(projected)
+            if item is None:
+                return 3
+            return _next_json(item) if parsed.json else _next(item)
         if parsed.command == "who":
             claims = protocol._ledger_claims(client)
             if parsed.json:
@@ -640,7 +689,15 @@ def main(arguments: list[str] | None = None) -> int:
             print(f"RESCOPED {_claim_subject(rescoped)}: {rescoped.claim_id}")
             return 0
         if parsed.command == "claim":
-            claimed = protocol.acquire_claim(client, _request(parsed))
+            requested = _request(parsed)
+            warning = None
+            if isinstance(requested.identity, protocol.IssueIdentity):
+                warning = _out_of_order_warning(
+                    _board(client, protocol._ledger_claims(client)), requested.identity.issue
+                )
+            if warning is not None:
+                print(warning, file=sys.stderr if parsed.json else sys.stdout)
+            claimed = protocol.acquire_claim(client, requested)
             if parsed.json:
                 return _claim_json(claimed)
             print(f"CLAIMED {_claim_subject(claimed)}: {claimed.claim_id} {claimed.comment.url}")
