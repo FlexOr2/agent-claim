@@ -73,6 +73,11 @@ POLICY_LOADER = (
     "second board."
 )
 DEFAULT_CLAIM_ROLE = "builder"
+SCOPE_SHARE_LIMIT = 0.25
+ALLOW_DIRECTORY_HELP = (
+    "permit a directory without a cut, or a scope covering more than a quarter "
+    "of versioned files"
+)
 
 
 def _resolved_identity(issue: int | None, branch: str) -> protocol.ClaimIdentity:
@@ -103,16 +108,85 @@ def _claim_subject(claim: protocol.ActiveClaim) -> str:
     )
 
 
-def _reject_directory_scopes(paths: tuple[str, ...], reason: str | None) -> None:
+def _claim_age_fields(claim: protocol.ActiveClaim, now: datetime) -> tuple[str, bool]:
+    age = board.claim_age(claim.comment.created_at, now)
+    return board.format_claim_age(age), board.claim_is_old(age)
+
+
+def _claim_age_suffix(claim: protocol.ActiveClaim, now: datetime) -> str:
+    rendered, old = _claim_age_fields(claim, now)
+    return f" {rendered} old" if old else f" {rendered}"
+
+
+def _issue_body_for_cut(
+    client: github.GitHubIssueComments, identity: protocol.ClaimIdentity
+) -> str | None:
+    if not isinstance(identity, protocol.IssueIdentity):
+        return None
+    for issue in client.list_open_board_issues():
+        if issue.number == identity.issue:
+            return issue.body
+    return None
+
+
+def _reject_uncut_directory_scope(
+    client: github.GitHubIssueComments,
+    identity: protocol.ClaimIdentity,
+    paths: tuple[str, ...],
+    allow_directory_reason: str | None,
+) -> None:
     directories = checkout._scope_directories(paths)
-    if not directories:
+    if not directories or allow_directory_reason is not None:
         return
-    if reason is None:
+    body = _issue_body_for_cut(client, identity)
+    if body is not None and board.has_cut(body):
+        return
+    raise protocol.ClaimError(f"directory scope {directories[0]!r} erst schneiden")
+
+
+def _scope_cost(versioned: tuple[str, ...], scope: tuple[str, ...]) -> tuple[int, int, float]:
+    n = len(checkout.paths_under_scope(versioned, scope))
+    total = len(versioned)
+    share = 0.0 if total == 0 else n / total
+    return n, total, share
+
+
+def _reject_oversized_scope(
+    scope: tuple[str, ...],
+    allow_directory_reason: str | None,
+    versioned: tuple[str, ...],
+) -> tuple[int, int, float]:
+    n, total, share = _scope_cost(versioned, scope)
+    if share > SCOPE_SHARE_LIMIT and allow_directory_reason is None:
         raise protocol.ClaimError(
-            f"directory scope {directories[0]!r} locks a whole tree; "
-            "pass --allow-directory REASON, or claim files instead"
+            f"scope covers more than a quarter of versioned files ({n} of {total}); "
+            "pass --allow-directory REASON"
         )
-    protocol._outbound_text(reason, "allow-directory reason", maximum=512)
+    return n, total, share
+
+
+def _touch_json(claim: protocol.ActiveClaim) -> dict[str, object]:
+    return {
+        **_identity_json(claim.identity),
+        "claim_id": claim.claim_id,
+        "agent": claim.agent,
+        "scope": list(claim.scope),
+    }
+
+
+def _touch_summary(touches: tuple[protocol.ActiveClaim, ...]) -> str:
+    if not touches:
+        return "touches no other open claims"
+    return "would touch " + ", ".join(
+        f"{_claim_subject(claim)} ({claim.claim_id})" for claim in touches
+    )
+
+
+def _claim_cost_line(
+    n: int, total: int, touches: tuple[protocol.ActiveClaim, ...]
+) -> str:
+    percent = 0 if total == 0 else round(100 * n / total)
+    return f"{n} of {total} versioned files ({percent}%); {_touch_summary(touches)}"
 
 
 def _request(arguments: argparse.Namespace) -> protocol.ClaimRequest:
@@ -147,6 +221,11 @@ def _request(arguments: argparse.Namespace) -> protocol.ClaimRequest:
     parsed = protocol.parse_claim_event(synthetic)
     if not isinstance(parsed, protocol.ActiveClaim):
         raise protocol.ClaimError("claim request did not produce a marker")
+    allow_directory_reason = getattr(arguments, "allow_directory", None)
+    if allow_directory_reason is not None:
+        allow_directory_reason = protocol._outbound_text(
+            allow_directory_reason, "allow-directory reason", maximum=512
+        )
     request = protocol.ClaimRequest(
         identity=parsed.identity,
         agent=parsed.agent,
@@ -156,9 +235,9 @@ def _request(arguments: argparse.Namespace) -> protocol.ClaimRequest:
         scope=parsed.scope,
         claim_id=parsed.claim_id,
         out_of_order_reason=arguments.out_of_order,
+        allow_directory_reason=allow_directory_reason,
     )
     checkout._validate_checkout(request)
-    _reject_directory_scopes(request.scope, getattr(arguments, "allow_directory", None))
     return request
 
 
@@ -206,7 +285,7 @@ def _parser() -> argparse.ArgumentParser:
     claim.add_argument(
         "--allow-directory",
         metavar="REASON",
-        help="permit a directory scope that locks a whole tree",
+        help=ALLOW_DIRECTORY_HELP,
     )
     claim.add_argument("--json", action="store_true")
 
@@ -248,7 +327,7 @@ def _parser() -> argparse.ArgumentParser:
     rescope.add_argument(
         "--allow-directory",
         metavar="REASON",
-        help="permit adding a directory scope that locks a whole tree",
+        help=ALLOW_DIRECTORY_HELP,
     )
     rescope.add_argument("--json", action="store_true")
 
@@ -308,7 +387,12 @@ def _status_claims(
     return related, index.conflict_ids
 
 
-def _status(claims: tuple[protocol.ActiveClaim, ...], issue: int | None) -> int:
+def _status(
+    claims: tuple[protocol.ActiveClaim, ...],
+    issue: int | None,
+    now: datetime | None = None,
+) -> int:
+    observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     related, conflict_ids = _status_claims(claims, issue)
     if not related:
         subject = "repository" if issue is None else f"issue #{issue}"
@@ -319,6 +403,7 @@ def _status(claims: tuple[protocol.ActiveClaim, ...], issue: int | None) -> int:
         print(
             f"{state} {_claim_subject(claim)}: {claim.agent} ({claim.role}) "
             f"base={claim.base} branch={claim.branch} claim={claim.claim_id}"
+            f"{_claim_age_suffix(claim, observed_at)}"
         )
         for path in claim.scope:
             print(f"  {path}")
@@ -326,8 +411,12 @@ def _status(claims: tuple[protocol.ActiveClaim, ...], issue: int | None) -> int:
 
 
 def _status_json(
-    claims: tuple[protocol.ActiveClaim, ...], issue: int | None, ledger: int
+    claims: tuple[protocol.ActiveClaim, ...],
+    issue: int | None,
+    ledger: int,
+    now: datetime | None = None,
 ) -> int:
+    observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     related, conflict_ids = _status_claims(claims, issue)
     if not related:
         state = "UNCLAIMED"
@@ -349,6 +438,8 @@ def _status_json(
                 "claim_id": claim.claim_id,
                 "scope": list(claim.scope),
                 "state": "CONFLICT" if claim.claim_id in conflict_ids else "CLAIMED",
+                "age": _claim_age_fields(claim, observed_at)[0],
+                "old": _claim_age_fields(claim, observed_at)[1],
             }
             for claim in related
         ],
@@ -420,7 +511,14 @@ def _rescope_json(claimed: protocol.ActiveClaim) -> int:
     return 0
 
 
-def _claim_json(claimed: protocol.ActiveClaim) -> int:
+def _claim_json(
+    claimed: protocol.ActiveClaim,
+    *,
+    versioned_files: int,
+    versioned_files_total: int,
+    share: float,
+    touches: tuple[protocol.ActiveClaim, ...],
+) -> int:
     print(
         json.dumps(
             {
@@ -432,6 +530,10 @@ def _claim_json(claimed: protocol.ActiveClaim) -> int:
                 "base": claimed.base,
                 "branch": claimed.branch,
                 "scope": list(claimed.scope),
+                "versioned_files": versioned_files,
+                "versioned_files_total": versioned_files_total,
+                "share": share,
+                "touches": [_touch_json(claim) for claim in touches],
             }
         )
     )
@@ -668,10 +770,11 @@ def main(arguments: list[str] | None = None) -> int:
         protocol.configure_ledger(ledger)
         if parsed.command == "status":
             claims = protocol._ledger_claims(client)
+            now = datetime.now(timezone.utc)
             if parsed.json:
-                return _status_json(claims, parsed.issue, ledger)
+                return _status_json(claims, parsed.issue, ledger, now=now)
             print(f"LEDGER #{ledger}")
-            return _status(claims, parsed.issue)
+            return _status(claims, parsed.issue, now=now)
         if parsed.command == "board":
             projected = _board(client, protocol._ledger_claims(client))
             print(board.board_json(projected) if parsed.json else board.render(projected))
@@ -705,7 +808,28 @@ def main(arguments: list[str] | None = None) -> int:
             identity = _resolved_identity(parsed.issue, rescope_branch)
             add = protocol._valid_scope(parsed.add) if parsed.add else ()
             drop = protocol._valid_scope(parsed.drop) if parsed.drop else ()
-            _reject_directory_scopes(add, parsed.allow_directory)
+            allow_directory_reason = parsed.allow_directory
+            if allow_directory_reason is not None:
+                allow_directory_reason = protocol._outbound_text(
+                    allow_directory_reason, "allow-directory reason", maximum=512
+                )
+            if add:
+                versioned = checkout.versioned_paths()
+                _reject_uncut_directory_scope(
+                    client, identity, add, allow_directory_reason
+                )
+                selected = protocol._select_rescope_claim(
+                    protocol._ledger_claims(client),
+                    identity,
+                    parsed.agent,
+                    parsed.claim_id,
+                    branch=rescope_branch,
+                )
+                _reject_oversized_scope(
+                    protocol._combined_scope(selected.scope, add, drop),
+                    allow_directory_reason,
+                    versioned,
+                )
             rescoped = protocol.rescope_claim(
                 client,
                 identity,
@@ -714,6 +838,7 @@ def main(arguments: list[str] | None = None) -> int:
                 drop,
                 parsed.claim_id,
                 branch=rescope_branch,
+                allow_directory_reason=allow_directory_reason,
             )
             if parsed.json:
                 return _rescope_json(rescoped)
@@ -721,6 +846,16 @@ def main(arguments: list[str] | None = None) -> int:
             return 0
         if parsed.command == "claim":
             requested = _request(parsed)
+            versioned = checkout.versioned_paths()
+            _reject_uncut_directory_scope(
+                client,
+                requested.identity,
+                requested.scope,
+                requested.allow_directory_reason,
+            )
+            n, total, share = _reject_oversized_scope(
+                requested.scope, requested.allow_directory_reason, versioned
+            )
             warning = None
             if isinstance(requested.identity, protocol.IssueIdentity):
                 warning = _out_of_order_warning(
@@ -729,9 +864,17 @@ def main(arguments: list[str] | None = None) -> int:
             if warning is not None:
                 print(warning, file=sys.stderr if parsed.json else sys.stdout)
             claimed = protocol.acquire_claim(client, requested)
+            touches = protocol.conflicting_claims(protocol._ledger_claims(client), claimed)
             if parsed.json:
-                return _claim_json(claimed)
+                return _claim_json(
+                    claimed,
+                    versioned_files=n,
+                    versioned_files_total=total,
+                    share=share,
+                    touches=touches,
+                )
             print(f"CLAIMED {_claim_subject(claimed)}: {claimed.claim_id} {claimed.comment.url}")
+            print(_claim_cost_line(n, total, touches))
             return 0
         if parsed.command == "release":
             identity = _resolved_identity(parsed.issue, release_branch or "")

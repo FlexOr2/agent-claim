@@ -43,8 +43,9 @@ present on the ledger, active or released, is refused before anything is posted;
 release the old claim and pass a fresh `--claim-id` instead.
 `rescope <issue> --add <path> [--drop <path>]` changes a live claim's scope
 without releasing it: the claim id and base stay, added paths are exclusive
-like `claim`, dropping is not refused for an existing remainder overlap, and
-there is no release window. It does not require HEAD to match
+like `claim`, `--add` of a directory or a combined share above a quarter uses
+the same cut / `--allow-directory` rules as `claim`, dropping is not refused
+for an existing remainder overlap, and there is no release window. It does not require HEAD to match
 base or a clean tree. A `rescope` ledger event is a new v2 action; older
 helpers fail loud on the whole ledger until they upgrade.
 
@@ -53,11 +54,16 @@ OWNER/REPOSITORY`. A claim must begin from a clean linked worktree and binds its
 base commit, branch, issue, and repository-relative scope. `--scope a,b` is
 the same as `--scope a --scope b`; each path is stored and compared
 separately, including when an older ledger comment still has one comma-joined
-string. Directory scopes (`docs`, `frontend/src`) lock the whole tree and are
-refused unless `--allow-directory REASON` is set. Claims collide on the same
+string. Directory scopes (`docs`, `frontend/src`) lock the whole tree: claim one only
+when the issue body has a `## Schnitt` cut with at least one `**Scheibe n: ...**`
+slice, or pass `--allow-directory REASON`. A scope covering more than a quarter
+of versioned files also needs that flag. `claim` prints how many versioned files
+the scope covers and that it touches no other open claims. Claims collide on the same
 issue or overlapping paths; disjoint scopes can proceed concurrently.
 `who <path>` prints the live claim that holds a path.
 Agents should read `--json` from `status`, `claim`, `release`, `rescope`, and `who`.
+`status` prints each live claim's age from its claim comment as `Xh Ym`, and
+marks it `old` after more than one hour.
 
 `bootstrap` adopts the exact `<!-- agent-claim-ledger:v1 -->` issue marker,
 ensures it is locked and labelled, and safely converges concurrent first starts
@@ -88,8 +94,9 @@ every duplicated id, not just the conflicting one — instead of picking a winne
 `agent-claim board` reads the open issues, open PRs, PRs merged in the last 14
 days, and the claim ledger, then prints a ranked projection with `READY NOW` and
 `STALE` sections. The table exposes which exact contract headings were found, an
-`EXPECT` state (`-`, `proposed`, or `ruled`), and a concise `Next`; JSON includes
-the complete derived contract state. An `Erwartung`, `Erwartungen`, or
+`EXPECT` state (`-`, `proposed`, or `ruled`), a concise `Next`, and a CLAIM
+cell with `-` or the agent, role, claim age, and `old` when the claim comment
+is older than one hour; JSON includes the complete derived contract state. An `Erwartung`, `Erwartungen`, or
 `Erwartungsliste` heading makes the following block an expectation list: a line
 with `*(Default: yes|no|later)*` is proposed. A block is ruled only when every
 expectation line carries a `*(geregelt: ja)*` or `*(geregelt: NEIN ...)*`

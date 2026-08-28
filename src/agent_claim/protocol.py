@@ -202,6 +202,7 @@ class ClaimRequest:
     scope: tuple[str, ...]
     claim_id: str
     out_of_order_reason: str | None = None
+    allow_directory_reason: str | None = None
 
 
 class IssueComments(Protocol):
@@ -978,6 +979,12 @@ def claim_comment(request: ClaimRequest) -> str:
     if request.out_of_order_reason is not None:
         reason = _outbound_text(request.out_of_order_reason, "out-of-order reason", maximum=512)
         out_of_order = f"- Out-of-order reason: {reason}\n"
+    allow_directory = ""
+    if request.allow_directory_reason is not None:
+        reason = _outbound_text(
+            request.allow_directory_reason, "allow-directory reason", maximum=512
+        )
+        allow_directory = f"- Allow-directory reason: {reason}\n"
     return _validated_comment(
         f"{_marker(payload)}\n"
         "## CLAIM — exclusive build lane\n\n"
@@ -987,6 +994,7 @@ def claim_comment(request: ClaimRequest) -> str:
         f"- Branch: `{request.branch}`\n"
         f"- Claim ID: `{request.claim_id}`\n"
         f"{out_of_order}"
+        f"{allow_directory}"
         "- Write scope:\n"
         f"{scope}\n\n"
         "Repository-wide ledger event. No edit starts before this claim is re-read live. "
@@ -995,7 +1003,13 @@ def claim_comment(request: ClaimRequest) -> str:
     )
 
 
-def rescope_comment(claim: ActiveClaim, scope: tuple[str, ...], agent: str, role: str) -> str:
+def rescope_comment(
+    claim: ActiveClaim,
+    scope: tuple[str, ...],
+    agent: str,
+    role: str,
+    allow_directory_reason: str | None = None,
+) -> str:
     validated_agent = _outbound_text(agent, "agent", maximum=128)
     validated_role = _outbound_text(role, "role", maximum=64)
     payload: dict[str, object] = {
@@ -1007,6 +1021,10 @@ def rescope_comment(claim: ActiveClaim, scope: tuple[str, ...], agent: str, role
         "scope": list(scope),
     }
     scope_lines = "\n".join(f"- `{path}`" for path in scope)
+    allow_directory = ""
+    if allow_directory_reason is not None:
+        reason = _outbound_text(allow_directory_reason, "allow-directory reason", maximum=512)
+        allow_directory = f"- Allow-directory reason: {reason}\n"
     return _validated_comment(
         f"{_marker(payload)}\n"
         "## RESCOPE — exclusive build lane\n\n"
@@ -1015,6 +1033,7 @@ def rescope_comment(claim: ActiveClaim, scope: tuple[str, ...], agent: str, role
         f"- Base: `{claim.base}`\n"
         f"- Branch: `{claim.branch}`\n"
         f"- Claim ID: `{claim.claim_id}`\n"
+        f"{allow_directory}"
         "- Write scope:\n"
         f"{scope_lines}\n\n"
         "Repository-wide ledger event. Claim id and base are unchanged. "
@@ -1432,22 +1451,15 @@ def _rescope_added_conflicts(
     )
 
 
-def rescope_claim(
-    client: IssueComments,
+def _select_rescope_claim(
+    claims: tuple[ActiveClaim, ...],
     identity: ClaimIdentity,
     agent: str,
-    add: tuple[str, ...],
-    drop: tuple[str, ...],
     claim_id: str | None,
     *,
-    branch: str | None = None,
+    branch: str | None,
 ) -> ActiveClaim:
-    if not add and not drop:
-        raise ClaimUnavailable("rescope requires --add or --drop")
-    add_scope = _valid_scope(list(add)) if add else ()
-    drop_scope = _valid_scope(list(drop)) if drop else ()
-    observed = _ledger_claims(client)
-    standing = _claims_for_identity(observed, identity, branch)
+    standing = _claims_for_identity(claims, identity, branch)
     if not standing:
         raise ClaimUnavailable(
             f"{_identity_summary(identity, branch or '')} has no active build claim"
@@ -1485,6 +1497,28 @@ def rescope_claim(
         raise ClaimUnavailable(
             f"claim branch {selected.branch!r} does not match checkout branch {branch!r}"
         )
+    return selected
+
+
+def rescope_claim(
+    client: IssueComments,
+    identity: ClaimIdentity,
+    agent: str,
+    add: tuple[str, ...],
+    drop: tuple[str, ...],
+    claim_id: str | None,
+    *,
+    branch: str | None = None,
+    allow_directory_reason: str | None = None,
+) -> ActiveClaim:
+    if not add and not drop:
+        raise ClaimUnavailable("rescope requires --add or --drop")
+    add_scope = _valid_scope(list(add)) if add else ()
+    drop_scope = _valid_scope(list(drop)) if drop else ()
+    observed = _ledger_claims(client)
+    selected = _select_rescope_claim(
+        observed, identity, agent, claim_id, branch=branch
+    )
     new_scope = _combined_scope(selected.scope, add_scope, drop_scope)
     added = tuple(path for path in new_scope if path not in selected.scope)
     blocked_by = _rescope_added_conflicts(observed, selected.claim_id, added)
@@ -1497,7 +1531,14 @@ def rescope_claim(
         )
 
     client.post_comment(
-        LEDGER_ISSUE, rescope_comment(selected, new_scope, agent, selected.role)
+        LEDGER_ISSUE,
+        rescope_comment(
+            selected,
+            new_scope,
+            agent,
+            selected.role,
+            allow_directory_reason=allow_directory_reason,
+        ),
     )
     observed, own = _observe_rescoped_claim(
         client,
