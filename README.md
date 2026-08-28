@@ -87,9 +87,14 @@ every duplicated id, not just the conflicting one — instead of picking a winne
 
 `agent-claim board` reads the open issues, open PRs, PRs merged in the last 14
 days, and the claim ledger, then prints a ranked projection with `READY NOW` and
-`STALE` sections. The table exposes which exact contract headings were found
-and a concise `Next`; JSON includes the complete derived contract state. It
-never writes GitHub. The target defaults to the repository of the current checkout;
+`STALE` sections. The table exposes which exact contract headings were found, an
+`EXPECT` state (`-`, `proposed`, or `ruled`), and a concise `Next`; JSON includes
+the complete derived contract state. An `Erwartung`, `Erwartungen`, or
+`Erwartungsliste` heading makes the following block an expectation list: a line
+with `*(Default: yes|no|later)*` is proposed. A block is ruled only when every
+expectation line carries a `*(geregelt: ja)*` or `*(geregelt: NEIN ...)*`
+marker; absent or malformed markers remain proposed. It never writes GitHub.
+The target defaults to the repository of the current checkout;
 for another GitHub repository run `agent-claim --repo FlexOr2/atelier-2 board`.
 The current checkout may set `priority_labels` as an ordered non-empty list in
 `.agent-claim/board.toml`; absent configuration uses `security`, `data`, `ci`,
@@ -98,8 +103,10 @@ buckets, followed by items that unblock other work, then the remaining labels;
 stage and Next bonuses sort only within a bucket.
 
 Use `agent-claim next` (or `agent-claim next --json`) to name the highest-scored
-actionable item: it is open, free, unblocked, and has a complete
-Now/Next/Blocked by/Done when contract; it exits 3 when none qualifies. `claim`
+actionable item: it is open, free, unblocked, has a complete
+Now/Next/Blocked by/Done when contract, and does not have proposed expectations.
+It names every skipped proposed item with `Erwartungen ungeregelt` (also in the
+JSON `skipped` list), and exits 3 when none qualifies. `claim`
 still allows work out of order, but warns when a higher-scored actionable item is
 free; pass `--out-of-order REASON` to preserve why in the claim comment.
 

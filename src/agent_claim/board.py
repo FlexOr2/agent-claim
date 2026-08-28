@@ -22,6 +22,15 @@ CONTRACT_FIELD_PATTERN = re.compile(
     r"(?P<plain_name>Now|Next|Blocked by|Done when):)[ \t]*(?P<value>[^\r\n]*)$"
 )
 MARKDOWN_HEADING_PATTERN = re.compile(r"(?m)^#{1,6} .*$")
+EXPECTATION_HEADING_PATTERN = re.compile(
+    r"(?im)^#{1,6}[ \t]+(?:Erwartung|Erwartungen|Erwartungsliste)[ \t]*$"
+)
+PROPOSED_EXPECTATION_PATTERN = re.compile(
+    r"\*\(Default:[ \t]*(?:yes|no|later)\)\*", re.IGNORECASE
+)
+RULED_EXPECTATION_PATTERN = re.compile(
+    r"\*\(geregelt:[ \t]*(?:ja|NEIN(?:[^\r\n]*))\)\*", re.IGNORECASE
+)
 REFERENCE_PATTERN = re.compile(r"(?<![A-Za-z0-9_])#([1-9][0-9]*)")
 CLOSING_REFERENCE_PATTERN = re.compile(
     r"(?im)\b(?:close(?:s|d)?|fix(?:es|ed)?|resolve(?:s|d)?|"
@@ -76,6 +85,12 @@ class Stage(StrEnum):
     IN_FLIGHT = "in-flight"
 
 
+class ExpectationState(StrEnum):
+    NONE = "-"
+    PROPOSED = "proposed"
+    RULED = "ruled"
+
+
 @dataclass(frozen=True)
 class BoardItem:
     number: int
@@ -85,6 +100,7 @@ class BoardItem:
     priority_bucket: str
     contract: Contract
     contract_complete: bool
+    expectation_state: ExpectationState
     open_blockers: tuple[int, ...]
     stage: Stage
     age_days: int
@@ -152,6 +168,26 @@ def parse_contract(body: str) -> Contract:
         blocked_by=sections.get("Blocked by"),
         done_when=sections.get("Done when") or None,
     )
+
+
+def expectation_state(body: str) -> ExpectationState:
+    expectation_heading = EXPECTATION_HEADING_PATTERN.search(body)
+    if expectation_heading is None:
+        return ExpectationState.NONE
+    next_heading = MARKDOWN_HEADING_PATTERN.search(body, expectation_heading.end())
+    expectation_block = body[
+        expectation_heading.end() : next_heading.start() if next_heading is not None else len(body)
+    ]
+    expectation_lines = tuple(
+        line.strip() for line in expectation_block.splitlines() if line.strip()
+    )
+    if (
+        not expectation_lines
+        or any(PROPOSED_EXPECTATION_PATTERN.search(line) for line in expectation_lines)
+        or not all(RULED_EXPECTATION_PATTERN.search(line) for line in expectation_lines)
+    ):
+        return ExpectationState.PROPOSED
+    return ExpectationState.RULED
 
 
 def _references(text: str | None) -> frozenset[int]:
@@ -248,6 +284,7 @@ def build_board(
     items: list[BoardItem] = []
     for issue in issues:
         contract = contracts[issue.number]
+        expectations = expectation_state(issue.body)
         claim = claims_by_issue.get(issue.number)
         in_flight = issue.number in in_flight_references or (
             claim is not None and claim.branch in open_branches
@@ -272,6 +309,7 @@ def build_board(
             active_claim=f"{claim.agent} ({claim.role})" if claim else None,
             open_blockers=blockers[issue.number],
             contract_complete=contract.complete,
+            expectation_state=expectations,
         )
         items.append(
             BoardItem(
@@ -282,6 +320,7 @@ def build_board(
                 priority_bucket=priority_bucket,
                 contract=contract,
                 contract_complete=contract.complete,
+                expectation_state=expectations,
                 open_blockers=blockers[issue.number],
                 stage=stage,
                 age_days=age_days,
@@ -328,6 +367,7 @@ def render(board: Board) -> str:
             "PRIORITY",
             "STAGE",
             "CONTRACT",
+            "EXPECT",
             "NEXT",
             "AGE",
             "IDLE",
@@ -344,6 +384,7 @@ def render(board: Board) -> str:
                 item.priority_bucket,
                 item.stage.value,
                 _contract_summary(item.contract),
+                item.expectation_state.value,
                 _brief(item.contract.next),
                 str(item.age_days),
                 str(item.idle_days),
@@ -381,8 +422,14 @@ def _contract_summary(contract: Contract) -> str:
 
 
 def _actionable_reason(
-    *, active_claim: str | None, open_blockers: tuple[int, ...], contract_complete: bool
+    *,
+    active_claim: str | None,
+    open_blockers: tuple[int, ...],
+    contract_complete: bool,
+    expectation_state: ExpectationState,
 ) -> str | None:
+    if expectation_state is ExpectationState.PROPOSED:
+        return "Erwartungen ungeregelt"
     if active_claim is not None:
         return "claimed"
     if open_blockers:
