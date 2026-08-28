@@ -61,14 +61,14 @@ of versioned files also needs that flag. Live claims are advisory: they say who
 works where and do not refuse path overlap. Two lanes may claim the same
 directory or the same file; `claim` and `status` print the overlap as a note.
 The same issue or the same `docs/`/`fix/` lane branch still holds at most one
-live claim. `claim --resource <name>` allocates the next free integer for that
-named scarce value and holds it until land or release; a second live hold of
-the same name and value is refused by name. Sequential allocations stay unique
-even after a release. `claim` prints how many versioned files the scope covers
-and which open claims it overlaps. `status` also prints `trunk-pull breaks: N`,
-the number of `agent-claim broke` records on the current ledger — each one is a
-recorded red check run after pulling trunk. `who <path>` prints every live
-claim that holds a path.
+live claim. `claim --resource <name>` posts a name-only intent; the live integer is the next
+positive value not occupied by an earlier first-occurrence request for that name. An explicit
+posted value occupies that integer even after release; a released auto still occupies the
+integer it would have been assigned. A second live hold of the same name and value is
+refused: only the earliest live claim of that pair is the holder. Sequential allocations
+stay unique even after a release. `claim` prints
+how many versioned files the scope covers and which open claims it overlaps.
+`who <path>` prints every live claim that holds a path.
 Agents should read `--json` from `status`, `claim`, `release`, `rescope`, and `who`.
 `status` prints each live claim's age from its claim comment as `Xh Ym`, and
 marks it `old` after more than one hour.
@@ -109,12 +109,12 @@ is older than one hour; JSON includes the complete derived contract state. An `E
 with `*(Default: yes|no|later)*` is proposed. A block is ruled only when every
 expectation line carries a `*(geregelt: ja)*` or `*(geregelt: NEIN ...)*`
 marker; absent or malformed markers remain proposed. A ruled block also shows
-how many default-branch landings (`git log` committer times) happened after its
-heading date (`DD.MM.YYYY`, preferring `GEREGELT: Operator …`); ten or more
-mark it `old`. Missing or proposed expectations have neither fresh nor old. If
-a ruled block has no readable date or git cannot name the default branch, that
-is an error, never silently fresh. The table footer `TRUNK-PULL BREAKS` is the
-same ledger count `status` prints. It never writes GitHub.
+how many default-branch first-parent landings (`git log --first-parent`
+committer times) happened after its heading date (`DD.MM.YYYY`, preferring
+`GEREGELT: Operator …`); ten or more mark it `old`. Missing or proposed
+expectations have neither fresh nor old. If a ruled block has no readable date
+or git cannot name the default branch, that is an error, never silently fresh.
+It never writes GitHub.
 The target defaults to the repository of the current checkout;
 for another GitHub repository run `agent-claim --repo FlexOr2/atelier-2 board`.
 The current checkout may set `priority_labels` as an ordered non-empty list in

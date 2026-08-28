@@ -32,7 +32,6 @@ BRANCH_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}")
 REPOSITORY_PATTERN = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9_.-]{1,100}"
 )
-TRUNK_BREAK_MARKER = "<!-- agent-claim-trunk-break:v1 -->"
 MAX_PROTOCOL_EVENTS = 4096
 MAX_PROTOCOL_BYTES = 8 * 1024 * 1024
 MAX_COMMENT_BYTES = 48 * 1024
@@ -118,6 +117,7 @@ class ActiveClaim:
     scope: tuple[str, ...]
     comment: IssueComment
     resource: ResourceHold | None = None
+    requested_resource: str | None = None
 
 
 @dataclass(frozen=True)
@@ -440,17 +440,6 @@ def is_protocol_candidate(comment: IssueComment) -> bool:
     )
 
 
-def is_trunk_break_candidate(comment: IssueComment) -> bool:
-    return (
-        comment.author_association in TRUSTED_ASSOCIATIONS
-        and comment.body.partition("\n")[0] == TRUNK_BREAK_MARKER
-    )
-
-
-def is_ledger_event_candidate(comment: IssueComment) -> bool:
-    return is_protocol_candidate(comment) or is_trunk_break_candidate(comment)
-
-
 def _marker_payload(comment: IssueComment) -> tuple[dict[str, object], bool] | None:
     if not is_protocol_candidate(comment):
         return None
@@ -520,8 +509,14 @@ def _parse_active_claim(
     expected = {"action", "agent", "base", "branch", "claim_id", "role", "scope"}
     if not legacy:
         expected.add(_identity_marker_key(identity))
-    if "resource" in payload or "resource_value" in payload:
-        expected.update({"resource", "resource_value"})
+    if "resource_value" in payload and "resource" not in payload:
+        raise InvalidClaimMarker(
+            f"trusted comment {comment.url} resource_value requires resource"
+        )
+    if "resource" in payload:
+        expected.add("resource")
+        if "resource_value" in payload:
+            expected.add("resource_value")
     _strict_keys(payload, frozenset(expected), comment)
     claim_id, agent, role = _event_identity(payload, comment)
     base = _required_text(payload, "base", maximum=40)
@@ -529,9 +524,15 @@ def _parse_active_claim(
         raise InvalidClaimMarker(
             f"trusted comment {comment.url} base must be a full lowercase commit SHA"
         )
-    resource = (
-        _required_resource_hold(payload, comment) if "resource" in payload else None
-    )
+    requested_resource = None
+    resource = None
+    if "resource" in payload:
+        requested_resource = _required_text(payload, "resource", maximum=64)
+        _valid_resource_name(
+            requested_resource, field=f"trusted comment {comment.url} resource"
+        )
+        if "resource_value" in payload:
+            resource = _required_resource_hold(payload, comment)
     return ActiveClaim(
         identity=identity,
         claim_id=claim_id,
@@ -542,6 +543,7 @@ def _parse_active_claim(
         scope=_valid_scope(payload.get("scope")),
         comment=comment,
         resource=resource,
+        requested_resource=requested_resource,
     )
 
 
@@ -783,7 +785,6 @@ class ClaimLedgerAggregate:
     duplicate_claim_ids: tuple[str, ...]
     occurrences: Mapping[str, tuple[ActiveClaim, ...]]
     terminated_by: Mapping[str, tuple[IssueComment, ...]]
-    trunk_check_breaks: int
 
 
 def _aggregate_claim_events(comments: tuple[IssueComment, ...]) -> ClaimLedgerAggregate:
@@ -798,16 +799,8 @@ def _aggregate_claim_events(comments: tuple[IssueComment, ...]) -> ClaimLedgerAg
     occurrences: dict[str, list[ActiveClaim]] = {}
     terminated_by: dict[str, list[IssueComment]] = {}
     duplicate_claim_ids: list[str] = []
-    trunk_check_breaks = 0
     ordered = sorted(comments, key=lambda comment: (comment.created_at, comment.identifier))
     for comment in ordered:
-        if is_trunk_break_candidate(comment):
-            if comment.created_at != comment.updated_at:
-                raise InvalidClaimMarker(
-                    f"trusted protocol comment {comment.url} was edited after publication"
-                )
-            trunk_check_breaks += 1
-            continue
         event = parse_claim_event(comment)
         if event is None:
             continue
@@ -843,26 +836,85 @@ def _aggregate_claim_events(comments: tuple[IssueComment, ...]) -> ClaimLedgerAg
         if _apply_terminal_event(event, active, acquired):
             terminated_by.setdefault(event.claim_id, []).append(event.comment)
 
+    occurrence_map = {claim_id: tuple(events) for claim_id, events in occurrences.items()}
+    derived_active = _apply_derived_resource_holds(active, occurrence_map)
     return ClaimLedgerAggregate(
         active=tuple(
             sorted(
-                active.values(),
+                derived_active.values(),
                 key=lambda event: (event.comment.created_at, event.comment.identifier),
             )
         ),
         seen_claim_ids=frozenset(acquired),
         duplicate_claim_ids=tuple(duplicate_claim_ids),
-        occurrences=MappingProxyType(
-            {claim_id: tuple(events) for claim_id, events in occurrences.items()}
-        ),
+        occurrences=MappingProxyType(occurrence_map),
         terminated_by=MappingProxyType(
             {
                 claim_id: tuple(terminal_comments)
                 for claim_id, terminal_comments in terminated_by.items()
             }
         ),
-        trunk_check_breaks=trunk_check_breaks,
     )
+
+
+def _apply_derived_resource_holds(
+    active: dict[str, ActiveClaim],
+    occurrences: Mapping[str, tuple[ActiveClaim, ...]],
+) -> dict[str, ActiveClaim]:
+    """Assign auto resource values from occupied first-occurrence intents.
+
+    Walk first-occurrence intents for a name in ledger order. Explicit intents occupy
+    their posted value, including after release. Auto intents take the next positive
+    integer not already occupied; a released auto still occupies the integer it would
+    have been assigned. Among still-active claims, only the earliest live (name, value)
+    pair stays the holder — later live explicit posts of that pair are stripped.
+    """
+    derived = dict(active)
+    first_occurrences = [events[0] for events in occurrences.values()]
+    names = sorted(
+        {
+            event.requested_resource
+            for event in first_occurrences
+            if event.requested_resource is not None
+        }
+    )
+    for name in names:
+        intents = sorted(
+            (
+                event
+                for event in first_occurrences
+                if event.requested_resource == name
+            ),
+            key=lambda event: (event.comment.created_at, event.comment.identifier),
+        )
+        occupied: set[int] = set()
+        for intent in intents:
+            if intent.resource is not None:
+                occupied.add(intent.resource.value)
+                continue
+            value = 1
+            while value in occupied:
+                value += 1
+            occupied.add(value)
+            current = derived.get(intent.claim_id)
+            if current is None:
+                continue
+            derived[intent.claim_id] = replace(current, resource=ResourceHold(name, value))
+    holders: dict[tuple[str, int], list[ActiveClaim]] = {}
+    first_by_id = {event.claim_id: event for event in first_occurrences}
+    for claim in derived.values():
+        if claim.resource is not None:
+            holders.setdefault((claim.resource.name, claim.resource.value), []).append(claim)
+    for held in holders.values():
+        ordered = sorted(
+            held, key=lambda claim: (claim.comment.created_at, claim.comment.identifier)
+        )
+        for loser in ordered[1:]:
+            first = first_by_id.get(loser.claim_id)
+            if first is None or first.resource is None:
+                continue
+            derived[loser.claim_id] = replace(loser, resource=None)
+    return derived
 
 
 def _reject_duplicate_claim_ids(aggregate: ClaimLedgerAggregate) -> None:
@@ -874,12 +926,6 @@ def active_claims(comments: tuple[IssueComment, ...]) -> tuple[ActiveClaim, ...]
     aggregate = _aggregate_claim_events(comments)
     _reject_duplicate_claim_ids(aggregate)
     return aggregate.active
-
-
-def trunk_check_breaks(comments: tuple[IssueComment, ...]) -> int:
-    aggregate = _aggregate_claim_events(comments)
-    _reject_duplicate_claim_ids(aggregate)
-    return aggregate.trunk_check_breaks
 
 
 def _scope_prefixes(paths: tuple[str, ...]) -> set[tuple[str, ...]]:
@@ -1080,15 +1126,18 @@ def claim_comment(request: ClaimRequest) -> str:
     resource_line = ""
     if request.resource is not None:
         name = _outbound_resource_name(request.resource)
-        if (
-            isinstance(request.resource_value, bool)
-            or not isinstance(request.resource_value, int)
-            or request.resource_value < 1
-        ):
-            raise ClaimError("resource value must be a positive integer")
         payload["resource"] = name
-        payload["resource_value"] = request.resource_value
-        resource_line = f"- Resource: `{name}` = {request.resource_value}\n"
+        if request.resource_value is None:
+            resource_line = f"- Resource: `{name}`\n"
+        else:
+            if (
+                isinstance(request.resource_value, bool)
+                or not isinstance(request.resource_value, int)
+                or request.resource_value < 1
+            ):
+                raise ClaimError("resource value must be a positive integer")
+            payload["resource_value"] = request.resource_value
+            resource_line = f"- Resource: `{name}` = {request.resource_value}\n"
     scope = "\n".join(f"- `{path}`" for path in request.scope)
     out_of_order = ""
     if request.out_of_order_reason is not None:
@@ -1453,32 +1502,6 @@ def _reconcile_identity(
         reconcile_issue_label(client, identity.issue, unclaimed_body=unclaimed_body)
 
 
-def trunk_break_comment(agent: str, role: str) -> str:
-    validated_agent = _outbound_text(agent, "agent", maximum=128)
-    validated_role = _outbound_text(role, "role", maximum=64)
-    return _validated_comment(
-        f"{TRUNK_BREAK_MARKER}\n"
-        "Pulling trunk broke the checks.\n\n"
-        f"Agent: {validated_agent} ({validated_role})"
-    )
-
-
-def record_trunk_break(client: IssueComments, agent: str, role: str) -> int:
-    client.post_comment(LEDGER_ISSUE, trunk_break_comment(agent, role))
-    comments = client.list_protocol_candidates(LEDGER_ISSUE)
-    return trunk_check_breaks(comments)
-
-
-def _next_resource_value(aggregate: ClaimLedgerAggregate, name: str) -> int:
-    values = [
-        event.resource.value
-        for events in aggregate.occurrences.values()
-        for event in events
-        if event.resource is not None and event.resource.name == name
-    ]
-    return max(values, default=0) + 1
-
-
 def _resource_holders(
     claims: tuple[ActiveClaim, ...], hold: ResourceHold, *, except_id: str
 ) -> tuple[ActiveClaim, ...]:
@@ -1492,23 +1515,21 @@ def _resource_holders(
     )
 
 
-def _assigned_request(
-    request: ClaimRequest, aggregate: ClaimLedgerAggregate
-) -> ClaimRequest:
+def _assigned_request(request: ClaimRequest) -> ClaimRequest:
     if request.resource is None:
         if request.resource_value is not None:
             raise ClaimError("resource value requires a resource name")
         return request
     name = _outbound_resource_name(request.resource)
-    if request.resource_value is not None:
-        if (
-            isinstance(request.resource_value, bool)
-            or not isinstance(request.resource_value, int)
-            or request.resource_value < 1
-        ):
-            raise ClaimError("resource value must be a positive integer")
+    if request.resource_value is None:
         return replace(request, resource=name)
-    return replace(request, resource=name, resource_value=_next_resource_value(aggregate, name))
+    if (
+        isinstance(request.resource_value, bool)
+        or not isinstance(request.resource_value, int)
+        or request.resource_value < 1
+    ):
+        raise ClaimError("resource value must be a positive integer")
+    return replace(request, resource=name)
 
 
 def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
@@ -1519,7 +1540,7 @@ def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
             "released; release it, then claim again with a fresh --claim-id"
         )
     _reject_duplicate_claim_ids(aggregate)
-    request = _assigned_request(request, aggregate)
+    request = _assigned_request(request)
     standing = aggregate.active
     blocked_by = blocking_claims(standing, request)
     if blocked_by:
@@ -1556,15 +1577,9 @@ def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
             "the posted claim id"
         )
     identity_competitors = blocking_claims(observed, own)
-    resource_competitors = (
-        _resource_holders(observed, own.resource, except_id=own.claim_id)
-        if own.resource is not None
-        else ()
-    )
-    competitors = identity_competitors or resource_competitors
-    if competitors:
+    if identity_competitors:
         winner = min(
-            (own, *competitors),
+            (own, *identity_competitors),
             key=lambda claim: (claim.comment.created_at, claim.comment.identifier),
         )
         if winner.claim_id != request.claim_id:
@@ -1574,16 +1589,39 @@ def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
             )
             _reconcile_identity(client, request.identity)
             _reconcile_identity(client, winner.identity)
-            if own.resource is not None and winner.resource == own.resource:
-                raise ClaimUnavailable(
-                    f"{own.resource.name} {own.resource.value} is held by "
-                    f"{winner.agent} ({winner.role}) on "
-                    f"{_identity_summary(winner.identity, winner.branch)}"
-                )
             raise ClaimUnavailable(
                 f"{_identity_summary(request.identity, request.branch)} claim race lost to "
                 f"{winner.agent} ({winner.role}) on "
                 f"{_identity_summary(winner.identity, winner.branch)} branch {winner.branch}"
+            )
+    if request.resource is not None and request.resource_value is not None:
+        expected = ResourceHold(request.resource, request.resource_value)
+        if own.resource != expected:
+            holder = next(
+                (claim for claim in observed if claim.resource == expected),
+                None,
+            )
+            client.post_comment(
+                LEDGER_ISSUE,
+                release_comment(own, request.agent, request.role, "claim race lost"),
+            )
+            _reconcile_identity(client, request.identity)
+            if holder is not None:
+                _reconcile_identity(client, holder.identity)
+                raise ClaimUnavailable(
+                    f"{expected.name} {expected.value} is held by "
+                    f"{holder.agent} ({holder.role}) on "
+                    f"{_identity_summary(holder.identity, holder.branch)}"
+                )
+            raise ClaimUnavailable(
+                f"{expected.name} {expected.value} is held by another claim"
+            )
+    elif request.resource is not None:
+        hold = own.resource
+        if hold is None or hold.name != request.resource:
+            raise ClaimError(
+                f"{_identity_summary(request.identity, request.branch)} requested "
+                f"{request.resource} but derivation produced no hold"
             )
 
     _reconcile_identity(client, request.identity)

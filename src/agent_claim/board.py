@@ -133,7 +133,6 @@ class Board:
     items: tuple[BoardItem, ...]
     ready_now: tuple[BoardItem, ...]
     stale: tuple[BoardItem, ...]
-    trunk_check_breaks: int = 0
 
 
 def load_config(path: Path = CONFIG_PATH) -> BoardConfig:
@@ -366,7 +365,6 @@ def build_board(
     *,
     now: datetime | None = None,
     trunk_landings: tuple[datetime, ...] = (),
-    trunk_check_breaks: int = 0,
 ) -> Board:
     observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     issue_numbers = frozenset(issue.number for issue in issues)
@@ -468,7 +466,6 @@ def build_board(
             for item in ordered
             if item.idle_days > 7 and item.stage is Stage.TEXT_ONLY
         ),
-        trunk_check_breaks=trunk_check_breaks,
     )
 
 
@@ -525,10 +522,7 @@ def render(board: Board) -> str:
     )
     ready = ", ".join(f"#{item.number}" for item in board.ready_now) or "none"
     stale = ", ".join(f"#{item.number}" for item in board.stale) or "none"
-    return (
-        f"{table}\n\nREADY NOW\n{ready}\n\nSTALE\n{stale}\n\n"
-        f"TRUNK-PULL BREAKS\n{board.trunk_check_breaks}"
-    )
+    return f"{table}\n\nREADY NOW\n{ready}\n\nSTALE\n{stale}"
 
 
 def _contract_summary(contract: Contract) -> str:

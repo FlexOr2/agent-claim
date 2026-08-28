@@ -25,7 +25,7 @@ from .protocol import (
     _projection_marker,
     _validated_comment,
     claim_label,
-    is_ledger_event_candidate,
+    is_protocol_candidate,
 )
 
 TIMESTAMP_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
@@ -224,7 +224,7 @@ class GitHubIssueComments:
             page_comments = self._comment_page(issue, page)
             total_comments += len(page_comments)
             for parsed in page_comments:
-                if not is_ledger_event_candidate(parsed):
+                if not is_protocol_candidate(parsed):
                     continue
                 protocol_bytes += len(parsed.body.encode("utf-8"))
                 if (

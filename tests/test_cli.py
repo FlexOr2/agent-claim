@@ -267,7 +267,7 @@ class FakeComments:
         return tuple(
             entry
             for entry in self.comments.get(issue, [])
-            if protocol.is_ledger_event_candidate(entry)
+            if protocol.is_protocol_candidate(entry)
         )
 
     def post_comment(self, issue: int, body: str) -> str:
@@ -3982,7 +3982,7 @@ def _git_checkout(
         ("rev-parse", "--git-common-dir"): common_directory,
         ("status", "--porcelain"): dirty,
         ("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"): "refs/remotes/origin/main",
-        ("log", "--reverse", "--format=%cI", "refs/remotes/origin/main"): "",
+        ("log", "--first-parent", "--reverse", "--format=%cI", "refs/remotes/origin/main"): "",
     }
 
 
@@ -4991,7 +4991,7 @@ def test_cli_status_empty_ledger_prints_ledger_then_unclaimed_repository(
 
     assert issue_claim.main(["--repo", "example/agent-claim", "status"]) == 0
     assert capsys.readouterr().out == (
-        f"LEDGER #{LEDGER_ISSUE}\ntrunk-pull breaks: 0\nUNCLAIMED repository\n"
+        f"LEDGER #{LEDGER_ISSUE}\nUNCLAIMED repository\n"
     )
 
 
@@ -5003,7 +5003,7 @@ def test_cli_status_issue_with_no_claim_prints_ledger_then_unclaimed_issue(
 
     assert issue_claim.main(["--repo", "example/agent-claim", "status", "72"]) == 0
     assert capsys.readouterr().out == (
-        f"LEDGER #{LEDGER_ISSUE}\ntrunk-pull breaks: 0\nUNCLAIMED issue #72\n"
+        f"LEDGER #{LEDGER_ISSUE}\nUNCLAIMED issue #72\n"
     )
 
 
@@ -5044,7 +5044,6 @@ def test_cli_status_after_claim_prints_ledger_then_claimed(
     assert status == 0
     assert capsys.readouterr().out == (
         f"LEDGER #{LEDGER_ISSUE}\n"
-        "trunk-pull breaks: 0\n"
         f"CLAIMED issue #72: Codex Sol (builder) base={BASE} "
         "branch=codex/issue-72 claim=cli-claim 0h 0m\n"
         "  src\n"
@@ -5090,7 +5089,6 @@ def test_cli_lane_claim_status_and_release_round_trip_without_issue_number(
     assert issue_claim.main(["--repo", "example/agent-claim", "status"]) == 0
     assert capsys.readouterr().out == (
         f"LEDGER #{LEDGER_ISSUE}\n"
-        "trunk-pull breaks: 0\n"
         f"CLAIMED lane docs/lane-cleanup: Codex Sol (builder) base={BASE} "
         "branch=docs/lane-cleanup claim=cli-lane-claim 0h 0m\n"
         "  docs\n"
@@ -5164,7 +5162,6 @@ def test_cli_status_overlapping_protocol_comments_print_ledger_then_notes(
     assert status == 0
     assert capsys.readouterr().out == (
         f"LEDGER #{LEDGER_ISSUE}\n"
-        "trunk-pull breaks: 0\n"
         f"CLAIMED issue #72: Codex Sol (builder) base={BASE} "
         "branch=codex/issue-72-claims claim=claim-a 0h 0m\n"
         "  shared\n"
@@ -5209,7 +5206,6 @@ def test_cli_status_json_empty_ledger_prints_unclaimed_object(
             "ledger": LEDGER_ISSUE,
             "issue": None,
             "state": "UNCLAIMED",
-            "trunk_check_breaks": 0,
             "claims": [],
         }
     ) + "\n"
@@ -5229,7 +5225,6 @@ def test_cli_status_json_issue_with_no_claim_prints_unclaimed_object(
             "ledger": LEDGER_ISSUE,
             "issue": 72,
             "state": "UNCLAIMED",
-            "trunk_check_breaks": 0,
             "claims": [],
         }
     ) + "\n"
@@ -5277,7 +5272,6 @@ def test_cli_status_json_after_claim_prints_claimed_object(
             "ledger": LEDGER_ISSUE,
             "issue": 72,
             "state": "CLAIMED",
-            "trunk_check_breaks": 0,
             "claims": [
                 {
                     "issue": 72,
@@ -5326,7 +5320,6 @@ def test_cli_status_json_overlapping_protocol_comments_print_claimed_object(
             "ledger": LEDGER_ISSUE,
             "issue": None,
             "state": "CLAIMED",
-            "trunk_check_breaks": 0,
             "claims": [
                 {
                     "issue": 72,
@@ -5407,7 +5400,6 @@ def test_cli_status_json_issue_on_overlap_prints_related_claimed_object(
             "ledger": LEDGER_ISSUE,
             "issue": 72,
             "state": "CLAIMED",
-            "trunk_check_breaks": 0,
             "claims": [
                 {
                     "issue": 72,
@@ -7464,7 +7456,32 @@ def test_resource_allocates_unique_values_in_sequence() -> None:
 
     assert first.resource == protocol.ResourceHold("schema-hop", 1)
     assert second.resource == protocol.ResourceHold("schema-hop", 2)
-    assert "Resource: `schema-hop` = 1" in client.comments[LEDGER_ISSUE][0].body
+    first_body = client.comments[LEDGER_ISSUE][0].body
+    assert "- Resource: `schema-hop`" in first_body
+    assert "`schema-hop` =" not in first_body
+    assert "resource_value" not in _marker_payload_keys(first_body)
+
+
+def test_auto_resource_after_live_explicit_two_holds_one_not_none() -> None:
+    client = FakeComments()
+    explicit = acquire_claim(
+        client,
+        request(issue=72, scope=("src/a.py",), resource="schema-hop", resource_value=2),
+    )
+    auto = acquire_claim(
+        client,
+        request("claim-b", "Grok 4.6", issue=73, scope=("src/b.py",), resource="schema-hop"),
+    )
+
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    holds = {claim.resource for claim in standing}
+    assert explicit.resource == protocol.ResourceHold("schema-hop", 2)
+    assert auto.resource == protocol.ResourceHold("schema-hop", 1)
+    assert None not in holds
+    assert holds == {
+        protocol.ResourceHold("schema-hop", 1),
+        protocol.ResourceHold("schema-hop", 2),
+    }
 
 
 def test_resource_refuses_a_second_live_hold_of_the_same_value() -> None:
@@ -7503,7 +7520,37 @@ def test_releasing_a_resource_drops_the_hold_and_keeps_later_values_unique() -> 
     assert [claim.resource for claim in standing] == [protocol.ResourceHold("schema-hop", 2)]
 
 
-def test_resource_race_loses_to_the_named_holder() -> None:
+def test_resource_race_later_auto_succeeds_with_the_next_value() -> None:
+    client = FakeComments()
+    earlier = comment(
+        100,
+        claim_comment(
+            request(
+                "earlier",
+                "Grok 4.6",
+                issue=72,
+                scope=("src/a.py",),
+                resource="schema-hop",
+                resource_value=1,
+            )
+        ),
+        created_at="2026-08-20T23:59:59Z",
+    )
+    client.inject_after_next_ledger_post = earlier
+
+    later = acquire_claim(
+        client,
+        request("later", "Codex Sol", issue=73, scope=("src/b.py",), resource="schema-hop"),
+    )
+
+    standing = active_claims(tuple(client.comments[LEDGER_ISSUE]))
+    by_id = {claim.claim_id: claim for claim in standing}
+    assert later.resource == protocol.ResourceHold("schema-hop", 2)
+    assert by_id["earlier"].resource == protocol.ResourceHold("schema-hop", 1)
+    assert by_id["later"].resource == protocol.ResourceHold("schema-hop", 2)
+
+
+def test_resource_race_explicit_value_still_fails_closed() -> None:
     client = FakeComments()
     earlier = comment(
         100,
@@ -7524,12 +7571,97 @@ def test_resource_race_loses_to_the_named_holder() -> None:
     with pytest.raises(ClaimUnavailable, match="schema-hop 1 is held by Grok 4.6"):
         acquire_claim(
             client,
-            request("later", "Codex Sol", issue=73, scope=("src/b.py",), resource="schema-hop"),
+            request(
+                "later",
+                "Codex Sol",
+                issue=73,
+                scope=("src/b.py",),
+                resource="schema-hop",
+                resource_value=1,
+            ),
         )
 
+
+def test_two_intents_for_the_same_value_leave_exactly_one_holder() -> None:
+    client = FakeComments(
+        {
+            LEDGER_ISSUE: [
+                comment(
+                    1,
+                    claim_comment(
+                        request(
+                            issue=72,
+                            scope=("src/a.py",),
+                            resource="schema-hop",
+                            resource_value=1,
+                        )
+                    ),
+                ),
+                comment(
+                    2,
+                    claim_comment(
+                        request(
+                            "claim-b",
+                            "Grok 4.6",
+                            issue=73,
+                            scope=("src/b.py",),
+                            resource="schema-hop",
+                            resource_value=1,
+                        )
+                    ),
+                ),
+            ]
+        }
+    )
+
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    holds = [claim.resource for claim in standing if claim.resource is not None]
+    assert holds == [protocol.ResourceHold("schema-hop", 1)]
+    assert {claim.claim_id for claim in standing} == {"claim-a", "claim-b"}
+
+
+def test_resource_loser_that_dies_before_retry_is_not_a_holder() -> None:
+    client = FakeComments(
+        {
+            LEDGER_ISSUE: [
+                comment(
+                    1,
+                    claim_comment(
+                        request(
+                            "first",
+                            issue=72,
+                            scope=("src/a.py",),
+                            resource="schema-hop",
+                            resource_value=1,
+                        )
+                    ),
+                ),
+                comment(
+                    2,
+                    claim_comment(
+                        request(
+                            "loser",
+                            "Grok 4.6",
+                            issue=73,
+                            scope=("src/b.py",),
+                            resource="schema-hop",
+                            resource_value=1,
+                        )
+                    ),
+                ),
+            ]
+        }
+    )
+
     standing = active_claims(tuple(client.comments[LEDGER_ISSUE]))
-    assert [claim.claim_id for claim in standing] == ["earlier"]
-    assert standing[0].resource == protocol.ResourceHold("schema-hop", 1)
+    holders = [
+        claim
+        for claim in standing
+        if claim.resource == protocol.ResourceHold("schema-hop", 1)
+    ]
+    assert [claim.claim_id for claim in holders] == ["first"]
+    assert {claim.claim_id for claim in standing} == {"first", "loser"}
+    assert all("## RELEASE" not in entry.body for entry in client.comments[LEDGER_ISSUE])
 
 
 def test_cli_claim_resource_prints_the_allocated_value(
@@ -7569,7 +7701,271 @@ def test_cli_claim_resource_prints_the_allocated_value(
     assert payload["resource_value"] == 1
     posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])
     assert isinstance(posted, ActiveClaim)
-    assert posted.resource == protocol.ResourceHold("schema-hop", 1)
+    assert posted.resource is None
+    assert posted.requested_resource == "schema-hop"
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert [claim.resource for claim in standing] == [protocol.ResourceHold("schema-hop", 1)]
+
+
+
+def test_cli_two_claims_of_the_same_directory_are_advisory(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    client = FakeComments()
+    _patch_status_cli(monkeypatch, client)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(
+        checkout,
+        "_scope_directories",
+        lambda paths: tuple(path for path in paths if path == "src"),
+    )
+
+    first = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "src",
+            "--claim-id",
+            "dir-a",
+            "--allow-directory",
+            "shared directory",
+        ]
+    )
+    capsys.readouterr()
+    second = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "73",
+            "--agent",
+            "Grok 4.6",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-73",
+            "--scope",
+            "src",
+            "--claim-id",
+            "dir-b",
+            "--allow-directory",
+            "shared directory",
+        ]
+    )
+    claimed = capsys.readouterr().out
+
+    assert first == 0
+    assert second == 0
+    assert "CONFLICT" not in claimed
+    assert "overlaps issue #72 (dir-a)" in claimed
+
+    status = issue_claim.main(["--repo", "example/agent-claim", "status"])
+    rendered = capsys.readouterr().out
+    assert status == 0
+    assert "CONFLICT" not in rendered
+    assert "CLAIMED issue #72" in rendered
+    assert "CLAIMED issue #73" in rendered
+    assert "overlaps issue #73 (dir-b)" in rendered
+    assert "overlaps issue #72 (dir-a)" in rendered
+
+    who = issue_claim.main(["--repo", "example/agent-claim", "who", "src"])
+    holders = capsys.readouterr().out
+    assert who == 0
+    assert "CONFLICT" not in holders
+    assert "CLAIMED src issue #72" in holders
+    assert "CLAIMED src issue #73" in holders
+    assert "overlap: issue #72 (dir-a), issue #73 (dir-b)" in holders
+
+
+def test_cli_two_claims_of_the_same_file_are_advisory(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    client = FakeComments()
+    _patch_status_cli(monkeypatch, client)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+
+    first = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "src/widget.py",
+            "--claim-id",
+            "file-a",
+        ]
+    )
+    capsys.readouterr()
+    second = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "73",
+            "--agent",
+            "Grok 4.6",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-73",
+            "--scope",
+            "src/widget.py",
+            "--claim-id",
+            "file-b",
+        ]
+    )
+    claimed = capsys.readouterr().out
+
+    assert first == 0
+    assert second == 0
+    assert "CONFLICT" not in claimed
+    assert "overlaps issue #72 (file-a)" in claimed
+
+    status = issue_claim.main(["--repo", "example/agent-claim", "status"])
+    rendered = capsys.readouterr().out
+    assert status == 0
+    assert "CONFLICT" not in rendered
+    assert "CLAIMED issue #72" in rendered
+    assert "CLAIMED issue #73" in rendered
+
+    who = issue_claim.main(["--repo", "example/agent-claim", "who", "src/widget.py"])
+    holders = capsys.readouterr().out
+    assert who == 0
+    assert "CONFLICT" not in holders
+    assert "CLAIMED src/widget.py issue #72" in holders
+    assert "CLAIMED src/widget.py issue #73" in holders
+    assert "overlap: issue #72 (file-a), issue #73 (file-b)" in holders
+
+
+def test_cli_two_resource_claims_allocate_one_then_two(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    client = FakeComments()
+    _patch_status_cli(monkeypatch, client)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+
+    first = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "src/a.py",
+            "--resource",
+            "schema-hop",
+            "--claim-id",
+            "hop-1",
+            "--json",
+        ]
+    )
+    first_payload = json.loads(capsys.readouterr().out)
+    second = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "73",
+            "--agent",
+            "Grok 4.6",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-73",
+            "--scope",
+            "src/b.py",
+            "--resource",
+            "schema-hop",
+            "--claim-id",
+            "hop-2",
+            "--json",
+        ]
+    )
+    second_payload = json.loads(capsys.readouterr().out)
+
+    assert first == 0
+    assert second == 0
+    assert first_payload["resource_value"] == 1
+    assert second_payload["resource_value"] == 2
+
+
+def test_cli_resource_race_still_yields_unique_live_holds(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    client = FakeComments()
+    _patch_status_cli(monkeypatch, client)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+    client.inject_after_next_ledger_post = comment(
+        100,
+        claim_comment(
+            request(
+                "earlier",
+                "Grok 4.6",
+                issue=72,
+                scope=("src/a.py",),
+                resource="schema-hop",
+            )
+        ),
+        created_at="2026-08-20T23:59:59Z",
+    )
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "73",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-73",
+            "--scope",
+            "src/b.py",
+            "--resource",
+            "schema-hop",
+            "--claim-id",
+            "later",
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    holds = sorted(
+        claim.resource.value
+        for claim in standing
+        if claim.resource is not None and claim.resource.name == "schema-hop"
+    )
+
+    assert status == 0
+    assert payload["resource_value"] == 2
+    assert holds == [1, 2]
 
 
 def test_who_lists_every_holder_without_calling_overlap_an_error(
@@ -7825,23 +8221,6 @@ def test_each_item_carries_its_own_ruling_age() -> None:
     assert by_number[11].ruling_landings == 12
 
 
-def test_broke_appends_a_ledger_record_and_status_counts_it(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    client = FakeComments()
-    _patch_status_cli(monkeypatch, client)
-    _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Ada"})
-
-    assert issue_claim.main(["--repo", "example/agent-claim", "broke"]) == 0
-    assert capsys.readouterr().out == "TRUNK-PULL BREAKS 1\n"
-    assert issue_claim.main(["--repo", "example/agent-claim", "broke"]) == 0
-    capsys.readouterr()
-
-    assert issue_claim.main(["--repo", "example/agent-claim", "status", "--json"]) == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["trunk_check_breaks"] == 2
-
-
 def test_identity_conflict_still_marks_status_conflict(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -7870,8 +8249,8 @@ def test_trunk_landing_times_read_the_default_branch_not_the_work_branch(
         observed.append(arguments)
         if arguments[:3] == ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]:
             return "refs/remotes/origin/main"
-        if arguments[:3] == ["log", "--reverse", "--format=%cI"]:
-            assert arguments[3] == "refs/remotes/origin/main"
+        if arguments[:4] == ["log", "--first-parent", "--reverse", "--format=%cI"]:
+            assert arguments[4] == "refs/remotes/origin/main"
             return "2026-08-29T00:00:00+00:00\n2026-08-30T00:00:00Z"
         raise AssertionError(arguments)
 
@@ -7882,7 +8261,51 @@ def test_trunk_landing_times_read_the_default_branch_not_the_work_branch(
         datetime(2026, 8, 29, tzinfo=timezone.utc),
         datetime(2026, 8, 30, tzinfo=timezone.utc),
     )
-    assert ["log", "--reverse", "--format=%cI", "refs/remotes/origin/main"] in observed
+    assert [
+        "log",
+        "--first-parent",
+        "--reverse",
+        "--format=%cI",
+        "refs/remotes/origin/main",
+    ] in observed
+
+
+
+def test_trunk_landing_times_count_a_five_commit_merge_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    git("init", "-b", "main")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.com")
+    git("config", "commit.gpgsign", "false")
+    (repo / "file.txt").write_text("0\n")
+    git("add", "file.txt")
+    git("commit", "-m", "initial")
+    git("checkout", "-b", "feature")
+    for index in range(1, 6):
+        (repo / "file.txt").write_text(f"{index}\n")
+        git("add", "file.txt")
+        git("commit", "-m", f"commit-{index}")
+    git("checkout", "main")
+    git("merge", "--no-ff", "-m", "merge feature", "feature")
+    git("checkout", "-b", "work")
+    monkeypatch.chdir(repo)
+
+    unrestricted = git("log", "--reverse", "--format=%cI").stdout.splitlines()
+    assert len(unrestricted) == 7
+    assert len(checkout.trunk_landing_times()) == 2
 
 
 def test_no_path_class_list_is_read_or_written() -> None:

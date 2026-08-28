@@ -180,13 +180,12 @@ def _trunk_ref() -> str:
 
 
 def trunk_landing_times() -> tuple[datetime, ...]:
-    """Committer times of landings on the default branch, oldest first.
+    """Committer times of first-parent landings on the default branch, oldest first.
 
-    The number of landings since a ruling date is this sequence filtered by
-    committer time. Using the default branch — never the work branch — is the
+    A merge counts once. Using the default branch — never the work branch — is the
     contract: a ruling ages with trunk, not with local commits.
     """
-    raw = _git_output(["log", "--reverse", "--format=%cI", _trunk_ref()])
+    raw = _git_output(["log", "--first-parent", "--reverse", "--format=%cI", _trunk_ref()])
     if not raw:
         return ()
     times: list[datetime] = []

@@ -361,12 +361,6 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser(
         "protect", help="deny PreToolUse writes without this session's live claim"
     )
-    broke = commands.add_parser(
-        "broke", help="record that pulling trunk broke the checks"
-    )
-    broke.add_argument("--agent")
-    broke.add_argument("--role", default=DEFAULT_CLAIM_ROLE)
-    broke.add_argument("--json", action="store_true")
     return parser
 
 
@@ -471,8 +465,6 @@ def _status_json(
     issue: int | None,
     ledger: int,
     now: datetime | None = None,
-    *,
-    trunk_check_breaks: int = 0,
 ) -> int:
     observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     related, index = _status_claims(claims, issue)
@@ -487,7 +479,6 @@ def _status_json(
         "ledger": ledger,
         "issue": issue,
         "state": state,
-        "trunk_check_breaks": trunk_check_breaks,
         "claims": [
             {
                 **_identity_json(claim.identity),
@@ -628,8 +619,6 @@ def _release_json(
 def _board(
     client: github.GitHubIssueComments,
     claims: tuple[protocol.ActiveClaim, ...],
-    *,
-    trunk_check_breaks: int = 0,
 ) -> board.Board:
     now = datetime.now(timezone.utc)
     toplevel = Path(checkout._git_output(["rev-parse", "--show-toplevel"]))
@@ -641,7 +630,6 @@ def _board(
         board.load_config(toplevel / ".agent-claim" / "board.toml"),
         now=now,
         trunk_landings=checkout.trunk_landing_times(),
-        trunk_check_breaks=trunk_check_breaks,
     )
 
 
@@ -826,7 +814,7 @@ def main(arguments: list[str] | None = None) -> int:
     if parsed.command == "protect":
         return _protect(parsed.repo)
     try:
-        if parsed.command in {"claim", "release", "rescope", "broke"}:
+        if parsed.command in {"claim", "release", "rescope"}:
             parsed.agent = checkout._resolved_agent(parsed.agent)
         release_branch: str | None = None
         if parsed.command == "release":
@@ -860,31 +848,19 @@ def main(arguments: list[str] | None = None) -> int:
         if parsed.command == "status":
             comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
             claims = protocol.active_claims(comments)
-            breaks = protocol.trunk_check_breaks(comments)
             now = datetime.now(timezone.utc)
             if parsed.json:
-                return _status_json(
-                    claims, parsed.issue, ledger, now=now, trunk_check_breaks=breaks
-                )
+                return _status_json(claims, parsed.issue, ledger, now=now)
             print(f"LEDGER #{ledger}")
-            print(f"trunk-pull breaks: {breaks}")
             return _status(claims, parsed.issue, now=now)
         if parsed.command == "board":
             comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
-            projected = _board(
-                client,
-                protocol.active_claims(comments),
-                trunk_check_breaks=protocol.trunk_check_breaks(comments),
-            )
+            projected = _board(client, protocol.active_claims(comments))
             print(board.board_json(projected) if parsed.json else board.render(projected))
             return 0
         if parsed.command == "next":
             comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
-            projected = _board(
-                client,
-                protocol.active_claims(comments),
-                trunk_check_breaks=protocol.trunk_check_breaks(comments),
-            )
+            projected = _board(client, protocol.active_claims(comments))
             item = board.highest_scored_actionable(projected)
             skipped = _proposed_expectations(projected)
             if item is None:
@@ -895,13 +871,6 @@ def main(arguments: list[str] | None = None) -> int:
                         _next(None, skipped)
                 return 3
             return _next_json(item, skipped) if parsed.json else _next(item, skipped)
-        if parsed.command == "broke":
-            count = protocol.record_trunk_break(client, parsed.agent, parsed.role)
-            if parsed.json:
-                print(json.dumps({"trunk_check_breaks": count}))
-            else:
-                print(f"TRUNK-PULL BREAKS {count}")
-            return 0
         if parsed.command == "who":
             claims = protocol._ledger_claims(client)
             if parsed.json:
