@@ -6,7 +6,7 @@ import json
 import re
 import tomllib
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
 
@@ -23,8 +23,14 @@ CONTRACT_FIELD_PATTERN = re.compile(
 )
 MARKDOWN_HEADING_PATTERN = re.compile(r"(?m)^#{1,6} .*$")
 EXPECTATION_HEADING_PATTERN = re.compile(
-    r"(?im)^#{1,6}[ \t]+(?:Erwartung|Erwartungen|Erwartungsliste)[ \t]*$"
+    r"(?im)^#{1,6}[ \t]+(?:Erwartung|Erwartungen|Erwartungsliste)\b[^\n]*$"
 )
+DOTTED_DATE_PATTERN = re.compile(r"\b([0-3]?\d)\.([01]?\d)\.(20\d{2})\b")
+OPERATOR_RULING_DATE_PATTERN = re.compile(
+    r"GEREGELT:[ \t]*Operator[ \t]*([0-3]?\d)\.([01]?\d)\.(20\d{2})",
+    re.IGNORECASE,
+)
+RULING_OLD_AFTER_LANDINGS = 10
 PROPOSED_EXPECTATION_PATTERN = re.compile(
     r"\*\(Default:[ \t]*(?:yes|no|later)\)\*", re.IGNORECASE
 )
@@ -106,6 +112,8 @@ class BoardItem:
     contract: Contract
     contract_complete: bool
     expectation_state: ExpectationState
+    ruling_landings: int | None
+    ruling_old: bool | None
     open_blockers: tuple[int, ...]
     stage: Stage
     age_days: int
@@ -177,13 +185,17 @@ def parse_contract(body: str) -> Contract:
     )
 
 
+def expectation_heading(body: str) -> re.Match[str] | None:
+    return EXPECTATION_HEADING_PATTERN.search(body)
+
+
 def expectation_state(body: str) -> ExpectationState:
-    expectation_heading = EXPECTATION_HEADING_PATTERN.search(body)
-    if expectation_heading is None:
+    heading = expectation_heading(body)
+    if heading is None:
         return ExpectationState.NONE
-    next_heading = MARKDOWN_HEADING_PATTERN.search(body, expectation_heading.end())
+    next_heading = MARKDOWN_HEADING_PATTERN.search(body, heading.end())
     expectation_block = body[
-        expectation_heading.end() : next_heading.start() if next_heading is not None else len(body)
+        heading.end() : next_heading.start() if next_heading is not None else len(body)
     ]
     expectation_lines = tuple(
         line.strip() for line in expectation_block.splitlines() if line.strip()
@@ -195,6 +207,50 @@ def expectation_state(body: str) -> ExpectationState:
     ):
         return ExpectationState.PROPOSED
     return ExpectationState.RULED
+
+
+def _parse_dotted_date(day: str, month: str, year: str) -> date:
+    try:
+        return date(int(year), int(month), int(day))
+    except ValueError as error:
+        raise protocol.ClaimError(
+            f"expectation heading has an invalid date {day}.{month}.{year}"
+        ) from error
+
+
+def parse_ruling_date(body: str) -> date:
+    heading = expectation_heading(body)
+    if heading is None:
+        raise protocol.ClaimError("ruled expectations have no readable date")
+    line = heading.group(0)
+    operator = OPERATOR_RULING_DATE_PATTERN.search(line)
+    if operator is not None:
+        return _parse_dotted_date(*operator.groups())
+    dates = {
+        _parse_dotted_date(day, month, year)
+        for day, month, year in DOTTED_DATE_PATTERN.findall(line)
+    }
+    if len(dates) == 1:
+        return next(iter(dates))
+    if not dates:
+        raise protocol.ClaimError("ruled expectations have no readable date")
+    raise protocol.ClaimError("ruled expectations have more than one date")
+
+
+def landings_since(trunk_landings: tuple[datetime, ...], ruling: date) -> int:
+    start = datetime(ruling.year, ruling.month, ruling.day, tzinfo=timezone.utc) + timedelta(
+        days=1
+    )
+    return sum(1 for moment in trunk_landings if moment >= start)
+
+
+def ruling_freshness(
+    body: str, trunk_landings: tuple[datetime, ...]
+) -> tuple[int | None, bool | None]:
+    if expectation_state(body) is not ExpectationState.RULED:
+        return None, None
+    count = landings_since(trunk_landings, parse_ruling_date(body))
+    return count, count >= RULING_OLD_AFTER_LANDINGS
 
 
 def _references(text: str | None) -> frozenset[int]:
@@ -308,6 +364,7 @@ def build_board(
     config: BoardConfig,
     *,
     now: datetime | None = None,
+    trunk_landings: tuple[datetime, ...] = (),
 ) -> Board:
     observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     issue_numbers = frozenset(issue.number for issue in issues)
@@ -332,6 +389,7 @@ def build_board(
     for issue in issues:
         contract = contracts[issue.number]
         expectations = expectation_state(issue.body)
+        ruling_landings, ruling_old = ruling_freshness(issue.body, trunk_landings)
         claim = claims_by_issue.get(issue.number)
         in_flight = issue.number in in_flight_references or (
             claim is not None and claim.branch in open_branches
@@ -377,6 +435,8 @@ def build_board(
                 contract=contract,
                 contract_complete=contract.complete,
                 expectation_state=expectations,
+                ruling_landings=ruling_landings,
+                ruling_old=ruling_old,
                 open_blockers=blockers[issue.number],
                 stage=stage,
                 age_days=age_days,
@@ -442,7 +502,7 @@ def render(board: Board) -> str:
                 item.priority_bucket,
                 item.stage.value,
                 _contract_summary(item.contract),
-                item.expectation_state.value,
+                _expectation_cell(item),
                 _brief(item.contract.next),
                 str(item.age_days),
                 str(item.idle_days),
@@ -495,6 +555,16 @@ def _actionable_reason(
     if not contract_complete:
         return "body incomplete"
     return None
+
+
+def _expectation_cell(item: BoardItem) -> str:
+    if item.expectation_state is ExpectationState.NONE:
+        return "-"
+    if item.expectation_state is ExpectationState.PROPOSED:
+        return item.expectation_state.value
+    count = 0 if item.ruling_landings is None else item.ruling_landings
+    suffix = " old" if item.ruling_old else ""
+    return f"ruled {count}{suffix}"
 
 
 def _claim_cell(item: BoardItem) -> str:
