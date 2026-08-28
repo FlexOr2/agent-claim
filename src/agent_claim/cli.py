@@ -471,9 +471,15 @@ def _board(
     )
 
 
-def _next_json(item: board.BoardItem) -> int:
-    print(
-        json.dumps(
+def _next_json(item: board.BoardItem | None, skipped: tuple[board.BoardItem, ...]) -> int:
+    payload: dict[str, object] = {
+        "skipped": [
+            {"number": skipped_item.number, "reason": skipped_item.actionable_reason}
+            for skipped_item in skipped
+        ]
+    }
+    if item is not None:
+        payload.update(
             {
                 "number": item.number,
                 "score": item.score,
@@ -481,13 +487,32 @@ def _next_json(item: board.BoardItem) -> int:
                 "next": item.contract.next,
             }
         )
+    print(json.dumps(payload))
+    return 0
+
+
+def _next(item: board.BoardItem | None, skipped: tuple[board.BoardItem, ...]) -> int:
+    lines = (
+        [f"#{item.number} score {item.score}: {item.title}", f"Next: {item.contract.next}"]
+        if item is not None
+        else ["No actionable item."]
     )
+    if skipped:
+        skipped_lines = (
+            f"#{skipped_item.number}: {skipped_item.actionable_reason}"
+            for skipped_item in skipped
+        )
+        lines.extend(("", "SKIPPED", *skipped_lines))
+    print("\n".join(lines))
     return 0
 
 
-def _next(item: board.BoardItem) -> int:
-    print(f"#{item.number} score {item.score}: {item.title}\nNext: {item.contract.next}")
-    return 0
+def _proposed_expectations(projected: board.Board) -> tuple[board.BoardItem, ...]:
+    return tuple(
+        item
+        for item in projected.items
+        if item.expectation_state is board.ExpectationState.PROPOSED
+    )
 
 
 def _out_of_order_warning(
@@ -654,9 +679,15 @@ def main(arguments: list[str] | None = None) -> int:
         if parsed.command == "next":
             projected = _board(client, protocol._ledger_claims(client))
             item = board.highest_scored_actionable(projected)
+            skipped = _proposed_expectations(projected)
             if item is None:
+                if skipped:
+                    if parsed.json:
+                        _next_json(None, skipped)
+                    else:
+                        _next(None, skipped)
                 return 3
-            return _next_json(item) if parsed.json else _next(item)
+            return _next_json(item, skipped) if parsed.json else _next(item, skipped)
         if parsed.command == "who":
             claims = protocol._ledger_claims(client)
             if parsed.json:

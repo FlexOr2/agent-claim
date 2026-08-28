@@ -558,6 +558,55 @@ def test_board_projects_fixture_json_without_github_writes(
     assert 11 not in [item["number"] for item in payload["ready_now"]]
 
 
+def test_board_exposes_all_expectation_states(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    issues = (
+        board_issue(10, "No expectations", complete_contract("Claim #10.")),
+        board_issue(
+            11,
+            "Proposed expectations",
+            complete_contract("Claim #11.")
+            + "\n\n"
+            + expectation_block("- Name it. *(Default: no)*"),
+        ),
+        board_issue(
+            12,
+            "Ruled expectations",
+            complete_contract("Claim #12.")
+            + "\n\n"
+            + expectation_block("- Name it. *(geregelt: ja)*"),
+        ),
+    )
+    client = _claims_client()
+    monkeypatch.setattr(client, "list_open_board_issues", lambda: issues)
+    monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
+    monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "board"]) == 0
+    rendered = capsys.readouterr().out
+    assert "EXPECT" in rendered
+    assert "-         Claim #10." in next(
+        line for line in rendered.splitlines() if "No expectations" in line
+    )
+    assert "proposed  Claim #11." in next(
+        line for line in rendered.splitlines() if "Proposed expectations" in line
+    )
+    assert "ruled     Claim #12." in next(
+        line for line in rendered.splitlines() if "Ruled expectations" in line
+    )
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "board", "--json"]) == 0
+    expectation_states = {
+        item["number"]: item["expectation_state"]
+        for item in json.loads(capsys.readouterr().out)["items"]
+    }
+    assert expectation_states == {10: "-", 11: "proposed", 12: "ruled"}
+
+
 def board_issue(
     number: int,
     title: str,
@@ -582,6 +631,10 @@ def complete_contract(next_step: str, *, blocked_by: str = "") -> str:
         f"## Blocked by\n{blocked_by}\n\n"
         "## Done when\nThe work is merged."
     )
+
+
+def expectation_block(*lines: str, heading: str = "Erwartung") -> str:
+    return f"## {heading}\n" + "\n".join(lines)
 
 
 @pytest.mark.parametrize(
@@ -613,6 +666,7 @@ def complete_contract(next_step: str, *, blocked_by: str = "") -> str:
                 "score": 10,
                 "title": "Top work",
                 "next": "Claim #11.",
+                "skipped": [],
             },
             id="emits_the_highest_scored_actionable_item_as_json",
         ),
@@ -670,6 +724,169 @@ def test_next_reports_the_highest_scored_actionable_item(
         assert rendered == expected_output
     else:
         assert json.loads(rendered) == expected_output
+
+
+@pytest.mark.parametrize(
+    ("expectations", "expected_state", "expected_exit", "expected_output"),
+    [
+        pytest.param(
+            "",
+            board.ExpectationState.NONE,
+            0,
+            "#10 score -10: Work\nNext: Claim #10.\n",
+            id="no_expectation_block_remains_actionable",
+        ),
+        pytest.param(
+            expectation_block("- Name it. *(Default: yes)*"),
+            board.ExpectationState.PROPOSED,
+            3,
+            "No actionable item.\n\nSKIPPED\n#10: Erwartungen ungeregelt\n",
+            id="proposed_expectations_are_skipped",
+        ),
+        pytest.param(
+            expectation_block("- Name it without a ruling."),
+            board.ExpectationState.PROPOSED,
+            3,
+            "No actionable item.\n\nSKIPPED\n#10: Erwartungen ungeregelt\n",
+            id="unmarked_expectations_are_skipped",
+        ),
+        pytest.param(
+            expectation_block("- Name it. *(geregelt: maybe)*"),
+            board.ExpectationState.PROPOSED,
+            3,
+            "No actionable item.\n\nSKIPPED\n#10: Erwartungen ungeregelt\n",
+            id="malformed_expectations_are_skipped",
+        ),
+        pytest.param(
+            expectation_block(
+                "- Name it. *(geregelt: ja)*",
+                "- Remove it. *(geregelt: NEIN, it stays)*",
+            ),
+            board.ExpectationState.RULED,
+            0,
+            "#10 score -10: Work\nNext: Claim #10.\n",
+            id="fully_ruled_expectations_remain_actionable",
+        ),
+        pytest.param(
+            expectation_block(
+                "- Name it. *(geregelt: NEIN, not for this release)*",
+                "- Remove it. *(Default: later)*",
+                heading="Erwartungsliste",
+            ),
+            board.ExpectationState.PROPOSED,
+            3,
+            "No actionable item.\n\nSKIPPED\n#10: Erwartungen ungeregelt\n",
+            id="mixed_expectations_are_skipped",
+        ),
+    ],
+)
+def test_next_reports_expectation_state(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    expectations: str,
+    expected_state: board.ExpectationState,
+    expected_exit: int,
+    expected_output: str,
+) -> None:
+    issue = board_issue(
+        10,
+        "Work",
+        "\n\n".join(part for part in (complete_contract("Claim #10."), expectations) if part),
+    )
+    client = _claims_client()
+    monkeypatch.setattr(client, "list_open_board_issues", lambda: (issue,))
+    monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
+    monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "next"]) == expected_exit
+    assert capsys.readouterr().out == expected_output
+
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+    assert projected.items[0].expectation_state is expected_state
+
+
+def test_next_json_names_skipped_proposed_expectations(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    proposed = board_issue(
+        11,
+        "Needs rulings",
+        complete_contract("Claim #11.")
+        + "\n\n"
+        + expectation_block("- Name it. *(Default: no)*", heading="Erwartungen"),
+    )
+    ruled = board_issue(
+        10,
+        "Ready work",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block("- Name it. *(geregelt: ja)*"),
+    )
+    client = _claims_client()
+    monkeypatch.setattr(client, "list_open_board_issues", lambda: (proposed, ruled))
+    monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
+    monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "next", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "number": 10,
+        "score": -10,
+        "title": "Ready work",
+        "next": "Claim #10.",
+        "skipped": [{"number": 11, "reason": "Erwartungen ungeregelt"}],
+    }
+
+
+def test_claim_does_not_treat_proposed_expectations_as_an_out_of_order_competitor(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    client = _claims_client()
+    proposed = board_issue(
+        11,
+        "Needs rulings",
+        complete_contract("Claim #11.")
+        + "\n\n"
+        + expectation_block("- Name it. *(Default: yes)*"),
+        labels=("security",),
+    )
+    claimed_request = request(issue=10, scope=("src/work.py",))
+    monkeypatch.setattr(
+        client,
+        "list_open_board_issues",
+        lambda: (board_issue(10, "Ready work", complete_contract("Claim #10.")), proposed),
+    )
+    monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
+    monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+    monkeypatch.setattr(issue_claim, "_request", lambda _arguments: claimed_request)
+
+    assert (
+        issue_claim.main(
+            [
+                "--repo",
+                "example/agent-claim",
+                "claim",
+                "10",
+                "--agent",
+                "Codex Sol",
+                "--scope",
+                "src/work.py",
+            ]
+        )
+        == 0
+    )
+    assert "WARNING" not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
