@@ -66,11 +66,45 @@ def _git_output(arguments: list[str]) -> str:
     return result.stdout.strip()
 
 
+def versioned_paths() -> tuple[str, ...]:
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "-z", "--full-name"],
+            check=False,
+            capture_output=True,
+            timeout=GH_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError as error:
+        raise ClaimError("git is required for issue claims") from error
+    except subprocess.TimeoutExpired as error:
+        raise ClaimError("git timed out while validating the build checkout") from error
+    if result.returncode != 0:
+        detail = (
+            result.stderr.decode().strip()
+            or result.stdout.decode().strip()
+            or "unknown git failure"
+        )
+        raise ClaimError(detail)
+    return tuple(
+        dict.fromkeys(path for path in result.stdout.decode().split("\0") if path)
+    )
+
+
+def paths_under_scope(paths: tuple[str, ...], scope: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            path
+            for path in paths
+            if any(path == entry or path.startswith(f"{entry}/") for entry in scope)
+        )
+    )
+
+
 def _scope_directories(paths: tuple[str, ...]) -> tuple[str, ...]:
     """Return the scope entries that name a git tree or on-disk directory.
 
-    A directory scope locks every descendant path. Callers must require an
-    explicit --allow-directory reason before storing one.
+    A directory scope locks every descendant path. Callers must require a cut
+    or an explicit --allow-directory reason before storing one.
     """
     directories: list[str] = []
     toplevel: str | None = None

@@ -5,7 +5,7 @@ import json
 import subprocess
 import sys
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -50,6 +50,8 @@ from agent_claim.cli import (  # noqa: E402
 
 issue_claim.configure_ledger(71)
 LEDGER_ISSUE = 71
+
+_LIVE_VERSIONED_PATHS = checkout.versioned_paths
 
 BASE = "a" * 40
 
@@ -1016,6 +1018,51 @@ def test_board_reports_each_item_actionability_reason(
     item = next(item for item in projected.items if item.number == issue.number)
 
     assert (item.actionable, item.actionable_reason) == expected
+
+
+def test_board_collects_every_open_blocker_from_prose() -> None:
+    blocked = board_issue(
+        10,
+        "Blocked",
+        complete_contract(
+            "Claim #10.",
+            blocked_by="#790 Reparaturrunde (review) und #642 P3",
+        ),
+    )
+    projected = board.build_board(
+        (
+            blocked,
+            board_issue(642, "P3", complete_contract("Claim #642.")),
+            board_issue(790, "Review", complete_contract("Claim #790.")),
+        ),
+        (),
+        (),
+        (),
+        board.BoardConfig(),
+        now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+    )
+    item = next(item for item in projected.items if item.number == 10)
+
+    assert item.open_blockers == (642, 790)
+    assert item.actionable is False
+    assert item.actionable_reason == "blocked by #642, #790"
+
+
+@pytest.mark.parametrize("blocked_by", ["nichts", "none", "None.", "keine", "-"])
+def test_board_treats_nothing_blocker_values_as_unblocked(blocked_by: str) -> None:
+    issue = board_issue(10, "Ready", complete_contract("Claim #10.", blocked_by=blocked_by))
+    projected = board.build_board(
+        (issue,),
+        (),
+        (),
+        (),
+        board.BoardConfig(),
+        now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+    )
+
+    assert projected.items[0].open_blockers == ()
+    assert projected.items[0].actionable is True
+    assert projected.items[0].actionable_reason is None
 
 
 def test_board_parses_the_last_atelier_contract_projection() -> None:
@@ -3798,6 +3845,16 @@ def test_scope_directories_detects_an_untracked_directory(
     assert checkout._scope_directories(("scratch", "file.py")) == ("scratch",)
 
 
+def test_paths_under_scope_matches_prefix_or_exact_entry() -> None:
+    paths = ("LICENSE", "src/a.py", "src/b.py", "docs/a.md")
+
+    assert checkout.paths_under_scope(paths, ("src",)) == ("src/a.py", "src/b.py")
+    assert checkout.paths_under_scope(paths, ("LICENSE",)) == ("LICENSE",)
+    assert checkout.paths_under_scope(paths, ("src/a.py", "docs")) == ("src/a.py", "docs/a.md")
+    assert checkout.paths_under_scope(paths, ("missing",)) == ()
+
+
+
 def test_checkout_validation_binds_clean_head_and_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4729,6 +4786,74 @@ def test_cli_status_claim_release_and_adapter_error_exit_codes(
     assert "ERROR: adapter failed" in capsys.readouterr().err
 
 
+
+class FixedDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 8, 21, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _stub_versioned_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        checkout,
+        "versioned_paths",
+        lambda: (
+            "LICENSE",
+            "README.md",
+            "pyproject.toml",
+            "src/agent_claim/__init__.py",
+        ),
+    )
+
+
+def test_versioned_paths_reads_nul_terminated_ls_files_without_stripping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[list[str]] = []
+
+    def run(arguments, **kwargs):
+        observed.append(arguments)
+        return subprocess.CompletedProcess(
+            arguments, 0, stdout=b" foo.py\0bar.py\0 foo.py\0", stderr=b""
+        )
+
+    monkeypatch.setattr(checkout.subprocess, "run", run)
+
+    assert _LIVE_VERSIONED_PATHS() == (" foo.py", "bar.py")
+    assert observed == [["git", "ls-files", "-z", "--full-name"]]
+
+
+def test_versioned_paths_fails_loud_like_git_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    def missing(*_arguments, **_kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(checkout.subprocess, "run", missing)
+    with pytest.raises(ClaimError, match="git is required for issue claims"):
+        _LIVE_VERSIONED_PATHS()
+
+    def timed_out(*_arguments, **_kwargs):
+        raise subprocess.TimeoutExpired(["git"], checkout.GH_TIMEOUT_SECONDS)
+
+    monkeypatch.setattr(checkout.subprocess, "run", timed_out)
+    with pytest.raises(ClaimError, match="git timed out while validating the build checkout"):
+        _LIVE_VERSIONED_PATHS()
+
+    def failed(arguments, **_kwargs):
+        return subprocess.CompletedProcess(
+            arguments, 128, stdout=b"", stderr=b"fatal: not a git repository\n"
+        )
+
+    monkeypatch.setattr(checkout.subprocess, "run", failed)
+    with pytest.raises(ClaimError, match="fatal: not a git repository"):
+        _LIVE_VERSIONED_PATHS()
+
+
+@pytest.fixture(autouse=True)
+def _freeze_cli_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(issue_claim, "datetime", FixedDateTime)
+
+
 def _patch_status_cli(
     monkeypatch: pytest.MonkeyPatch,
     client: FakeComments,
@@ -4737,6 +4862,17 @@ def _patch_status_cli(
 ) -> None:
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: ledger)
+    monkeypatch.setattr(
+        checkout,
+        "versioned_paths",
+        lambda: (
+            "LICENSE",
+            "README.md",
+            "pyproject.toml",
+            "src/agent_claim/__init__.py",
+        ),
+    )
+    monkeypatch.setattr(issue_claim, "datetime", FixedDateTime)
 
 
 def test_cli_reconcile_repairs_a_poisoned_ledger_and_status_reads_it_afterwards(
@@ -4868,7 +5004,7 @@ def test_cli_status_after_claim_prints_ledger_then_claimed(
     assert capsys.readouterr().out == (
         f"LEDGER #{LEDGER_ISSUE}\n"
         f"CLAIMED issue #72: Codex Sol (builder) base={BASE} "
-        "branch=codex/issue-72 claim=cli-claim\n"
+        "branch=codex/issue-72 claim=cli-claim 0h 0m\n"
         "  src\n"
     )
 
@@ -4913,7 +5049,7 @@ def test_cli_lane_claim_status_and_release_round_trip_without_issue_number(
     assert capsys.readouterr().out == (
         f"LEDGER #{LEDGER_ISSUE}\n"
         f"CLAIMED lane docs/lane-cleanup: Codex Sol (builder) base={BASE} "
-        "branch=docs/lane-cleanup claim=cli-lane-claim\n"
+        "branch=docs/lane-cleanup claim=cli-lane-claim 0h 0m\n"
         "  docs\n"
     )
 
@@ -4986,10 +5122,10 @@ def test_cli_status_overlapping_protocol_comments_print_ledger_then_conflict(
     assert capsys.readouterr().out == (
         f"LEDGER #{LEDGER_ISSUE}\n"
         f"CONFLICT issue #72: Codex Sol (builder) base={BASE} "
-        "branch=codex/issue-72-claims claim=claim-a\n"
+        "branch=codex/issue-72-claims claim=claim-a 0h 0m\n"
         "  shared\n"
         f"CONFLICT issue #73: Grok 4.6 (builder) base={BASE} "
-        "branch=codex/issue-73-claims claim=claim-b\n"
+        "branch=codex/issue-73-claims claim=claim-b 0h 0m\n"
         "  shared/file.py\n"
     )
 
@@ -5104,6 +5240,8 @@ def test_cli_status_json_after_claim_prints_claimed_object(
                     "claim_id": "cli-claim",
                     "scope": ["src"],
                     "state": "CLAIMED",
+                    "age": "0h 0m",
+                    "old": False,
                 }
             ],
         }
@@ -5147,6 +5285,8 @@ def test_cli_status_json_overlapping_protocol_comments_print_conflict_object(
                     "claim_id": "claim-a",
                     "scope": ["shared"],
                     "state": "CONFLICT",
+                    "age": "0h 0m",
+                    "old": False,
                 },
                 {
                     "issue": 73,
@@ -5158,6 +5298,8 @@ def test_cli_status_json_overlapping_protocol_comments_print_conflict_object(
                     "claim_id": "claim-b",
                     "scope": ["shared/file.py"],
                     "state": "CONFLICT",
+                    "age": "0h 0m",
+                    "old": False,
                 },
             ],
         }
@@ -5203,6 +5345,8 @@ def test_cli_status_json_issue_on_overlap_prints_related_conflict_object(
                     "claim_id": "claim-a",
                     "scope": ["shared"],
                     "state": "CONFLICT",
+                    "age": "0h 0m",
+                    "old": False,
                 },
                 {
                     "issue": 73,
@@ -5214,6 +5358,8 @@ def test_cli_status_json_issue_on_overlap_prints_related_conflict_object(
                     "claim_id": "claim-b",
                     "scope": ["shared/file.py"],
                     "state": "CONFLICT",
+                    "age": "0h 0m",
+                    "old": False,
                 },
             ],
         }
@@ -5286,6 +5432,7 @@ def test_cli_claim_without_json_prints_the_claimed_line(
     assert capsys.readouterr().out == (
         "CLAIMED issue #72: cli-claim "
         "https://github.com/example/agent-claim/issues/71#issuecomment-1\n"
+        "1 of 4 versioned files (25%); touches no other open claims\n"
     )
 
 
@@ -5354,6 +5501,7 @@ def test_cli_comma_joined_scope_is_stored_as_distinct_paths_and_overlaps(
     assert captured.out == (
         "CLAIMED issue #72: joined "
         "https://github.com/example/agent-claim/issues/71#issuecomment-1\n"
+        "0 of 4 versioned files (0%); touches no other open claims\n"
     )
     assert captured.err.startswith("ERROR:")
     assert "issue #72" in captured.err
@@ -5589,7 +5737,7 @@ def test_cli_claim_refuses_a_directory_scope_without_allow_directory(
     assert status == 2
     assert captured.out == ""
     assert "directory scope 'docs'" in captured.err
-    assert "--allow-directory" in captured.err
+    assert "erst schneiden" in captured.err
     assert LEDGER_ISSUE not in client.comments
 
 
@@ -5629,6 +5777,10 @@ def test_cli_claim_allows_a_directory_scope_with_reason(
     posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])
     assert isinstance(posted, ActiveClaim)
     assert posted.scope == ("docs",)
+    assert (
+        "- Allow-directory reason: rewrite the docs tree"
+        in client.comments[LEDGER_ISSUE][0].body
+    )
 
 
 def test_cli_who_prints_the_claim_holding_a_path(
@@ -5707,8 +5859,531 @@ def test_cli_rescope_refuses_adding_a_directory_without_allow_directory(
     assert status == 2
     assert captured.out == ""
     assert "directory scope 'docs'" in captured.err
+    assert "erst schneiden" in captured.err
     standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
     assert standing[0].scope == ("src/widget.py",)
+
+
+
+def test_cli_claim_share_above_a_quarter_requires_allow_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "LICENSE",
+            "--scope",
+            "README.md",
+            "--claim-id",
+            "wide",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert status == 2
+    assert captured.out == ""
+    assert "2 of 4" in captured.err
+    assert "--allow-directory" in captured.err
+    assert "erst schneiden" not in captured.err
+    assert LEDGER_ISSUE not in client.comments
+
+
+def test_cli_claim_share_above_a_quarter_succeeds_with_allow_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "LICENSE",
+            "--scope",
+            "README.md",
+            "--allow-directory",
+            "cover two files",
+            "--claim-id",
+            "wide",
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert status == 0
+    assert payload["versioned_files"] == 2
+    assert payload["versioned_files_total"] == 4
+    assert payload["share"] == 0.5
+    assert payload["touches"] == []
+    assert "- Allow-directory reason: cover two files" in client.comments[LEDGER_ISSUE][0].body
+
+
+def test_cli_claim_share_at_a_quarter_does_not_need_allow_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "src",
+            "--claim-id",
+            "quarter",
+        ]
+    )
+
+    assert status == 0
+    assert capsys.readouterr().out.endswith(
+        "1 of 4 versioned files (25%); touches no other open claims\n"
+    )
+
+
+def test_cli_claim_touches_stay_empty_beside_a_disjoint_standing_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = _claims_client(request("claim-a", "Ada", issue=73, scope=("LICENSE",)))
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "src",
+            "--claim-id",
+            "disjoint",
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert status == 0
+    assert payload["touches"] == []
+
+
+def test_claim_cost_lists_an_overlapping_standing_claim_as_a_touch() -> None:
+    standing = parse_claim_event(
+        comment(1, claim_comment(request("claim-a", issue=55, scope=("src",))))
+    )
+    lane = parse_claim_event(
+        comment(
+            2,
+            claim_comment(
+                request("claim-b", "Grok 4.6", lane=True, branch="docs/foo", scope=("docs",))
+            ),
+        )
+    )
+    assert isinstance(standing, ActiveClaim) and isinstance(lane, ActiveClaim)
+    overlapping = protocol.conflicting_claims(
+        (standing, lane), request("challenger", issue=56, scope=("src/widget.py",))
+    )
+    both = protocol.conflicting_claims(
+        (standing, lane), request("wide", issue=56, scope=("src", "docs"))
+    )
+
+    assert [claim.claim_id for claim in overlapping] == ["claim-a"]
+    assert issue_claim._touch_summary(overlapping) == "would touch issue #55 (claim-a)"
+    assert issue_claim._touch_summary(both) == (
+        "would touch issue #55 (claim-a), lane docs/foo (claim-b)"
+    )
+    assert issue_claim._touch_summary(()) == "touches no other open claims"
+
+
+def test_claim_age_old_uses_the_same_floored_minutes_as_display() -> None:
+    just_over_an_hour = timedelta(seconds=3601)
+    sixty_one_minutes = timedelta(seconds=3660)
+
+    assert board.format_claim_age(just_over_an_hour) == "1h 0m"
+    assert board.claim_is_old(just_over_an_hour) is False
+    assert board.format_claim_age(sixty_one_minutes) == "1h 1m"
+    assert board.claim_is_old(sixty_one_minutes) is True
+
+
+def test_status_and_board_show_claim_age_from_the_claim_comment(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    claimed = request("mine", "Ada", issue=72, branch="codex/issue-72", scope=("src",))
+    fresh = comment(1, claim_comment(claimed), created_at="2026-08-20T23:30:00Z")
+    client = FakeComments({LEDGER_ISSUE: [fresh]})
+    client.board_issues = (board_issue(72, "Work", complete_contract("Claim #72.")),)
+    _patch_status_cli(monkeypatch, client)
+    monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "status", "72"]) == 0
+    status_out = capsys.readouterr().out
+    assert " 0h 30m\n" in status_out
+    assert " old" not in status_out.split("CLAIMED", 1)[1]
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "status", "72", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["claims"][0]["age"] == "0h 30m"
+    assert payload["claims"][0]["old"] is False
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "board"]) == 0
+    assert "Ada (builder) 0h 30m" in capsys.readouterr().out
+    assert issue_claim.main(["--repo", "example/agent-claim", "board", "--json"]) == 0
+    item = next(row for row in json.loads(capsys.readouterr().out)["items"] if row["number"] == 72)
+    assert item["claim_age"] == "0h 30m"
+    assert item["claim_old"] is False
+
+
+def test_status_and_board_mark_a_claim_old_after_sixty_one_minutes(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    claimed = request("mine", "Ada", issue=72, branch="codex/issue-72", scope=("src",))
+    old = comment(1, claim_comment(claimed), created_at="2026-08-20T22:59:00Z")
+    client = FakeComments({LEDGER_ISSUE: [old]})
+    client.board_issues = (board_issue(72, "Work", complete_contract("Claim #72.")),)
+    _patch_status_cli(monkeypatch, client)
+    monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "status", "72"]) == 0
+    assert " 1h 1m old\n" in capsys.readouterr().out
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "status", "72", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["claims"][0]["age"] == "1h 1m"
+    assert payload["claims"][0]["old"] is True
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "board"]) == 0
+    assert "Ada (builder) 1h 1m old" in capsys.readouterr().out
+
+
+def test_claim_age_uses_the_claim_comment_not_a_later_rescope(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    claimed = request("mine", "Ada", issue=72, branch="codex/issue-72", scope=("src",))
+    claim_event = comment(1, claim_comment(claimed), created_at="2026-08-20T23:30:00Z")
+    parsed = parse_claim_event(claim_event)
+    assert isinstance(parsed, ActiveClaim)
+    rescope_event = comment(
+        2,
+        protocol.rescope_comment(parsed, ("src", "LICENSE"), "Ada", "builder"),
+        created_at="2026-08-20T23:59:00Z",
+    )
+    client = FakeComments({LEDGER_ISSUE: [claim_event, rescope_event]})
+    _patch_status_cli(monkeypatch, client)
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "status", "72"]) == 0
+    out = capsys.readouterr().out
+    assert " 0h 30m\n" in out
+    assert " old" not in out.split("CLAIMED", 1)[1]
+
+
+def test_cli_claim_allows_a_cut_directory_without_allow_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeComments()
+    client.board_issues = (
+        board_issue(
+            72,
+            "Cut work",
+            complete_contract("Claim #72.") + "\n\n## Schnitt\n\n**Scheibe 1: Title**\n",
+        ),
+    )
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(
+        checkout, "_scope_directories", lambda paths: tuple(p for p in paths if p == "docs")
+    )
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "docs",
+            "--claim-id",
+            "cut",
+        ]
+    )
+
+    assert status == 0
+    posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])
+    assert isinstance(posted, ActiveClaim)
+    assert posted.scope == ("docs",)
+
+
+def test_cli_claim_refuses_a_schnitt_heading_without_a_scheibe_line(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    client.board_issues = (
+        board_issue(
+            72,
+            "Uncut",
+            complete_contract("Claim #72.") + "\n\n## Schnitt\n\nNo slices yet.\n",
+        ),
+    )
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(
+        checkout, "_scope_directories", lambda paths: tuple(p for p in paths if p == "docs")
+    )
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "docs",
+            "--claim-id",
+            "heading",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert status == 2
+    assert "erst schneiden" in captured.err
+    assert LEDGER_ISSUE not in client.comments
+
+
+def test_cli_lane_directory_without_allow_directory_is_erst_schneiden(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_agent_identity_env(monkeypatch, {"AGENT_CLAIM_AGENT": "Ada"})
+    client = FakeComments()
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(
+        checkout, "_scope_directories", lambda paths: tuple(p for p in paths if p == "docs")
+    )
+    git_values = {("branch", "--show-current"): "docs/lane-cleanup"}
+    monkeypatch.setattr(checkout, "_git_output", lambda arguments: git_values[tuple(arguments)])
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "--base",
+            BASE,
+            "--branch",
+            "docs/lane-cleanup",
+            "--scope",
+            "docs",
+            "--claim-id",
+            "lane-docs",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert status == 2
+    assert "erst schneiden" in captured.err
+    assert LEDGER_ISSUE not in client.comments
+
+
+def test_cli_claim_cut_directory_still_needs_allow_directory_when_share_is_high(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    client.board_issues = (
+        board_issue(
+            72,
+            "Cut work",
+            complete_contract("Claim #72.") + "\n\n## Schnitt\n\n**Scheibe 1: Title**\n",
+        ),
+    )
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(
+        checkout, "_scope_directories", lambda paths: tuple(p for p in paths if p == "docs")
+    )
+    monkeypatch.setattr(
+        checkout,
+        "versioned_paths",
+        lambda: ("LICENSE", "README.md", "docs/a.md", "docs/b.md"),
+    )
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "docs",
+            "--claim-id",
+            "wide-cut",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert status == 2
+    assert captured.out == ""
+    assert "2 of 4" in captured.err
+    assert "--allow-directory" in captured.err
+    assert "erst schneiden" not in captured.err
+    assert LEDGER_ISSUE not in client.comments
+
+
+def test_cli_rescope_add_that_raises_combined_share_requires_allow_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    acquire_claim(
+        client,
+        request(issue=72, branch="codex/issue-72", scope=("src",)),
+    )
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    git_values = _git_checkout()
+    monkeypatch.setattr(
+        checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
+    )
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+    _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Codex Sol"})
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "rescope",
+            "72",
+            "--add",
+            "LICENSE",
+            "--add",
+            "README.md",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert status == 2
+    assert captured.out == ""
+    assert "3 of 4" in captured.err
+    assert "--allow-directory" in captured.err
+    assert "erst schneiden" not in captured.err
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert standing[0].scope == ("src",)
+
+
+def test_cli_rescope_persists_allow_directory_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeComments()
+    acquire_claim(
+        client,
+        request(issue=72, branch="codex/issue-72", scope=("src/widget.py",)),
+    )
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    git_values = _git_checkout()
+    monkeypatch.setattr(
+        checkout, "_git_output", lambda arguments: git_values[tuple(arguments)]
+    )
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: paths)
+    _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Codex Sol"})
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "rescope",
+            "72",
+            "--add",
+            "docs",
+            "--allow-directory",
+            "widen to the docs tree",
+        ]
+    )
+
+    assert status == 0
+    bodies = [entry.body for entry in client.comments[LEDGER_ISSUE]]
+    assert any("- Allow-directory reason: widen to the docs tree" in body for body in bodies)
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert standing[0].scope == ("src/widget.py", "docs")
 
 
 def test_cli_release_without_json_prints_the_released_line(
@@ -5782,6 +6457,10 @@ def test_cli_claim_json_prints_acquired_claim_object(
             "base": BASE,
             "branch": branch,
             "scope": ["src", "docs"],
+            "versioned_files": 1,
+            "versioned_files_total": 4,
+            "share": 0.25,
+            "touches": [],
         }
     ) + "\n"
     posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])

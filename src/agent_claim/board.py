@@ -6,7 +6,7 @@ import json
 import re
 import tomllib
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
 
@@ -36,6 +36,11 @@ CLOSING_REFERENCE_PATTERN = re.compile(
     r"(?im)\b(?:close(?:s|d)?|fix(?:es|ed)?|resolve(?:s|d)?|"
     r"land(?:s|ed)?|implement(?:s|ed)?)\s*:?\s*#([1-9][0-9]*)"
 )
+NOTHING_BLOCKER_VALUES = frozenset({"nichts", "none", "keine", "-"})
+CLAIM_OLD_AFTER = timedelta(hours=1)
+CUT_HEADING_PATTERN = re.compile(r"(?m)^##[ \t]+Schnitt")
+CUT_SECTION_HEADING_PATTERN = re.compile(r"(?m)^##[ \t]+")
+SLICE_LINE_PATTERN = re.compile(r"(?m)^\*\*Scheibe [1-9][0-9]*: .+\*\*\s*$")
 
 
 @dataclass(frozen=True)
@@ -106,6 +111,8 @@ class BoardItem:
     age_days: int
     idle_days: int
     active_claim: str | None
+    claim_age: str | None
+    claim_old: bool
     unblocks_count: int
     single_concrete_next: bool
     score: int
@@ -196,6 +203,46 @@ def _references(text: str | None) -> frozenset[int]:
     return frozenset(int(number) for number in REFERENCE_PATTERN.findall(text))
 
 
+def _nothing_blocker_line(line: str) -> bool:
+    cleaned = line.strip().rstrip(".-").casefold()
+    return not cleaned or cleaned in NOTHING_BLOCKER_VALUES
+
+
+def _blocker_references(text: str | None) -> frozenset[int]:
+    if text is None:
+        return frozenset()
+    lines = tuple(line.strip() for line in text.splitlines() if line.strip())
+    if not lines or all(_nothing_blocker_line(line) for line in lines):
+        return frozenset()
+    return _references(text)
+
+
+def has_cut(body: str) -> bool:
+    heading = CUT_HEADING_PATTERN.search(body)
+    if heading is None:
+        return False
+    next_heading = CUT_SECTION_HEADING_PATTERN.search(body, heading.end())
+    end = next_heading.start() if next_heading is not None else len(body)
+    return SLICE_LINE_PATTERN.search(body[heading.end() : end]) is not None
+
+
+def claim_age(created_at: str, now: datetime) -> timedelta:
+    return now.astimezone(timezone.utc) - _timestamp(created_at)
+
+
+def _floored_claim_minutes(age: timedelta) -> int:
+    return max(0, int(age.total_seconds())) // 60
+
+
+def format_claim_age(age: timedelta) -> str:
+    hours, minutes = divmod(_floored_claim_minutes(age), 60)
+    return f"{hours}h {minutes}m"
+
+
+def claim_is_old(age: timedelta) -> bool:
+    return _floored_claim_minutes(age) > _floored_claim_minutes(CLAIM_OLD_AFTER)
+
+
 def _timestamp(value: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -268,7 +315,7 @@ def build_board(
     contracts = {issue.number: parse_contract(issue.body) for issue in issues}
     blockers = {
         issue.number: tuple(
-            sorted(_references(contracts[issue.number].blocked_by) & open_references)
+            sorted(_blocker_references(contracts[issue.number].blocked_by) & open_references)
         )
         for issue in issues
     }
@@ -305,8 +352,17 @@ def build_board(
         score += 20 * unblocks[issue.number]
         score += {Stage.IN_FLIGHT: 30, Stage.CODE_LANDED: 20, Stage.TEXT_ONLY: -20}[stage]
         score += 10 if single_next else 0
+        if claim is None:
+            active_claim = None
+            claim_age_text = None
+            claim_old = False
+        else:
+            active_claim = f"{claim.agent} ({claim.role})"
+            age = claim_age(claim.comment.created_at, observed_at)
+            claim_age_text = format_claim_age(age)
+            claim_old = claim_is_old(age)
         actionable_reason = _actionable_reason(
-            active_claim=f"{claim.agent} ({claim.role})" if claim else None,
+            active_claim=active_claim,
             open_blockers=blockers[issue.number],
             contract_complete=contract.complete,
             expectation_state=expectations,
@@ -325,7 +381,9 @@ def build_board(
                 stage=stage,
                 age_days=age_days,
                 idle_days=idle_days,
-                active_claim=(f"{claim.agent} ({claim.role})" if claim else None),
+                active_claim=active_claim,
+                claim_age=claim_age_text,
+                claim_old=claim_old,
                 unblocks_count=unblocks[issue.number],
                 single_concrete_next=single_next,
                 score=score,
@@ -388,7 +446,7 @@ def render(board: Board) -> str:
                 _brief(item.contract.next),
                 str(item.age_days),
                 str(item.idle_days),
-                item.active_claim or "-",
+                _claim_cell(item),
                 "yes" if item.actionable else f"no: {item.actionable_reason}",
                 ",".join(f"#{number}" for number in item.open_blockers) or "-",
                 str(item.unblocks_count),
@@ -433,10 +491,17 @@ def _actionable_reason(
     if active_claim is not None:
         return "claimed"
     if open_blockers:
-        return f"blocked by #{open_blockers[0]}"
+        return "blocked by " + ", ".join(f"#{number}" for number in open_blockers)
     if not contract_complete:
         return "body incomplete"
     return None
+
+
+def _claim_cell(item: BoardItem) -> str:
+    if item.active_claim is None:
+        return "-"
+    suffix = " old" if item.claim_old else ""
+    return f"{item.active_claim} {item.claim_age}{suffix}"
 
 
 def _brief(value: str | None, *, maximum: int = 48) -> str:
