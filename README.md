@@ -42,10 +42,10 @@ Omitted `--role` on `release` uses that selected claim's role; an explicit
 present on the ledger, active or released, is refused before anything is posted;
 release the old claim and pass a fresh `--claim-id` instead.
 `rescope <issue> --add <path> [--drop <path>]` changes a live claim's scope
-without releasing it: the claim id and base stay, added paths are exclusive
+without releasing it: the claim id and base stay, added paths are advisory
 like `claim`, `--add` of a directory or a combined share above a quarter uses
-the same cut / `--allow-directory` rules as `claim`, dropping is not refused
-for an existing remainder overlap, and there is no release window. It does not require HEAD to match
+the same cut / `--allow-directory` rules as `claim`, and there is no release
+window. It does not require HEAD to match
 base or a clean tree. A `rescope` ledger event is a new v2 action; older
 helpers fail loud on the whole ledger until they upgrade.
 
@@ -57,10 +57,18 @@ separately, including when an older ledger comment still has one comma-joined
 string. Directory scopes (`docs`, `frontend/src`) lock the whole tree: claim one only
 when the issue body has a `## Schnitt` cut with at least one `**Scheibe n: ...**`
 slice, or pass `--allow-directory REASON`. A scope covering more than a quarter
-of versioned files also needs that flag. `claim` prints how many versioned files
-the scope covers and that it touches no other open claims. Claims collide on the same
-issue or overlapping paths; disjoint scopes can proceed concurrently.
-`who <path>` prints the live claim that holds a path.
+of versioned files also needs that flag. Live claims are advisory: they say who
+works where and do not refuse path overlap. Two lanes may claim the same
+directory or the same file; `claim` and `status` print the overlap as a note.
+The same issue or the same `docs/`/`fix/` lane branch still holds at most one
+live claim. `claim --resource <name>` allocates the next free integer for that
+named scarce value and holds it until land or release; a second live hold of
+the same name and value is refused by name. Sequential allocations stay unique
+even after a release. `claim` prints how many versioned files the scope covers
+and which open claims it overlaps. `status` also prints `trunk-pull breaks: N`,
+the number of `agent-claim broke` records on the current ledger — each one is a
+recorded red check run after pulling trunk. `who <path>` prints every live
+claim that holds a path.
 Agents should read `--json` from `status`, `claim`, `release`, `rescope`, and `who`.
 `status` prints each live claim's age from its claim comment as `Xh Ym`, and
 marks it `old` after more than one hour.
@@ -94,13 +102,19 @@ every duplicated id, not just the conflicting one — instead of picking a winne
 `agent-claim board` reads the open issues, open PRs, PRs merged in the last 14
 days, and the claim ledger, then prints a ranked projection with `READY NOW` and
 `STALE` sections. The table exposes which exact contract headings were found, an
-`EXPECT` state (`-`, `proposed`, or `ruled`), a concise `Next`, and a CLAIM
+`EXPECT` state (`-`, `proposed`, or `ruled N` / `ruled N old`), a concise `Next`, and a CLAIM
 cell with `-` or the agent, role, claim age, and `old` when the claim comment
 is older than one hour; JSON includes the complete derived contract state. An `Erwartung`, `Erwartungen`, or
 `Erwartungsliste` heading makes the following block an expectation list: a line
 with `*(Default: yes|no|later)*` is proposed. A block is ruled only when every
 expectation line carries a `*(geregelt: ja)*` or `*(geregelt: NEIN ...)*`
-marker; absent or malformed markers remain proposed. It never writes GitHub.
+marker; absent or malformed markers remain proposed. A ruled block also shows
+how many default-branch landings (`git log` committer times) happened after its
+heading date (`DD.MM.YYYY`, preferring `GEREGELT: Operator …`); ten or more
+mark it `old`. Missing or proposed expectations have neither fresh nor old. If
+a ruled block has no readable date or git cannot name the default branch, that
+is an error, never silently fresh. The table footer `TRUNK-PULL BREAKS` is the
+same ledger count `status` prints. It never writes GitHub.
 The target defaults to the repository of the current checkout;
 for another GitHub repository run `agent-claim --repo FlexOr2/atelier-2 board`.
 The current checkout may set `priority_labels` as an ordered non-empty list in
@@ -113,9 +127,11 @@ Use `agent-claim next` (or `agent-claim next --json`) to name the highest-scored
 actionable item: it is open, free, unblocked, has a complete
 Now/Next/Blocked by/Done when contract, and does not have proposed expectations.
 It names every skipped proposed item with `Erwartungen ungeregelt` (also in the
-JSON `skipped` list), and exits 3 when none qualifies. `claim`
-still allows work out of order, but warns when a higher-scored actionable item is
-free; pass `--out-of-order REASON` to preserve why in the claim comment.
+JSON `skipped` list), and exits 3 when none qualifies. When the pulled item's
+ruling is old, it adds `vor N Landungen geregelt, beim Ziehen neu refinen`.
+`claim` still allows work out of order, but warns when a higher-scored
+actionable item is free; pass `--out-of-order REASON` to preserve why in the
+claim comment.
 
 ## Issueless lane claims
 
@@ -137,9 +153,9 @@ agent-claim release
 Like an issue claim, a lane claim must begin from a clean linked worktree
 checked out on that branch — `claim` fails outside one.
 
-A lane claim shares the same exclusivity, scope-conflict rules, and release
-path as an issue claim: two lane claims collide on the same branch or an
-overlapping scope, and a lane collides with an issue claim over scope overlap.
+A lane claim shares the same identity exclusivity, advisory overlap notes, and
+release path as an issue claim: two lane claims collide on the same branch;
+overlapping scope with another lane or issue is a visible note, not a refusal.
 `status` and `protect` show and authorize it the same way. A lane owns no
 GitHub issue, so it gets no projection comment or label, and `reconcile` never
 touches it.

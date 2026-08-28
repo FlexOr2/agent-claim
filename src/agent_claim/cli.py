@@ -176,8 +176,8 @@ def _touch_json(claim: protocol.ActiveClaim) -> dict[str, object]:
 
 def _touch_summary(touches: tuple[protocol.ActiveClaim, ...]) -> str:
     if not touches:
-        return "touches no other open claims"
-    return "would touch " + ", ".join(
+        return "overlaps no other open claims"
+    return "overlaps " + ", ".join(
         f"{_claim_subject(claim)} ({claim.claim_id})" for claim in touches
     )
 
@@ -226,6 +226,9 @@ def _request(arguments: argparse.Namespace) -> protocol.ClaimRequest:
         allow_directory_reason = protocol._outbound_text(
             allow_directory_reason, "allow-directory reason", maximum=512
         )
+    resource = getattr(arguments, "resource", None)
+    if resource is not None:
+        resource = protocol._outbound_resource_name(resource)
     request = protocol.ClaimRequest(
         identity=parsed.identity,
         agent=parsed.agent,
@@ -236,6 +239,7 @@ def _request(arguments: argparse.Namespace) -> protocol.ClaimRequest:
         claim_id=parsed.claim_id,
         out_of_order_reason=arguments.out_of_order,
         allow_directory_reason=allow_directory_reason,
+        resource=resource,
     )
     checkout._validate_checkout(request)
     return request
@@ -286,6 +290,11 @@ def _parser() -> argparse.ArgumentParser:
         "--allow-directory",
         metavar="REASON",
         help=ALLOW_DIRECTORY_HELP,
+    )
+    claim.add_argument(
+        "--resource",
+        metavar="NAME",
+        help="allocate the next free value of this named scarce resource and hold it",
     )
     claim.add_argument("--json", action="store_true")
 
@@ -352,6 +361,12 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser(
         "protect", help="deny PreToolUse writes without this session's live claim"
     )
+    broke = commands.add_parser(
+        "broke", help="record that pulling trunk broke the checks"
+    )
+    broke.add_argument("--agent")
+    broke.add_argument("--role", default=DEFAULT_CLAIM_ROLE)
+    broke.add_argument("--json", action="store_true")
     return parser
 
 
@@ -368,23 +383,58 @@ def _identity_json(identity: protocol.ClaimIdentity) -> dict[str, object]:
 
 def _status_claims(
     claims: tuple[protocol.ActiveClaim, ...], issue: int | None
-) -> tuple[tuple[protocol.ActiveClaim, ...], set[str]]:
+) -> tuple[tuple[protocol.ActiveClaim, ...], protocol.ClaimConflictIndex]:
     selected = tuple(
         claim
         for claim in claims
         if issue is None
         or (isinstance(claim.identity, protocol.IssueIdentity) and claim.identity.issue == issue)
     )
-    if not selected:
-        return (), set()
     index = protocol._claim_conflict_index(claims)
+    if not selected:
+        return (), index
     related_ids = (
         {claim.claim_id for claim in claims}
         if issue is None
         else protocol._related_claim_ids(index, selected)
     )
     related = tuple(claim for claim in claims if claim.claim_id in related_ids)
-    return related, index.conflict_ids
+    return related, index
+
+
+def _resource_fields(claim: protocol.ActiveClaim) -> dict[str, object]:
+    if claim.resource is None:
+        return {"resource": None, "resource_value": None}
+    return {"resource": claim.resource.name, "resource_value": claim.resource.value}
+
+
+def _overlap_subjects(
+    claims_by_id: dict[str, protocol.ActiveClaim], peer_ids: set[str]
+) -> list[dict[str, object]]:
+    return [
+        {
+            **_identity_json(peer.identity),
+            "claim_id": peer.claim_id,
+            "agent": peer.agent,
+        }
+        for claim_id in sorted(peer_ids)
+        if (peer := claims_by_id.get(claim_id)) is not None
+    ]
+
+
+def _overlap_note(
+    claims_by_id: dict[str, protocol.ActiveClaim], peer_ids: set[str]
+) -> str | None:
+    peers = [
+        claims_by_id[claim_id]
+        for claim_id in sorted(peer_ids)
+        if claim_id in claims_by_id
+    ]
+    if not peers:
+        return None
+    return "overlaps " + ", ".join(
+        f"{_claim_subject(claim)} ({claim.claim_id})" for claim in peers
+    )
 
 
 def _status(
@@ -393,13 +443,14 @@ def _status(
     now: datetime | None = None,
 ) -> int:
     observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    related, conflict_ids = _status_claims(claims, issue)
+    related, index = _status_claims(claims, issue)
     if not related:
         subject = "repository" if issue is None else f"issue #{issue}"
         print(f"UNCLAIMED {subject}")
         return 0
+    claims_by_id = {claim.claim_id: claim for claim in claims}
     for claim in related:
-        state = "CONFLICT" if claim.claim_id in conflict_ids else "CLAIMED"
+        state = "CONFLICT" if claim.claim_id in index.conflict_ids else "CLAIMED"
         print(
             f"{state} {_claim_subject(claim)}: {claim.agent} ({claim.role}) "
             f"base={claim.base} branch={claim.branch} claim={claim.claim_id}"
@@ -407,7 +458,12 @@ def _status(
         )
         for path in claim.scope:
             print(f"  {path}")
-    return 2 if any(claim.claim_id in conflict_ids for claim in related) else 0
+        if claim.resource is not None:
+            print(f"  resource {claim.resource.name}={claim.resource.value}")
+        note = _overlap_note(claims_by_id, protocol._overlap_peer_ids(index, claim))
+        if note is not None:
+            print(f"  {note}")
+    return 2 if any(claim.claim_id in index.conflict_ids for claim in related) else 0
 
 
 def _status_json(
@@ -415,19 +471,23 @@ def _status_json(
     issue: int | None,
     ledger: int,
     now: datetime | None = None,
+    *,
+    trunk_check_breaks: int = 0,
 ) -> int:
     observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    related, conflict_ids = _status_claims(claims, issue)
+    related, index = _status_claims(claims, issue)
     if not related:
         state = "UNCLAIMED"
-    elif any(claim.claim_id in conflict_ids for claim in related):
+    elif any(claim.claim_id in index.conflict_ids for claim in related):
         state = "CONFLICT"
     else:
         state = "CLAIMED"
+    claims_by_id = {claim.claim_id: claim for claim in claims}
     payload = {
         "ledger": ledger,
         "issue": issue,
         "state": state,
+        "trunk_check_breaks": trunk_check_breaks,
         "claims": [
             {
                 **_identity_json(claim.identity),
@@ -437,7 +497,11 @@ def _status_json(
                 "branch": claim.branch,
                 "claim_id": claim.claim_id,
                 "scope": list(claim.scope),
-                "state": "CONFLICT" if claim.claim_id in conflict_ids else "CLAIMED",
+                **_resource_fields(claim),
+                "overlaps": _overlap_subjects(
+                    claims_by_id, protocol._overlap_peer_ids(index, claim)
+                ),
+                "state": "CONFLICT" if claim.claim_id in index.conflict_ids else "CLAIMED",
                 "age": _claim_age_fields(claim, observed_at)[0],
                 "old": _claim_age_fields(claim, observed_at)[1],
             }
@@ -453,25 +517,26 @@ def _who(claims: tuple[protocol.ActiveClaim, ...], path: str) -> int:
     if not holders:
         print(f"UNCLAIMED {path}")
         return 0
-    state = "CONFLICT" if len(holders) > 1 else "CLAIMED"
     for claim in holders:
         print(
-            f"{state} {path} {_claim_subject(claim)}: {claim.agent} ({claim.role}) "
+            f"CLAIMED {path} {_claim_subject(claim)}: {claim.agent} ({claim.role}) "
             f"claim={claim.claim_id}"
         )
-    return 2 if state == "CONFLICT" else 0
+    if len(holders) > 1:
+        print(
+            "overlap: "
+            + ", ".join(
+                f"{_claim_subject(claim)} ({claim.claim_id})" for claim in holders
+            )
+        )
+    return 0
 
 
 def _who_json(
     claims: tuple[protocol.ActiveClaim, ...], path: str, ledger: int
 ) -> int:
     holders = protocol.claims_holding_path(claims, path)
-    if not holders:
-        state = "UNCLAIMED"
-    elif len(holders) > 1:
-        state = "CONFLICT"
-    else:
-        state = "CLAIMED"
+    state = "UNCLAIMED" if not holders else "CLAIMED"
     payload = {
         "ledger": ledger,
         "path": path,
@@ -485,13 +550,14 @@ def _who_json(
                 "branch": claim.branch,
                 "claim_id": claim.claim_id,
                 "scope": list(claim.scope),
-                "state": "CONFLICT" if len(holders) > 1 else "CLAIMED",
+                **_resource_fields(claim),
+                "state": "CLAIMED",
             }
             for claim in holders
         ],
     }
     print(json.dumps(payload))
-    return 2 if state == "CONFLICT" else 0
+    return 0
 
 
 def _rescope_json(claimed: protocol.ActiveClaim) -> int:
@@ -530,6 +596,7 @@ def _claim_json(
                 "base": claimed.base,
                 "branch": claimed.branch,
                 "scope": list(claimed.scope),
+                **_resource_fields(claimed),
                 "versioned_files": versioned_files,
                 "versioned_files_total": versioned_files_total,
                 "share": share,
@@ -559,7 +626,10 @@ def _release_json(
 
 
 def _board(
-    client: github.GitHubIssueComments, claims: tuple[protocol.ActiveClaim, ...]
+    client: github.GitHubIssueComments,
+    claims: tuple[protocol.ActiveClaim, ...],
+    *,
+    trunk_check_breaks: int = 0,
 ) -> board.Board:
     now = datetime.now(timezone.utc)
     toplevel = Path(checkout._git_output(["rev-parse", "--show-toplevel"]))
@@ -570,6 +640,16 @@ def _board(
         claims,
         board.load_config(toplevel / ".agent-claim" / "board.toml"),
         now=now,
+        trunk_landings=checkout.trunk_landing_times(),
+        trunk_check_breaks=trunk_check_breaks,
+    )
+
+
+def _ruling_pull_hint(item: board.BoardItem) -> str | None:
+    if not item.ruling_old:
+        return None
+    return (
+        f"vor {item.ruling_landings} Landungen geregelt, beim Ziehen neu refinen"
     )
 
 
@@ -587,8 +667,13 @@ def _next_json(item: board.BoardItem | None, skipped: tuple[board.BoardItem, ...
                 "score": item.score,
                 "title": item.title,
                 "next": item.contract.next,
+                "ruling_landings": item.ruling_landings,
+                "ruling_old": item.ruling_old,
             }
         )
+        hint = _ruling_pull_hint(item)
+        if hint is not None:
+            payload["ruling_hint"] = hint
     print(json.dumps(payload))
     return 0
 
@@ -599,6 +684,10 @@ def _next(item: board.BoardItem | None, skipped: tuple[board.BoardItem, ...]) ->
         if item is not None
         else ["No actionable item."]
     )
+    if item is not None:
+        hint = _ruling_pull_hint(item)
+        if hint is not None:
+            lines.append(hint)
     if skipped:
         skipped_lines = (
             f"#{skipped_item.number}: {skipped_item.actionable_reason}"
@@ -737,7 +826,7 @@ def main(arguments: list[str] | None = None) -> int:
     if parsed.command == "protect":
         return _protect(parsed.repo)
     try:
-        if parsed.command in {"claim", "release", "rescope"}:
+        if parsed.command in {"claim", "release", "rescope", "broke"}:
             parsed.agent = checkout._resolved_agent(parsed.agent)
         release_branch: str | None = None
         if parsed.command == "release":
@@ -769,18 +858,33 @@ def main(arguments: list[str] | None = None) -> int:
             )
         protocol.configure_ledger(ledger)
         if parsed.command == "status":
-            claims = protocol._ledger_claims(client)
+            comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
+            claims = protocol.active_claims(comments)
+            breaks = protocol.trunk_check_breaks(comments)
             now = datetime.now(timezone.utc)
             if parsed.json:
-                return _status_json(claims, parsed.issue, ledger, now=now)
+                return _status_json(
+                    claims, parsed.issue, ledger, now=now, trunk_check_breaks=breaks
+                )
             print(f"LEDGER #{ledger}")
+            print(f"trunk-pull breaks: {breaks}")
             return _status(claims, parsed.issue, now=now)
         if parsed.command == "board":
-            projected = _board(client, protocol._ledger_claims(client))
+            comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
+            projected = _board(
+                client,
+                protocol.active_claims(comments),
+                trunk_check_breaks=protocol.trunk_check_breaks(comments),
+            )
             print(board.board_json(projected) if parsed.json else board.render(projected))
             return 0
         if parsed.command == "next":
-            projected = _board(client, protocol._ledger_claims(client))
+            comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
+            projected = _board(
+                client,
+                protocol.active_claims(comments),
+                trunk_check_breaks=protocol.trunk_check_breaks(comments),
+            )
             item = board.highest_scored_actionable(projected)
             skipped = _proposed_expectations(projected)
             if item is None:
@@ -791,6 +895,13 @@ def main(arguments: list[str] | None = None) -> int:
                         _next(None, skipped)
                 return 3
             return _next_json(item, skipped) if parsed.json else _next(item, skipped)
+        if parsed.command == "broke":
+            count = protocol.record_trunk_break(client, parsed.agent, parsed.role)
+            if parsed.json:
+                print(json.dumps({"trunk_check_breaks": count}))
+            else:
+                print(f"TRUNK-PULL BREAKS {count}")
+            return 0
         if parsed.command == "who":
             claims = protocol._ledger_claims(client)
             if parsed.json:

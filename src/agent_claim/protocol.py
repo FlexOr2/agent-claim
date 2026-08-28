@@ -26,11 +26,13 @@ PROJECTION_MARKER_PATTERN = re.compile(
 )
 TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 CLAIM_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+RESOURCE_NAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9._-]{0,63}")
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 BRANCH_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}")
 REPOSITORY_PATTERN = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9_.-]{1,100}"
 )
+TRUNK_BREAK_MARKER = "<!-- agent-claim-trunk-break:v1 -->"
 MAX_PROTOCOL_EVENTS = 4096
 MAX_PROTOCOL_BYTES = 8 * 1024 * 1024
 MAX_COMMENT_BYTES = 48 * 1024
@@ -98,6 +100,14 @@ ClaimIdentity = IssueIdentity | LaneIdentity
 
 
 @dataclass(frozen=True)
+class ResourceHold:
+    """One named scarce value held by a live claim until land or release."""
+
+    name: str
+    value: int
+
+
+@dataclass(frozen=True)
 class ActiveClaim:
     identity: ClaimIdentity
     claim_id: str
@@ -107,6 +117,7 @@ class ActiveClaim:
     branch: str
     scope: tuple[str, ...]
     comment: IssueComment
+    resource: ResourceHold | None = None
 
 
 @dataclass(frozen=True)
@@ -203,6 +214,8 @@ class ClaimRequest:
     claim_id: str
     out_of_order_reason: str | None = None
     allow_directory_reason: str | None = None
+    resource: str | None = None
+    resource_value: int | None = None
 
 
 class IssueComments(Protocol):
@@ -274,6 +287,13 @@ def _outbound_text(value: object, field: str, *, maximum: int) -> str:
     ):
         raise ClaimError(f"{field} must be one bounded non-empty line")
     return normalized
+
+
+def _outbound_resource_name(value: object) -> str:
+    name = _outbound_text(value, "resource", maximum=64)
+    if RESOURCE_NAME_PATTERN.fullmatch(name) is None:
+        raise ClaimError("resource is not a resource name")
+    return name
 
 
 def _required_issue(payload: dict[str, object]) -> int:
@@ -420,6 +440,17 @@ def is_protocol_candidate(comment: IssueComment) -> bool:
     )
 
 
+def is_trunk_break_candidate(comment: IssueComment) -> bool:
+    return (
+        comment.author_association in TRUSTED_ASSOCIATIONS
+        and comment.body.partition("\n")[0] == TRUNK_BREAK_MARKER
+    )
+
+
+def is_ledger_event_candidate(comment: IssueComment) -> bool:
+    return is_protocol_candidate(comment) or is_trunk_break_candidate(comment)
+
+
 def _marker_payload(comment: IssueComment) -> tuple[dict[str, object], bool] | None:
     if not is_protocol_candidate(comment):
         return None
@@ -466,12 +497,31 @@ def _event_identity(
     return claim_id, agent, role
 
 
+def _valid_resource_name(name: str, *, field: str) -> str:
+    if RESOURCE_NAME_PATTERN.fullmatch(name) is None:
+        raise InvalidClaimMarker(f"{field} is not a resource name")
+    return name
+
+
+def _required_resource_hold(payload: dict[str, object], comment: IssueComment) -> ResourceHold:
+    name = _required_text(payload, "resource", maximum=64)
+    _valid_resource_name(name, field=f"trusted comment {comment.url} resource")
+    value = payload.get("resource_value")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise InvalidClaimMarker(
+            f"trusted comment {comment.url} resource_value must be a positive integer"
+        )
+    return ResourceHold(name, value)
+
+
 def _parse_active_claim(
     payload: dict[str, object], comment: IssueComment, identity: ClaimIdentity, *, legacy: bool
 ) -> ActiveClaim:
     expected = {"action", "agent", "base", "branch", "claim_id", "role", "scope"}
     if not legacy:
         expected.add(_identity_marker_key(identity))
+    if "resource" in payload or "resource_value" in payload:
+        expected.update({"resource", "resource_value"})
     _strict_keys(payload, frozenset(expected), comment)
     claim_id, agent, role = _event_identity(payload, comment)
     base = _required_text(payload, "base", maximum=40)
@@ -479,6 +529,9 @@ def _parse_active_claim(
         raise InvalidClaimMarker(
             f"trusted comment {comment.url} base must be a full lowercase commit SHA"
         )
+    resource = (
+        _required_resource_hold(payload, comment) if "resource" in payload else None
+    )
     return ActiveClaim(
         identity=identity,
         claim_id=claim_id,
@@ -488,6 +541,7 @@ def _parse_active_claim(
         branch=_valid_branch(payload),
         scope=_valid_scope(payload.get("scope")),
         comment=comment,
+        resource=resource,
     )
 
 
@@ -729,6 +783,7 @@ class ClaimLedgerAggregate:
     duplicate_claim_ids: tuple[str, ...]
     occurrences: Mapping[str, tuple[ActiveClaim, ...]]
     terminated_by: Mapping[str, tuple[IssueComment, ...]]
+    trunk_check_breaks: int
 
 
 def _aggregate_claim_events(comments: tuple[IssueComment, ...]) -> ClaimLedgerAggregate:
@@ -743,8 +798,16 @@ def _aggregate_claim_events(comments: tuple[IssueComment, ...]) -> ClaimLedgerAg
     occurrences: dict[str, list[ActiveClaim]] = {}
     terminated_by: dict[str, list[IssueComment]] = {}
     duplicate_claim_ids: list[str] = []
+    trunk_check_breaks = 0
     ordered = sorted(comments, key=lambda comment: (comment.created_at, comment.identifier))
     for comment in ordered:
+        if is_trunk_break_candidate(comment):
+            if comment.created_at != comment.updated_at:
+                raise InvalidClaimMarker(
+                    f"trusted protocol comment {comment.url} was edited after publication"
+                )
+            trunk_check_breaks += 1
+            continue
         event = parse_claim_event(comment)
         if event is None:
             continue
@@ -798,6 +861,7 @@ def _aggregate_claim_events(comments: tuple[IssueComment, ...]) -> ClaimLedgerAg
                 for claim_id, terminal_comments in terminated_by.items()
             }
         ),
+        trunk_check_breaks=trunk_check_breaks,
     )
 
 
@@ -810,6 +874,12 @@ def active_claims(comments: tuple[IssueComment, ...]) -> tuple[ActiveClaim, ...]
     aggregate = _aggregate_claim_events(comments)
     _reject_duplicate_claim_ids(aggregate)
     return aggregate.active
+
+
+def trunk_check_breaks(comments: tuple[IssueComment, ...]) -> int:
+    aggregate = _aggregate_claim_events(comments)
+    _reject_duplicate_claim_ids(aggregate)
+    return aggregate.trunk_check_breaks
 
 
 def _scope_prefixes(paths: tuple[str, ...]) -> set[tuple[str, ...]]:
@@ -847,8 +917,14 @@ def _identity_conflicts(
 
 
 def claims_conflict(left: ActiveClaim | ClaimRequest, right: ActiveClaim | ClaimRequest) -> bool:
-    if _identity_conflicts(left, right):
-        return True
+    """True when two claims share an issue or lane branch.
+
+    Path overlap is advisory: it is a visible note, not a conflict.
+    """
+    return _identity_conflicts(left, right)
+
+
+def claims_overlap(left: ActiveClaim | ClaimRequest, right: ActiveClaim | ClaimRequest) -> bool:
     return _scopes_overlap(left.scope, right.scope)
 
 
@@ -861,7 +937,7 @@ def claims_holding_path(
     return tuple(claim for claim in claims if _scopes_overlap(claim.scope, target))
 
 
-def conflicting_claims(
+def blocking_claims(
     claims: tuple[ActiveClaim, ...], candidate: ActiveClaim | ClaimRequest
 ) -> tuple[ActiveClaim, ...]:
     return tuple(
@@ -869,6 +945,23 @@ def conflicting_claims(
         for claim in claims
         if claim.claim_id != candidate.claim_id and claims_conflict(claim, candidate)
     )
+
+
+def overlapping_claims(
+    claims: tuple[ActiveClaim, ...], candidate: ActiveClaim | ClaimRequest
+) -> tuple[ActiveClaim, ...]:
+    return tuple(
+        claim
+        for claim in claims
+        if claim.claim_id != candidate.claim_id and claims_overlap(claim, candidate)
+    )
+
+
+def conflicting_claims(
+    claims: tuple[ActiveClaim, ...], candidate: ActiveClaim | ClaimRequest
+) -> tuple[ActiveClaim, ...]:
+    """Path-overlapping live claims, excluding identity. Used as the advisory note."""
+    return overlapping_claims(claims, candidate)
 
 
 IdentityKey = tuple[str, int | str]
@@ -890,14 +983,16 @@ def _identity_key(claim: ActiveClaim) -> IdentityKey:
 @dataclass(frozen=True)
 class ClaimConflictIndex:
     conflict_ids: set[str]
+    overlap_ids: set[str]
     claims_by_identity: dict[IdentityKey, set[str]]
     complete_paths: dict[tuple[str, ...], set[str]]
     descendant_paths: dict[tuple[str, ...], set[str]]
 
 
 def _claim_conflict_index(claims: tuple[ActiveClaim, ...]) -> ClaimConflictIndex:
-    """Index active-claim paths once for conflict status and targeted lookup."""
+    """Index identities and paths once for status conflict and overlap notes."""
     conflict_ids: set[str] = set()
+    overlap_ids: set[str] = set()
     claims_by_identity: dict[IdentityKey, set[str]] = {}
     complete_paths: dict[tuple[str, ...], set[str]] = {}
     descendant_paths: dict[tuple[str, ...], set[str]] = {}
@@ -916,8 +1011,8 @@ def _claim_conflict_index(claims: tuple[ActiveClaim, ...]) -> ClaimConflictIndex
                 matches.update(complete_paths.get(parts[:length], ()))
             matches.discard(claim.claim_id)
             if matches:
-                conflict_ids.add(claim.claim_id)
-                conflict_ids.update(matches)
+                overlap_ids.add(claim.claim_id)
+                overlap_ids.update(matches)
 
             complete_paths.setdefault(parts, set()).add(claim.claim_id)
             for length in range(1, len(parts) + 1):
@@ -925,6 +1020,7 @@ def _claim_conflict_index(claims: tuple[ActiveClaim, ...]) -> ClaimConflictIndex
 
     return ClaimConflictIndex(
         conflict_ids,
+        overlap_ids,
         claims_by_identity,
         complete_paths,
         descendant_paths,
@@ -937,11 +1033,18 @@ def _related_claim_ids(
     related = {claim.claim_id for claim in selected}
     for claim in selected:
         related.update(index.claims_by_identity[_identity_key(claim)])
-        for path in claim.scope:
-            parts = PurePosixPath(path).parts
-            related.update(index.descendant_paths.get(parts, ()))
-            for length in range(1, len(parts) + 1):
-                related.update(index.complete_paths.get(parts[:length], ()))
+        related.update(_overlap_peer_ids(index, claim))
+    return related
+
+
+def _overlap_peer_ids(index: ClaimConflictIndex, claim: ActiveClaim) -> set[str]:
+    related: set[str] = set()
+    for path in claim.scope:
+        parts = PurePosixPath(path).parts
+        related.update(index.descendant_paths.get(parts, ()))
+        for length in range(1, len(parts) + 1):
+            related.update(index.complete_paths.get(parts[:length], ()))
+    related.discard(claim.claim_id)
     return related
 
 
@@ -974,6 +1077,18 @@ def claim_comment(request: ClaimRequest) -> str:
         "role": role,
         "scope": list(request.scope),
     }
+    resource_line = ""
+    if request.resource is not None:
+        name = _outbound_resource_name(request.resource)
+        if (
+            isinstance(request.resource_value, bool)
+            or not isinstance(request.resource_value, int)
+            or request.resource_value < 1
+        ):
+            raise ClaimError("resource value must be a positive integer")
+        payload["resource"] = name
+        payload["resource_value"] = request.resource_value
+        resource_line = f"- Resource: `{name}` = {request.resource_value}\n"
     scope = "\n".join(f"- `{path}`" for path in request.scope)
     out_of_order = ""
     if request.out_of_order_reason is not None:
@@ -987,12 +1102,13 @@ def claim_comment(request: ClaimRequest) -> str:
         allow_directory = f"- Allow-directory reason: {reason}\n"
     return _validated_comment(
         f"{_marker(payload)}\n"
-        "## CLAIM — exclusive build lane\n\n"
+        "## CLAIM — build lane\n\n"
         f"- {_identity_label(request.identity, request.branch)}\n"
         f"- Owner: {agent} ({role})\n"
         f"- Base: `{request.base}`\n"
         f"- Branch: `{request.branch}`\n"
         f"- Claim ID: `{request.claim_id}`\n"
+        f"{resource_line}"
         f"{out_of_order}"
         f"{allow_directory}"
         "- Write scope:\n"
@@ -1027,7 +1143,7 @@ def rescope_comment(
         allow_directory = f"- Allow-directory reason: {reason}\n"
     return _validated_comment(
         f"{_marker(payload)}\n"
-        "## RESCOPE — exclusive build lane\n\n"
+        "## RESCOPE — build lane\n\n"
         f"- {_identity_label(claim.identity, claim.branch)}\n"
         f"- Owner: {validated_agent} ({validated_role})\n"
         f"- Base: `{claim.base}`\n"
@@ -1337,6 +1453,64 @@ def _reconcile_identity(
         reconcile_issue_label(client, identity.issue, unclaimed_body=unclaimed_body)
 
 
+def trunk_break_comment(agent: str, role: str) -> str:
+    validated_agent = _outbound_text(agent, "agent", maximum=128)
+    validated_role = _outbound_text(role, "role", maximum=64)
+    return _validated_comment(
+        f"{TRUNK_BREAK_MARKER}\n"
+        "Pulling trunk broke the checks.\n\n"
+        f"Agent: {validated_agent} ({validated_role})"
+    )
+
+
+def record_trunk_break(client: IssueComments, agent: str, role: str) -> int:
+    client.post_comment(LEDGER_ISSUE, trunk_break_comment(agent, role))
+    comments = client.list_protocol_candidates(LEDGER_ISSUE)
+    return trunk_check_breaks(comments)
+
+
+def _next_resource_value(aggregate: ClaimLedgerAggregate, name: str) -> int:
+    values = [
+        event.resource.value
+        for events in aggregate.occurrences.values()
+        for event in events
+        if event.resource is not None and event.resource.name == name
+    ]
+    return max(values, default=0) + 1
+
+
+def _resource_holders(
+    claims: tuple[ActiveClaim, ...], hold: ResourceHold, *, except_id: str
+) -> tuple[ActiveClaim, ...]:
+    return tuple(
+        claim
+        for claim in claims
+        if claim.claim_id != except_id
+        and claim.resource is not None
+        and claim.resource.name == hold.name
+        and claim.resource.value == hold.value
+    )
+
+
+def _assigned_request(
+    request: ClaimRequest, aggregate: ClaimLedgerAggregate
+) -> ClaimRequest:
+    if request.resource is None:
+        if request.resource_value is not None:
+            raise ClaimError("resource value requires a resource name")
+        return request
+    name = _outbound_resource_name(request.resource)
+    if request.resource_value is not None:
+        if (
+            isinstance(request.resource_value, bool)
+            or not isinstance(request.resource_value, int)
+            or request.resource_value < 1
+        ):
+            raise ClaimError("resource value must be a positive integer")
+        return replace(request, resource=name)
+    return replace(request, resource=name, resource_value=_next_resource_value(aggregate, name))
+
+
 def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
     aggregate = _aggregate_claim_events(client.list_protocol_candidates(LEDGER_ISSUE))
     if request.claim_id in aggregate.seen_claim_ids:
@@ -1345,15 +1519,25 @@ def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
             "released; release it, then claim again with a fresh --claim-id"
         )
     _reject_duplicate_claim_ids(aggregate)
+    request = _assigned_request(request, aggregate)
     standing = aggregate.active
-    blocked_by = conflicting_claims(standing, request)
+    blocked_by = blocking_claims(standing, request)
     if blocked_by:
         owner = blocked_by[0]
         raise ClaimUnavailable(
-            f"{_identity_summary(request.identity, request.branch)} or its scope is "
+            f"{_identity_summary(request.identity, request.branch)} is "
             f"claimed by {owner.agent} ({owner.role}) on "
             f"{_identity_summary(owner.identity, owner.branch)} branch {owner.branch}"
         )
+    if request.resource is not None and request.resource_value is not None:
+        hold = ResourceHold(request.resource, request.resource_value)
+        holder = _resource_holders(standing, hold, except_id=request.claim_id)
+        if holder:
+            owner = holder[0]
+            raise ClaimUnavailable(
+                f"{hold.name} {hold.value} is held by {owner.agent} ({owner.role}) on "
+                f"{_identity_summary(owner.identity, owner.branch)}"
+            )
 
     client.post_comment(LEDGER_ISSUE, claim_comment(request))
     post_aggregate = _aggregate_claim_events(client.list_protocol_candidates(LEDGER_ISSUE))
@@ -1371,23 +1555,36 @@ def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
             f"{_identity_summary(request.identity, request.branch)} did not expose "
             "the posted claim id"
         )
-    competitors = conflicting_claims(observed, own)
-    winner = min(
-        (own, *competitors),
-        key=lambda claim: (claim.comment.created_at, claim.comment.identifier),
+    identity_competitors = blocking_claims(observed, own)
+    resource_competitors = (
+        _resource_holders(observed, own.resource, except_id=own.claim_id)
+        if own.resource is not None
+        else ()
     )
-    if winner.claim_id != request.claim_id:
-        client.post_comment(
-            LEDGER_ISSUE,
-            release_comment(own, request.agent, request.role, "claim race lost"),
+    competitors = identity_competitors or resource_competitors
+    if competitors:
+        winner = min(
+            (own, *competitors),
+            key=lambda claim: (claim.comment.created_at, claim.comment.identifier),
         )
-        _reconcile_identity(client, request.identity)
-        _reconcile_identity(client, winner.identity)
-        raise ClaimUnavailable(
-            f"{_identity_summary(request.identity, request.branch)} claim race lost to "
-            f"{winner.agent} ({winner.role}) on "
-            f"{_identity_summary(winner.identity, winner.branch)} branch {winner.branch}"
-        )
+        if winner.claim_id != request.claim_id:
+            client.post_comment(
+                LEDGER_ISSUE,
+                release_comment(own, request.agent, request.role, "claim race lost"),
+            )
+            _reconcile_identity(client, request.identity)
+            _reconcile_identity(client, winner.identity)
+            if own.resource is not None and winner.resource == own.resource:
+                raise ClaimUnavailable(
+                    f"{own.resource.name} {own.resource.value} is held by "
+                    f"{winner.agent} ({winner.role}) on "
+                    f"{_identity_summary(winner.identity, winner.branch)}"
+                )
+            raise ClaimUnavailable(
+                f"{_identity_summary(request.identity, request.branch)} claim race lost to "
+                f"{winner.agent} ({winner.role}) on "
+                f"{_identity_summary(winner.identity, winner.branch)} branch {winner.branch}"
+            )
 
     _reconcile_identity(client, request.identity)
     return own
@@ -1435,20 +1632,6 @@ def _observe_rescoped_claim(
             f"{_identity_summary(identity, selected.branch)} did not observe {observe}"
         )
     return observed, own
-
-
-def _rescope_added_conflicts(
-    claims: tuple[ActiveClaim, ...],
-    claim_id: str,
-    added: tuple[str, ...],
-) -> tuple[ActiveClaim, ...]:
-    if not added:
-        return ()
-    return tuple(
-        claim
-        for claim in claims
-        if claim.claim_id != claim_id and _scopes_overlap(claim.scope, added)
-    )
 
 
 def _select_rescope_claim(
@@ -1520,16 +1703,6 @@ def rescope_claim(
         observed, identity, agent, claim_id, branch=branch
     )
     new_scope = _combined_scope(selected.scope, add_scope, drop_scope)
-    added = tuple(path for path in new_scope if path not in selected.scope)
-    blocked_by = _rescope_added_conflicts(observed, selected.claim_id, added)
-    if blocked_by:
-        owner = blocked_by[0]
-        raise ClaimUnavailable(
-            f"{_identity_summary(identity, selected.branch)} or its scope is "
-            f"claimed by {owner.agent} ({owner.role}) on "
-            f"{_identity_summary(owner.identity, owner.branch)} branch {owner.branch}"
-        )
-
     client.post_comment(
         LEDGER_ISSUE,
         rescope_comment(
@@ -1540,7 +1713,7 @@ def rescope_claim(
             allow_directory_reason=allow_directory_reason,
         ),
     )
-    observed, own = _observe_rescoped_claim(
+    _, own = _observe_rescoped_claim(
         client,
         identity,
         selected,
@@ -1548,30 +1721,6 @@ def rescope_claim(
         expose="the rescoped claim id",
         observe="the posted rescope",
     )
-    competitors = _rescope_added_conflicts(observed, own.claim_id, added)
-    if competitors:
-        competitor = min(
-            competitors,
-            key=lambda claim: (claim.comment.created_at, claim.comment.identifier),
-        )
-        client.post_comment(
-            LEDGER_ISSUE,
-            rescope_comment(selected, selected.scope, agent, selected.role),
-        )
-        _observe_rescoped_claim(
-            client,
-            identity,
-            selected,
-            selected.scope,
-            expose="the rescope rollback",
-            observe="the rescope rollback",
-        )
-        raise ClaimUnavailable(
-            f"{_identity_summary(identity, selected.branch)} rescope race lost to "
-            f"{competitor.agent} ({competitor.role}) on "
-            f"{_identity_summary(competitor.identity, competitor.branch)} "
-            f"branch {competitor.branch}"
-        )
 
     _reconcile_identity(client, identity)
     return own

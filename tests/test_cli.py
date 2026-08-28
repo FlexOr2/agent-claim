@@ -209,6 +209,8 @@ def request(
     role: str = "builder",
     branch: str | None = None,
     scope: tuple[str, ...] = ("docs/COORDINATION.md", "scripts/issue_claim.py"),
+    resource: str | None = None,
+    resource_value: int | None = None,
 ) -> ClaimRequest:
     """Build a `ClaimRequest`, issue-identified by default or lane-identified via `lane=True`.
 
@@ -229,6 +231,8 @@ def request(
         branch=branch or default_branch,
         scope=scope,
         claim_id=claim_id,
+        resource=resource,
+        resource_value=resource_value,
     )
 
 
@@ -261,7 +265,9 @@ class FakeComments:
 
     def list_protocol_candidates(self, issue: int) -> tuple[IssueComment, ...]:
         return tuple(
-            entry for entry in self.comments.get(issue, []) if is_protocol_candidate(entry)
+            entry
+            for entry in self.comments.get(issue, [])
+            if protocol.is_ledger_event_candidate(entry)
         )
 
     def post_comment(self, issue: int, body: str) -> str:
@@ -587,6 +593,7 @@ def test_board_exposes_all_expectation_states(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+    monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
 
     assert issue_claim.main(["--repo", "example/agent-claim", "board"]) == 0
     rendered = capsys.readouterr().out
@@ -597,7 +604,7 @@ def test_board_exposes_all_expectation_states(
     assert "proposed  Claim #11." in next(
         line for line in rendered.splitlines() if "Proposed expectations" in line
     )
-    assert "ruled     Claim #12." in next(
+    assert "ruled 0   Claim #12." in next(
         line for line in rendered.splitlines() if "Ruled expectations" in line
     )
 
@@ -635,7 +642,9 @@ def complete_contract(next_step: str, *, blocked_by: str = "") -> str:
     )
 
 
-def expectation_block(*lines: str, heading: str = "Erwartung") -> str:
+def expectation_block(
+    *lines: str, heading: str = "Erwartung (refine-Lauf 28.08.2026)"
+) -> str:
     return f"## {heading}\n" + "\n".join(lines)
 
 
@@ -669,6 +678,8 @@ def expectation_block(*lines: str, heading: str = "Erwartung") -> str:
                 "title": "Top work",
                 "next": "Claim #11.",
                 "skipped": [],
+                "ruling_landings": None,
+                "ruling_old": None,
             },
             id="emits_the_highest_scored_actionable_item_as_json",
         ),
@@ -718,6 +729,7 @@ def test_next_reports_the_highest_scored_actionable_item(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+    monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
 
     assert issue_claim.main(["--repo", "example/agent-claim", *arguments]) == expected_exit
     rendered = capsys.readouterr().out
@@ -803,6 +815,7 @@ def test_next_reports_expectation_state(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+    monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
 
     assert issue_claim.main(["--repo", "example/agent-claim", "next"]) == expected_exit
     assert capsys.readouterr().out == expected_output
@@ -837,6 +850,7 @@ def test_next_json_names_skipped_proposed_expectations(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+    monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
 
     assert issue_claim.main(["--repo", "example/agent-claim", "next", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == {
@@ -845,6 +859,8 @@ def test_next_json_names_skipped_proposed_expectations(
         "title": "Ready work",
         "next": "Claim #10.",
         "skipped": [{"number": 11, "reason": "Erwartungen ungeregelt"}],
+        "ruling_landings": 0,
+        "ruling_old": False,
     }
 
 
@@ -871,6 +887,7 @@ def test_claim_does_not_treat_proposed_expectations_as_an_out_of_order_competito
     monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+    monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
     monkeypatch.setattr(issue_claim, "_request", lambda _arguments: claimed_request)
 
     assert (
@@ -929,6 +946,7 @@ def test_claim_warns_about_a_higher_scored_actionable_item(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+    monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
     monkeypatch.setattr(issue_claim, "_request", lambda _arguments: claimed_request)
 
     arguments = [
@@ -1135,6 +1153,7 @@ def test_board_reads_priority_configuration_from_the_checkout_root(
             return ()
 
     monkeypatch.setattr(checkout, "_git_output", git_output)
+    monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
 
     projected = issue_claim._board(BoardClient(), ())
 
@@ -1844,8 +1863,10 @@ def test_scope_overlap_is_repository_wide_and_path_aware() -> None:
     nested = request("claim-b", issue=72, scope=("frontend/src/lib/player.ts",))
     sibling = request("claim-c", issue=73, scope=("frontend/tests",))
 
-    assert claims_conflict(left, nested)
+    assert not claims_conflict(left, nested)
+    assert protocol.claims_overlap(left, nested)
     assert not claims_conflict(left, sibling)
+    assert not protocol.claims_overlap(left, sibling)
 
 
 def test_comma_joined_scope_marker_is_read_as_distinct_paths() -> None:
@@ -1876,7 +1897,7 @@ def test_comma_joined_scope_marker_is_read_as_distinct_paths() -> None:
     )
 
 
-def test_comma_joined_scope_on_another_issue_refuses_a_claim_for_one_of_the_paths() -> None:
+def test_comma_joined_scope_on_another_issue_is_an_overlap_note_not_a_refusal() -> None:
     incumbent = comment(
         1,
         marker(
@@ -1896,13 +1917,16 @@ def test_comma_joined_scope_on_another_issue_refuses_a_claim_for_one_of_the_path
     )
     client = FakeComments({LEDGER_ISSUE: [incumbent]}, {72})
 
-    with pytest.raises(ClaimUnavailable, match="on issue #72"):
-        acquire_claim(
-            client,
-            request("challenger", "Grok 4.6", issue=73, scope=("docs/PRODUCT.md",)),
-        )
+    acquired = acquire_claim(
+        client,
+        request("challenger", "Grok 4.6", issue=73, scope=("docs/PRODUCT.md",)),
+    )
 
-    assert len(client.comments[LEDGER_ISSUE]) == 1
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert {claim.claim_id for claim in standing} == {"joined", acquired.claim_id}
+    assert [claim.claim_id for claim in protocol.overlapping_claims(standing, acquired)] == [
+        "joined"
+    ]
 
 
 def test_comma_joined_scope_with_spaces_equals_repeated_entries() -> None:
@@ -1964,8 +1988,8 @@ def test_comma_joined_scope_refuses_empty_or_padded_entries(scope: list[str]) ->
         ),
         pytest.param(
             request("claim-b", lane=True, branch="docs/lane-b", scope=("shared/file.py",)),
-            True,
-            id="different-lanes-overlapping-scope-conflicts",
+            False,
+            id="different-lanes-overlapping-scope-is-not-a-conflict",
         ),
         pytest.param(
             request("claim-b", lane=True, branch="docs/lane-b", scope=("other",)),
@@ -1974,8 +1998,8 @@ def test_comma_joined_scope_refuses_empty_or_padded_entries(scope: list[str]) ->
         ),
         pytest.param(
             request("claim-b", issue=72, scope=("shared/file.py",)),
-            True,
-            id="lane-and-issue-overlapping-scope-conflicts",
+            False,
+            id="lane-and-issue-overlapping-scope-is-not-a-conflict",
         ),
         pytest.param(
             request("claim-b", issue=72, scope=("other",)),
@@ -2025,17 +2049,17 @@ def test_status_scope_index_never_rescans_scope_pairs(
     assert capsys.readouterr().out.count("CLAIMED") == 1
 
 
-def test_existing_scope_on_another_issue_refuses_before_posting() -> None:
+def test_existing_scope_on_another_issue_is_posted_as_an_overlap() -> None:
     incumbent = comment(1, claim_comment(request(issue=71, scope=("shared",))))
     client = FakeComments({LEDGER_ISSUE: [incumbent]}, {71})
 
-    with pytest.raises(ClaimUnavailable, match="on issue #71"):
-        acquire_claim(
-            client,
-            request("challenger", "Grok 4.6", issue=72, scope=("shared/file.py",)),
-        )
+    acquired = acquire_claim(
+        client,
+        request("challenger", "Grok 4.6", issue=72, scope=("shared/file.py",)),
+    )
 
-    assert len(client.comments[LEDGER_ISSUE]) == 1
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert {claim.claim_id for claim in standing} == {"claim-a", acquired.claim_id}
 
 
 def test_rescope_adds_a_path_without_changing_claim_id_or_base() -> None:
@@ -2079,26 +2103,26 @@ def test_rescope_drop_and_add_replace_paths_atomically() -> None:
     assert updated.scope == ("src/keep.py", "src/new.py")
 
 
-def test_rescope_refuses_a_path_held_by_another_issue() -> None:
+def test_rescope_adds_a_path_held_by_another_issue() -> None:
     client = FakeComments()
     acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
     other = acquire_claim(
         client, request("claim-b", "Grok 4.6", issue=73, scope=("docs/PRODUCT.md",))
     )
 
-    with pytest.raises(ClaimUnavailable, match="on issue #73"):
-        rescope_claim(
-            client,
-            IssueIdentity(72),
-            "Codex Sol",
-            ("docs/PRODUCT.md",),
-            (),
-            "claim-a",
-        )
+    updated = rescope_claim(
+        client,
+        IssueIdentity(72),
+        "Codex Sol",
+        ("docs/PRODUCT.md",),
+        (),
+        "claim-a",
+    )
 
     standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
     scopes = {claim.claim_id: claim.scope for claim in standing}
-    assert scopes["claim-a"] == ("src/widget.py",)
+    assert updated.scope == ("src/widget.py", "docs/PRODUCT.md")
+    assert scopes["claim-a"] == ("src/widget.py", "docs/PRODUCT.md")
     assert scopes[other.claim_id] == ("docs/PRODUCT.md",)
 
 
@@ -2125,7 +2149,7 @@ def test_rescope_drops_an_unrelated_path_when_the_remainder_already_overlaps() -
     assert scopes["claim-b"] == ("docs/product",)
 
 
-def test_rescope_refuses_adding_a_held_path_when_the_remainder_already_overlaps() -> None:
+def test_rescope_adds_a_held_path_when_the_remainder_already_overlaps() -> None:
     client = _claims_client(
         request(issue=72, scope=("docs/product", "tests/tooling")),
         request(
@@ -2136,19 +2160,19 @@ def test_rescope_refuses_adding_a_held_path_when_the_remainder_already_overlaps(
         ),
     )
 
-    with pytest.raises(ClaimUnavailable, match="on issue #73"):
-        rescope_claim(
-            client,
-            IssueIdentity(72),
-            "Codex Sol",
-            ("src/held.py",),
-            (),
-            "claim-a",
-        )
+    updated = rescope_claim(
+        client,
+        IssueIdentity(72),
+        "Codex Sol",
+        ("src/held.py",),
+        (),
+        "claim-a",
+    )
 
     standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
     scopes = {claim.claim_id: claim.scope for claim in standing}
-    assert scopes["claim-a"] == ("docs/product", "tests/tooling")
+    assert updated.scope == ("docs/product", "tests/tooling", "src/held.py")
+    assert scopes["claim-a"] == ("docs/product", "tests/tooling", "src/held.py")
     assert scopes["claim-b"] == ("docs/product", "src/held.py")
 
 
@@ -2221,7 +2245,7 @@ def test_rescope_refuses_a_foreign_agent() -> None:
         ),
     ],
 )
-def test_rescope_race_reverts_to_the_previous_scope(
+def test_rescope_keeps_an_added_path_that_another_claim_also_holds(
     competitor_id: str, created_at: str
 ) -> None:
     client = FakeComments()
@@ -2235,20 +2259,20 @@ def test_rescope_race_reverts_to_the_previous_scope(
     )
     client.inject_before_next_ledger_post = competitor
 
-    with pytest.raises(ClaimUnavailable, match="rescope race lost to Grok 4.6"):
-        rescope_claim(
-            client,
-            IssueIdentity(72),
-            "Codex Sol",
-            ("src/new.py",),
-            (),
-            "claim-a",
-        )
+    updated = rescope_claim(
+        client,
+        IssueIdentity(72),
+        "Codex Sol",
+        ("src/new.py",),
+        (),
+        "claim-a",
+    )
 
     standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
     scopes = {claim.claim_id: claim.scope for claim in standing}
     assert set(scopes) == {"claim-a", competitor_id}
-    assert scopes["claim-a"] == ("src/widget.py",)
+    assert updated.scope == ("src/widget.py", "src/new.py")
+    assert scopes["claim-a"] == ("src/widget.py", "src/new.py")
     assert scopes[competitor_id] == ("src/new.py",)
 
 
@@ -2332,17 +2356,19 @@ def test_same_lane_refuses_a_second_claim_even_with_disjoint_scope() -> None:
         )
 
 
-def test_lane_and_issue_claim_with_overlapping_scope_refuses_before_posting() -> None:
+def test_lane_and_issue_claim_with_overlapping_scope_both_stay_live() -> None:
     client = FakeComments()
     acquire_claim(client, request(issue=72, scope=("shared",)))
 
-    with pytest.raises(ClaimUnavailable, match="lane 'docs/lane-a'"):
-        acquire_claim(
-            client,
-            request(
-                "claim-b", "Grok 4.6", lane=True, branch="docs/lane-a", scope=("shared/file.py",)
-            ),
-        )
+    lane = acquire_claim(
+        client,
+        request(
+            "claim-b", "Grok 4.6", lane=True, branch="docs/lane-a", scope=("shared/file.py",)
+        ),
+    )
+
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert {claim.claim_id for claim in standing} == {"claim-a", lane.claim_id}
 
 
 def test_acquire_claim_refuses_reusing_an_active_claim_id_before_posting() -> None:
@@ -2385,7 +2411,7 @@ def test_acquire_claim_translates_a_same_claim_id_post_race_into_a_clear_error()
         acquire_claim(client, request("claim-a", "Codex Sol", issue=72, scope=("mine",)))
 
 
-def test_earlier_ledger_comment_wins_cross_issue_scope_race_and_label_survives() -> None:
+def test_cross_issue_scope_race_keeps_both_overlapping_claims() -> None:
     client = FakeComments()
     earlier = comment(
         100,
@@ -2396,15 +2422,14 @@ def test_earlier_ledger_comment_wins_cross_issue_scope_race_and_label_survives()
     )
     client.inject_after_next_ledger_post = earlier
 
-    with pytest.raises(ClaimUnavailable, match="race lost to Grok 4.6"):
-        acquire_claim(
-            client,
-            request("later", "Codex Sol", issue=73, scope=("shared",)),
-        )
+    later = acquire_claim(
+        client,
+        request("later", "Codex Sol", issue=73, scope=("shared",)),
+    )
 
     standing = active_claims(tuple(client.comments[LEDGER_ISSUE]))
-    assert [claim.claim_id for claim in standing] == ["earlier"]
-    assert client.labels == {72}
+    assert {claim.claim_id for claim in standing} == {"earlier", later.claim_id}
+    assert client.labels == {73}
 
 
 def test_release_removes_projection_only_after_claim_is_gone() -> None:
@@ -3147,7 +3172,9 @@ def test_paused_old_release_fails_frozen_without_mutating_successor_projection(
     assert client.other_labels == {claim_label(170): {72}}
 
 
-def test_status_reports_repository_scope_conflicts(capsys: pytest.CaptureFixture[str]) -> None:
+def test_status_reports_repository_scope_overlaps_as_notes(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     first = parse_claim_event(
         comment(1, claim_comment(request(issue=72, scope=("shared",))))
     )
@@ -3161,13 +3188,19 @@ def test_status_reports_repository_scope_conflicts(capsys: pytest.CaptureFixture
 
     exit_code = _status((first, second), None)
 
-    assert exit_code == 2
-    assert capsys.readouterr().out.count("CONFLICT") == 2
-    assert _status((first, second), 72) == 2
-    assert capsys.readouterr().out.count("CONFLICT") == 2
+    assert exit_code == 0
+    rendered = capsys.readouterr().out
+    assert rendered.count("CLAIMED") == 2
+    assert "CONFLICT" not in rendered
+    assert "overlaps issue #73 (claim-b)" in rendered
+    assert "overlaps issue #72 (claim-a)" in rendered
+    assert _status((first, second), 72) == 0
+    issue_rendered = capsys.readouterr().out
+    assert issue_rendered.count("CLAIMED") == 2
+    assert "overlaps issue #73 (claim-b)" in issue_rendered
 
 
-def test_status_detects_a_scope_that_is_claimed_after_its_descendant(
+def test_status_notes_a_scope_that_is_claimed_after_its_descendant(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     descendant = parse_claim_event(
@@ -3178,8 +3211,10 @@ def test_status_detects_a_scope_that_is_claimed_after_its_descendant(
     )
     assert descendant is not None and parent is not None
 
-    assert _status((descendant, parent), None) == 2
-    assert capsys.readouterr().out.count("CONFLICT") == 2
+    assert _status((descendant, parent), None) == 0
+    rendered = capsys.readouterr().out
+    assert rendered.count("CLAIMED") == 2
+    assert "CONFLICT" not in rendered
 
 
 def test_github_comment_reader_accepts_paginated_json_lines(
@@ -3946,6 +3981,8 @@ def _git_checkout(
         ("rev-parse", "--git-dir"): git_directory,
         ("rev-parse", "--git-common-dir"): common_directory,
         ("status", "--porcelain"): dirty,
+        ("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"): "refs/remotes/origin/main",
+        ("log", "--reverse", "--format=%cI", "refs/remotes/origin/main"): "",
     }
 
 
@@ -4953,7 +4990,9 @@ def test_cli_status_empty_ledger_prints_ledger_then_unclaimed_repository(
     _patch_status_cli(monkeypatch, FakeComments())
 
     assert issue_claim.main(["--repo", "example/agent-claim", "status"]) == 0
-    assert capsys.readouterr().out == f"LEDGER #{LEDGER_ISSUE}\nUNCLAIMED repository\n"
+    assert capsys.readouterr().out == (
+        f"LEDGER #{LEDGER_ISSUE}\ntrunk-pull breaks: 0\nUNCLAIMED repository\n"
+    )
 
 
 def test_cli_status_issue_with_no_claim_prints_ledger_then_unclaimed_issue(
@@ -4963,7 +5002,9 @@ def test_cli_status_issue_with_no_claim_prints_ledger_then_unclaimed_issue(
     _patch_status_cli(monkeypatch, FakeComments())
 
     assert issue_claim.main(["--repo", "example/agent-claim", "status", "72"]) == 0
-    assert capsys.readouterr().out == f"LEDGER #{LEDGER_ISSUE}\nUNCLAIMED issue #72\n"
+    assert capsys.readouterr().out == (
+        f"LEDGER #{LEDGER_ISSUE}\ntrunk-pull breaks: 0\nUNCLAIMED issue #72\n"
+    )
 
 
 def test_cli_status_after_claim_prints_ledger_then_claimed(
@@ -5003,6 +5044,7 @@ def test_cli_status_after_claim_prints_ledger_then_claimed(
     assert status == 0
     assert capsys.readouterr().out == (
         f"LEDGER #{LEDGER_ISSUE}\n"
+        "trunk-pull breaks: 0\n"
         f"CLAIMED issue #72: Codex Sol (builder) base={BASE} "
         "branch=codex/issue-72 claim=cli-claim 0h 0m\n"
         "  src\n"
@@ -5048,6 +5090,7 @@ def test_cli_lane_claim_status_and_release_round_trip_without_issue_number(
     assert issue_claim.main(["--repo", "example/agent-claim", "status"]) == 0
     assert capsys.readouterr().out == (
         f"LEDGER #{LEDGER_ISSUE}\n"
+        "trunk-pull breaks: 0\n"
         f"CLAIMED lane docs/lane-cleanup: Codex Sol (builder) base={BASE} "
         "branch=docs/lane-cleanup claim=cli-lane-claim 0h 0m\n"
         "  docs\n"
@@ -5098,7 +5141,7 @@ def test_cli_lane_mode_refuses_a_non_conventional_branch(
     assert client.comments == {}
 
 
-def test_cli_status_overlapping_protocol_comments_print_ledger_then_conflict(
+def test_cli_status_overlapping_protocol_comments_print_ledger_then_notes(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -5118,15 +5161,18 @@ def test_cli_status_overlapping_protocol_comments_print_ledger_then_conflict(
     _patch_status_cli(monkeypatch, client)
 
     status = issue_claim.main(["--repo", "example/agent-claim", "status"])
-    assert status == 2
+    assert status == 0
     assert capsys.readouterr().out == (
         f"LEDGER #{LEDGER_ISSUE}\n"
-        f"CONFLICT issue #72: Codex Sol (builder) base={BASE} "
+        "trunk-pull breaks: 0\n"
+        f"CLAIMED issue #72: Codex Sol (builder) base={BASE} "
         "branch=codex/issue-72-claims claim=claim-a 0h 0m\n"
         "  shared\n"
-        f"CONFLICT issue #73: Grok 4.6 (builder) base={BASE} "
+        "  overlaps issue #73 (claim-b)\n"
+        f"CLAIMED issue #73: Grok 4.6 (builder) base={BASE} "
         "branch=codex/issue-73-claims claim=claim-b 0h 0m\n"
         "  shared/file.py\n"
+        "  overlaps issue #72 (claim-a)\n"
     )
 
 
@@ -5163,6 +5209,7 @@ def test_cli_status_json_empty_ledger_prints_unclaimed_object(
             "ledger": LEDGER_ISSUE,
             "issue": None,
             "state": "UNCLAIMED",
+            "trunk_check_breaks": 0,
             "claims": [],
         }
     ) + "\n"
@@ -5182,6 +5229,7 @@ def test_cli_status_json_issue_with_no_claim_prints_unclaimed_object(
             "ledger": LEDGER_ISSUE,
             "issue": 72,
             "state": "UNCLAIMED",
+            "trunk_check_breaks": 0,
             "claims": [],
         }
     ) + "\n"
@@ -5229,6 +5277,7 @@ def test_cli_status_json_after_claim_prints_claimed_object(
             "ledger": LEDGER_ISSUE,
             "issue": 72,
             "state": "CLAIMED",
+            "trunk_check_breaks": 0,
             "claims": [
                 {
                     "issue": 72,
@@ -5239,6 +5288,9 @@ def test_cli_status_json_after_claim_prints_claimed_object(
                     "branch": "codex/issue-72",
                     "claim_id": "cli-claim",
                     "scope": ["src"],
+                    "resource": None,
+                    "resource_value": None,
+                    "overlaps": [],
                     "state": "CLAIMED",
                     "age": "0h 0m",
                     "old": False,
@@ -5248,7 +5300,7 @@ def test_cli_status_json_after_claim_prints_claimed_object(
     ) + "\n"
 
 
-def test_cli_status_json_overlapping_protocol_comments_print_conflict_object(
+def test_cli_status_json_overlapping_protocol_comments_print_claimed_object(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -5268,12 +5320,13 @@ def test_cli_status_json_overlapping_protocol_comments_print_conflict_object(
     _patch_status_cli(monkeypatch, client)
 
     status = issue_claim.main(["--repo", "example/agent-claim", "status", "--json"])
-    assert status == 2
+    assert status == 0
     assert capsys.readouterr().out == json.dumps(
         {
             "ledger": LEDGER_ISSUE,
             "issue": None,
-            "state": "CONFLICT",
+            "state": "CLAIMED",
+            "trunk_check_breaks": 0,
             "claims": [
                 {
                     "issue": 72,
@@ -5284,7 +5337,17 @@ def test_cli_status_json_overlapping_protocol_comments_print_conflict_object(
                     "branch": "codex/issue-72-claims",
                     "claim_id": "claim-a",
                     "scope": ["shared"],
-                    "state": "CONFLICT",
+                    "resource": None,
+                    "resource_value": None,
+                    "overlaps": [
+                        {
+                            "issue": 73,
+                            "lane": None,
+                            "claim_id": "claim-b",
+                            "agent": "Grok 4.6",
+                        }
+                    ],
+                    "state": "CLAIMED",
                     "age": "0h 0m",
                     "old": False,
                 },
@@ -5297,7 +5360,17 @@ def test_cli_status_json_overlapping_protocol_comments_print_conflict_object(
                     "branch": "codex/issue-73-claims",
                     "claim_id": "claim-b",
                     "scope": ["shared/file.py"],
-                    "state": "CONFLICT",
+                    "resource": None,
+                    "resource_value": None,
+                    "overlaps": [
+                        {
+                            "issue": 72,
+                            "lane": None,
+                            "claim_id": "claim-a",
+                            "agent": "Codex Sol",
+                        }
+                    ],
+                    "state": "CLAIMED",
                     "age": "0h 0m",
                     "old": False,
                 },
@@ -5306,7 +5379,7 @@ def test_cli_status_json_overlapping_protocol_comments_print_conflict_object(
     ) + "\n"
 
 
-def test_cli_status_json_issue_on_overlap_prints_related_conflict_object(
+def test_cli_status_json_issue_on_overlap_prints_related_claimed_object(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -5328,12 +5401,13 @@ def test_cli_status_json_issue_on_overlap_prints_related_conflict_object(
     status = issue_claim.main(
         ["--repo", "example/agent-claim", "status", "72", "--json"]
     )
-    assert status == 2
+    assert status == 0
     assert capsys.readouterr().out == json.dumps(
         {
             "ledger": LEDGER_ISSUE,
             "issue": 72,
-            "state": "CONFLICT",
+            "state": "CLAIMED",
+            "trunk_check_breaks": 0,
             "claims": [
                 {
                     "issue": 72,
@@ -5344,7 +5418,17 @@ def test_cli_status_json_issue_on_overlap_prints_related_conflict_object(
                     "branch": "codex/issue-72-claims",
                     "claim_id": "claim-a",
                     "scope": ["shared"],
-                    "state": "CONFLICT",
+                    "resource": None,
+                    "resource_value": None,
+                    "overlaps": [
+                        {
+                            "issue": 73,
+                            "lane": None,
+                            "claim_id": "claim-b",
+                            "agent": "Grok 4.6",
+                        }
+                    ],
+                    "state": "CLAIMED",
                     "age": "0h 0m",
                     "old": False,
                 },
@@ -5357,7 +5441,17 @@ def test_cli_status_json_issue_on_overlap_prints_related_conflict_object(
                     "branch": "codex/issue-73-claims",
                     "claim_id": "claim-b",
                     "scope": ["shared/file.py"],
-                    "state": "CONFLICT",
+                    "resource": None,
+                    "resource_value": None,
+                    "overlaps": [
+                        {
+                            "issue": 72,
+                            "lane": None,
+                            "claim_id": "claim-a",
+                            "agent": "Codex Sol",
+                        }
+                    ],
+                    "state": "CLAIMED",
                     "age": "0h 0m",
                     "old": False,
                 },
@@ -5432,7 +5526,7 @@ def test_cli_claim_without_json_prints_the_claimed_line(
     assert capsys.readouterr().out == (
         "CLAIMED issue #72: cli-claim "
         "https://github.com/example/agent-claim/issues/71#issuecomment-1\n"
-        "1 of 4 versioned files (25%); touches no other open claims\n"
+        "1 of 4 versioned files (25%); overlaps no other open claims\n"
     )
 
 
@@ -5475,7 +5569,7 @@ def test_cli_comma_joined_scope_is_stored_as_distinct_paths_and_overlaps(
         "src/atelier2/adapters/dbos/run_transitions.py",
     )
 
-    refused = issue_claim.main(
+    second = issue_claim.main(
         [
             "--repo",
             "example/agent-claim",
@@ -5497,15 +5591,10 @@ def test_cli_comma_joined_scope_is_stored_as_distinct_paths_and_overlaps(
     )
     captured = capsys.readouterr()
 
-    assert refused == 2
-    assert captured.out == (
-        "CLAIMED issue #72: joined "
-        "https://github.com/example/agent-claim/issues/71#issuecomment-1\n"
-        "0 of 4 versioned files (0%); touches no other open claims\n"
-    )
-    assert captured.err.startswith("ERROR:")
-    assert "issue #72" in captured.err
-    assert len(client.list_protocol_candidates(LEDGER_ISSUE)) == 1
+    assert second == 0
+    assert "CLAIMED issue #73: single " in captured.out
+    assert "overlaps issue #72 (joined)" in captured.out
+    assert len(client.list_protocol_candidates(LEDGER_ISSUE)) == 2
 
 
 def test_cli_comma_joined_scope_flag_equals_repeated_scope_flags(
@@ -5979,7 +6068,7 @@ def test_cli_claim_share_at_a_quarter_does_not_need_allow_directory(
 
     assert status == 0
     assert capsys.readouterr().out.endswith(
-        "1 of 4 versioned files (25%); touches no other open claims\n"
+        "1 of 4 versioned files (25%); overlaps no other open claims\n"
     )
 
 
@@ -6039,11 +6128,11 @@ def test_claim_cost_lists_an_overlapping_standing_claim_as_a_touch() -> None:
     )
 
     assert [claim.claim_id for claim in overlapping] == ["claim-a"]
-    assert issue_claim._touch_summary(overlapping) == "would touch issue #55 (claim-a)"
+    assert issue_claim._touch_summary(overlapping) == "overlaps issue #55 (claim-a)"
     assert issue_claim._touch_summary(both) == (
-        "would touch issue #55 (claim-a), lane docs/foo (claim-b)"
+        "overlaps issue #55 (claim-a), lane docs/foo (claim-b)"
     )
-    assert issue_claim._touch_summary(()) == "touches no other open claims"
+    assert issue_claim._touch_summary(()) == "overlaps no other open claims"
 
 
 def test_claim_age_old_compares_real_age_against_the_threshold() -> None:
@@ -6078,6 +6167,7 @@ def test_status_and_board_show_claim_age_from_the_claim_comment(
     client.board_issues = (board_issue(72, "Work", complete_contract("Claim #72.")),)
     _patch_status_cli(monkeypatch, client)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+    monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
 
     assert issue_claim.main(["--repo", "example/agent-claim", "status", "72"]) == 0
     status_out = capsys.readouterr().out
@@ -6108,6 +6198,7 @@ def test_status_and_board_mark_a_claim_old_after_sixty_one_minutes(
     client.board_issues = (board_issue(72, "Work", complete_contract("Claim #72.")),)
     _patch_status_cli(monkeypatch, client)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+    monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
 
     assert issue_claim.main(["--repo", "example/agent-claim", "status", "72"]) == 0
     assert " 1h 1m old\n" in capsys.readouterr().out
@@ -6468,6 +6559,8 @@ def test_cli_claim_json_prints_acquired_claim_object(
             "base": BASE,
             "branch": branch,
             "scope": ["src", "docs"],
+            "resource": None,
+            "resource_value": None,
             "versioned_files": 1,
             "versioned_files_total": 4,
             "share": 0.25,
@@ -7319,3 +7412,481 @@ def test_protect_non_claim_error_from_write_path_denies_json_without_traceback(
         "decision": "deny",
         "reason": "write path crashed",
     }
+
+
+def test_two_lanes_may_claim_the_same_file() -> None:
+    client = FakeComments()
+    first = acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
+    second = acquire_claim(
+        client, request("claim-b", "Grok 4.6", issue=73, scope=("src/widget.py",))
+    )
+
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert {claim.claim_id for claim in standing} == {first.claim_id, second.claim_id}
+    holders = claims_holding_path(standing, "src/widget.py")
+    assert {claim.claim_id for claim in holders} == {first.claim_id, second.claim_id}
+
+
+def test_many_lanes_may_claim_the_same_directory() -> None:
+    client = FakeComments()
+    acquired = [
+        acquire_claim(
+            client,
+            request(f"claim-{index}", f"Agent {index}", issue=100 + index, scope=("src",)),
+        )
+        for index in range(8)
+    ]
+
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert len(standing) == 8
+    assert {claim.claim_id for claim in standing} == {claim.claim_id for claim in acquired}
+
+
+def test_same_issue_still_refuses_a_second_live_claim() -> None:
+    client = FakeComments()
+    acquire_claim(client, request(issue=72, scope=("src/a.py",)))
+
+    with pytest.raises(ClaimUnavailable, match="issue #72 is claimed"):
+        acquire_claim(
+            client, request("claim-b", "Grok 4.6", issue=72, scope=("src/b.py",))
+        )
+
+
+def test_resource_allocates_unique_values_in_sequence() -> None:
+    client = FakeComments()
+    first = acquire_claim(
+        client, request(issue=72, scope=("src/a.py",), resource="schema-hop")
+    )
+    second = acquire_claim(
+        client,
+        request("claim-b", "Grok 4.6", issue=73, scope=("src/b.py",), resource="schema-hop"),
+    )
+
+    assert first.resource == protocol.ResourceHold("schema-hop", 1)
+    assert second.resource == protocol.ResourceHold("schema-hop", 2)
+    assert "Resource: `schema-hop` = 1" in client.comments[LEDGER_ISSUE][0].body
+
+
+def test_resource_refuses_a_second_live_hold_of_the_same_value() -> None:
+    client = FakeComments()
+    acquire_claim(
+        client,
+        request(issue=72, scope=("src/a.py",), resource="schema-hop", resource_value=4),
+    )
+
+    with pytest.raises(ClaimUnavailable, match="schema-hop 4 is held by Codex Sol"):
+        acquire_claim(
+            client,
+            request(
+                "claim-b",
+                "Grok 4.6",
+                issue=73,
+                scope=("src/b.py",),
+                resource="schema-hop",
+                resource_value=4,
+            ),
+        )
+
+
+def test_releasing_a_resource_drops_the_hold_and_keeps_later_values_unique() -> None:
+    client = FakeComments()
+    first = acquire_claim(
+        client, request(issue=72, scope=("src/a.py",), resource="schema-hop")
+    )
+    release_claim(client, IssueIdentity(72), "Codex Sol", "builder", "abandoned", first.claim_id)
+    acquire_claim(
+        client,
+        request("claim-b", "Grok 4.6", issue=73, scope=("src/b.py",), resource="schema-hop"),
+    )
+
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert [claim.resource for claim in standing] == [protocol.ResourceHold("schema-hop", 2)]
+
+
+def test_resource_race_loses_to_the_named_holder() -> None:
+    client = FakeComments()
+    earlier = comment(
+        100,
+        claim_comment(
+            request(
+                "earlier",
+                "Grok 4.6",
+                issue=72,
+                scope=("src/a.py",),
+                resource="schema-hop",
+                resource_value=1,
+            )
+        ),
+        created_at="2026-08-20T23:59:59Z",
+    )
+    client.inject_after_next_ledger_post = earlier
+
+    with pytest.raises(ClaimUnavailable, match="schema-hop 1 is held by Grok 4.6"):
+        acquire_claim(
+            client,
+            request("later", "Codex Sol", issue=73, scope=("src/b.py",), resource="schema-hop"),
+        )
+
+    standing = active_claims(tuple(client.comments[LEDGER_ISSUE]))
+    assert [claim.claim_id for claim in standing] == ["earlier"]
+    assert standing[0].resource == protocol.ResourceHold("schema-hop", 1)
+
+
+def test_cli_claim_resource_prints_the_allocated_value(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    client = FakeComments()
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "src",
+            "--resource",
+            "schema-hop",
+            "--claim-id",
+            "hop-1",
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert status == 0
+    assert payload["resource"] == "schema-hop"
+    assert payload["resource_value"] == 1
+    posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])
+    assert isinstance(posted, ActiveClaim)
+    assert posted.resource == protocol.ResourceHold("schema-hop", 1)
+
+
+def test_who_lists_every_holder_without_calling_overlap_an_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    client = _claims_client(
+        request("mine", "Ada", issue=72, scope=("src/widget.py",)),
+        request("theirs", "Grok 4.6", issue=73, scope=("src/widget.py",)),
+    )
+    _patch_status_cli(monkeypatch, client)
+
+    status = issue_claim.main(["--repo", "example/agent-claim", "who", "src/widget.py"])
+    rendered = capsys.readouterr().out
+
+    assert status == 0
+    assert "CONFLICT" not in rendered
+    assert "CLAIMED src/widget.py issue #72" in rendered
+    assert "CLAIMED src/widget.py issue #73" in rendered
+    assert "overlap: issue #72 (mine), issue #73 (theirs)" in rendered
+
+
+def test_ruled_expectations_without_a_date_fail_loud() -> None:
+    issue = board_issue(
+        10,
+        "Undated",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block("- Name it. *(geregelt: ja)*", heading="Erwartung"),
+    )
+
+    with pytest.raises(ClaimError, match="no readable date"):
+        board.build_board(
+            (issue,),
+            (),
+            (),
+            (),
+            board.BoardConfig(),
+            now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+        )
+
+
+def test_proposed_expectations_have_neither_fresh_nor_old() -> None:
+    issue = board_issue(
+        10,
+        "Proposed",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block("- Name it. *(Default: yes)*"),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
+    assert projected.items[0].ruling_landings is None
+    assert projected.items[0].ruling_old is None
+
+
+def test_a_ruling_is_old_after_ten_trunk_landings() -> None:
+    issue = board_issue(
+        10,
+        "Ruled",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block("- Name it. *(geregelt: ja)*"),
+    )
+    landings = tuple(
+        datetime(2026, 8, 29, hour, tzinfo=timezone.utc) for hour in range(10)
+    )
+    projected = board.build_board(
+        (issue,),
+        (),
+        (),
+        (),
+        board.BoardConfig(),
+        now=datetime(2026, 8, 30, tzinfo=timezone.utc),
+        trunk_landings=landings,
+    )
+    item = projected.items[0]
+
+    assert item.ruling_landings == 10
+    assert item.ruling_old is True
+    assert "ruled 10 old" in board.render(projected)
+
+
+def test_one_trunk_landing_does_not_make_a_ruling_old() -> None:
+    issue = board_issue(
+        10,
+        "Ruled",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block("- Name it. *(geregelt: ja)*"),
+    )
+    projected = board.build_board(
+        (issue,),
+        (),
+        (),
+        (),
+        board.BoardConfig(),
+        now=datetime(2026, 8, 30, tzinfo=timezone.utc),
+        trunk_landings=(datetime(2026, 8, 29, tzinfo=timezone.utc),),
+    )
+
+    assert projected.items[0].ruling_landings == 1
+    assert projected.items[0].ruling_old is False
+
+
+def test_same_day_trunk_landings_do_not_age_a_date_only_ruling() -> None:
+    issue = board_issue(
+        10,
+        "Ruled",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block("- Name it. *(geregelt: ja)*"),
+    )
+    projected = board.build_board(
+        (issue,),
+        (),
+        (),
+        (),
+        board.BoardConfig(),
+        now=datetime(2026, 8, 28, tzinfo=timezone.utc),
+        trunk_landings=(datetime(2026, 8, 28, 23, tzinfo=timezone.utc),),
+    )
+
+    assert projected.items[0].ruling_landings == 0
+    assert projected.items[0].ruling_old is False
+
+
+def test_operator_ruling_date_wins_over_another_heading_date() -> None:
+    issue = board_issue(
+        10,
+        "Ruled",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "- Name it. *(geregelt: ja)*",
+            heading="Erwartungen (refine-Lauf 01.08.2026 - GEREGELT: Operator 28.08.2026)",
+        ),
+    )
+    landings = (
+        datetime(2026, 8, 15, tzinfo=timezone.utc),
+        datetime(2026, 8, 29, tzinfo=timezone.utc),
+    )
+    projected = board.build_board(
+        (issue,),
+        (),
+        (),
+        (),
+        board.BoardConfig(),
+        now=datetime(2026, 8, 30, tzinfo=timezone.utc),
+        trunk_landings=landings,
+    )
+
+    assert projected.items[0].ruling_landings == 1
+
+
+def test_distinct_heading_dates_without_an_operator_date_fail_loud() -> None:
+    issue = board_issue(
+        10,
+        "Ambiguous",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "- Name it. *(geregelt: ja)*",
+            heading="Erwartungen (01.08.2026 and 28.08.2026)",
+        ),
+    )
+
+    with pytest.raises(ClaimError, match="more than one date"):
+        board.build_board(
+            (issue,),
+            (),
+            (),
+            (),
+            board.BoardConfig(),
+            now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+        )
+
+
+def test_next_names_an_old_ruling_when_the_item_is_pulled(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    issue = board_issue(
+        10,
+        "Work",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block("- Name it. *(geregelt: ja)*"),
+    )
+    client = _claims_client()
+    monkeypatch.setattr(client, "list_open_board_issues", lambda: (issue,))
+    monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
+    monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+    monkeypatch.setattr(
+        checkout,
+        "trunk_landing_times",
+        lambda: tuple(datetime(2026, 8, 29, hour, tzinfo=timezone.utc) for hour in range(10)),
+    )
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "next"]) == 0
+    assert capsys.readouterr().out == (
+        "#10 score -10: Work\n"
+        "Next: Claim #10.\n"
+        "vor 10 Landungen geregelt, beim Ziehen neu refinen\n"
+    )
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "next", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ruling_landings"] == 10
+    assert payload["ruling_old"] is True
+    assert payload["ruling_hint"] == "vor 10 Landungen geregelt, beim Ziehen neu refinen"
+
+
+def test_each_item_carries_its_own_ruling_age() -> None:
+    fresh = board_issue(
+        10,
+        "Fresh",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "- Name it. *(geregelt: ja)*",
+            heading="Erwartung (refine-Lauf 28.08.2026)",
+        ),
+    )
+    old = board_issue(
+        11,
+        "Old",
+        complete_contract("Claim #11.")
+        + "\n\n"
+        + expectation_block(
+            "- Name it. *(geregelt: ja)*",
+            heading="Erwartung (refine-Lauf 01.08.2026)",
+        ),
+    )
+    landings = tuple(datetime(2026, 8, 10 + index, tzinfo=timezone.utc) for index in range(12))
+    projected = board.build_board(
+        (fresh, old),
+        (),
+        (),
+        (),
+        board.BoardConfig(),
+        now=datetime(2026, 8, 30, tzinfo=timezone.utc),
+        trunk_landings=landings,
+    )
+    by_number = {item.number: item for item in projected.items}
+
+    assert by_number[10].ruling_old is False
+    assert by_number[11].ruling_old is True
+    assert by_number[11].ruling_landings == 12
+
+
+def test_broke_appends_a_ledger_record_and_status_counts_it(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    client = FakeComments()
+    _patch_status_cli(monkeypatch, client)
+    _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Ada"})
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "broke"]) == 0
+    assert capsys.readouterr().out == "TRUNK-PULL BREAKS 1\n"
+    assert issue_claim.main(["--repo", "example/agent-claim", "broke"]) == 0
+    capsys.readouterr()
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["trunk_check_breaks"] == 2
+
+
+def test_identity_conflict_still_marks_status_conflict(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    first = parse_claim_event(
+        comment(1, claim_comment(request(issue=72, scope=("src/a.py",))))
+    )
+    second = parse_claim_event(
+        comment(
+            2,
+            claim_comment(request("claim-b", "Grok 4.6", issue=72, scope=("src/b.py",))),
+        )
+    )
+    assert first is not None and second is not None
+
+    assert _status((first, second), None) == 2
+    rendered = capsys.readouterr().out
+    assert rendered.count("CONFLICT") == 2
+
+
+def test_trunk_landing_times_read_the_default_branch_not_the_work_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[list[str]] = []
+
+    def git_output(arguments: list[str]) -> str:
+        observed.append(arguments)
+        if arguments[:3] == ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]:
+            return "refs/remotes/origin/main"
+        if arguments[:3] == ["log", "--reverse", "--format=%cI"]:
+            assert arguments[3] == "refs/remotes/origin/main"
+            return "2026-08-29T00:00:00+00:00\n2026-08-30T00:00:00Z"
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(checkout, "_git_output", git_output)
+    times = checkout.trunk_landing_times()
+
+    assert times == (
+        datetime(2026, 8, 29, tzinfo=timezone.utc),
+        datetime(2026, 8, 30, tzinfo=timezone.utc),
+    )
+    assert ["log", "--reverse", "--format=%cI", "refs/remotes/origin/main"] in observed
+
+
+def test_no_path_class_list_is_read_or_written() -> None:
+    assert not Path("src/agent_claim").joinpath("single_writer.py").exists()
+    text = Path("src/agent_claim/protocol.py").read_text()
+    assert "single-writer" not in text
+    assert "single_writer" not in text

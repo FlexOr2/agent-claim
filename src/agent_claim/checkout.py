@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import github
@@ -155,6 +156,49 @@ def _validate_checkout(request: ClaimRequest) -> None:
     dirty = _git_output(["status", "--porcelain"])
     if dirty:
         raise ClaimError("claim must be acquired before the first worktree edit")
+
+
+def _trunk_ref() -> str:
+    try:
+        symbolic = _git_output(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
+        if symbolic:
+            return symbolic
+    except ClaimError:
+        pass
+    for candidate in (
+        "refs/remotes/origin/main",
+        "refs/remotes/origin/master",
+        "main",
+        "master",
+    ):
+        try:
+            _git_output(["rev-parse", "--verify", candidate])
+            return candidate
+        except ClaimError:
+            continue
+    raise ClaimError("cannot determine the main branch for ruling age")
+
+
+def trunk_landing_times() -> tuple[datetime, ...]:
+    """Committer times of landings on the default branch, oldest first.
+
+    The number of landings since a ruling date is this sequence filtered by
+    committer time. Using the default branch — never the work branch — is the
+    contract: a ruling ages with trunk, not with local commits.
+    """
+    raw = _git_output(["log", "--reverse", "--format=%cI", _trunk_ref()])
+    if not raw:
+        return ()
+    times: list[datetime] = []
+    for line in raw.splitlines():
+        try:
+            parsed = datetime.fromisoformat(line.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ClaimError("git returned a malformed trunk landing timestamp") from error
+        if parsed.tzinfo is None:
+            raise ClaimError("git returned a malformed trunk landing timestamp")
+        times.append(parsed.astimezone(timezone.utc))
+    return tuple(times)
 
 
 def _resolved_agent(explicit: str | None) -> str:
