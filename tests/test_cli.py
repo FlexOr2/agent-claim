@@ -6046,14 +6046,25 @@ def test_claim_cost_lists_an_overlapping_standing_claim_as_a_touch() -> None:
     assert issue_claim._touch_summary(()) == "touches no other open claims"
 
 
-def test_claim_age_old_uses_the_same_floored_minutes_as_display() -> None:
+def test_claim_age_old_compares_real_age_against_the_threshold() -> None:
     just_over_an_hour = timedelta(seconds=3601)
+    exactly_one_hour = timedelta(hours=1)
     sixty_one_minutes = timedelta(seconds=3660)
 
     assert board.format_claim_age(just_over_an_hour) == "1h 0m"
-    assert board.claim_is_old(just_over_an_hour) is False
+    assert board.claim_is_old(just_over_an_hour) is True
     assert board.format_claim_age(sixty_one_minutes) == "1h 1m"
     assert board.claim_is_old(sixty_one_minutes) is True
+    assert board.claim_is_old(exactly_one_hour) is False
+
+
+def test_has_cut_requires_a_non_empty_slice_title() -> None:
+    assert board.has_cut("## Schnitt\n\n**Scheibe 1: Title**\n") is True
+    assert board.has_cut("## Schnitt\n\n**Scheibe 1:    **\n") is False
+    assert board.has_cut("## Schnitt\n\n**Scheibe 1:**\n") is False
+    assert board.has_cut(
+        "## Schnitt\n\n**Scheibe 1:    **\n**Scheibe 2: Real title**\n"
+    ) is True
 
 
 def test_status_and_board_show_claim_age_from_the_claim_comment(

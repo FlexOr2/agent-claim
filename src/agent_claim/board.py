@@ -40,7 +40,7 @@ NOTHING_BLOCKER_VALUES = frozenset({"nichts", "none", "keine", "-"})
 CLAIM_OLD_AFTER = timedelta(hours=1)
 CUT_HEADING_PATTERN = re.compile(r"(?m)^##[ \t]+Schnitt")
 CUT_SECTION_HEADING_PATTERN = re.compile(r"(?m)^##[ \t]+")
-SLICE_LINE_PATTERN = re.compile(r"(?m)^\*\*Scheibe [1-9][0-9]*: .+\*\*\s*$")
+SLICE_LINE_PATTERN = re.compile(r"(?m)^\*\*Scheibe [1-9][0-9]*:[ \t]*\S.*?\*\*\s*$")
 
 
 @dataclass(frozen=True)
@@ -240,7 +240,7 @@ def format_claim_age(age: timedelta) -> str:
 
 
 def claim_is_old(age: timedelta) -> bool:
-    return _floored_claim_minutes(age) > _floored_claim_minutes(CLAIM_OLD_AFTER)
+    return age > CLAIM_OLD_AFTER
 
 
 def _timestamp(value: str) -> datetime:
