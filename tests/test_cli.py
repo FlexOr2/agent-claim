@@ -661,7 +661,8 @@ def expectation_block(
             (),
             ("next",),
             0,
-            "#11 score 10: Top work\nNext: Claim #11.\n",
+            "#11 score 10: Top work\nNext: Claim #11.\n"
+            "\nSKIPPED\n#12: blocked by #11\n",
             id="names_the_highest_scored_actionable_item",
         ),
         pytest.param(
@@ -678,7 +679,7 @@ def expectation_block(
                 "score": 10,
                 "title": "Top work",
                 "next": "Claim #11.",
-                "skipped": [],
+                "skipped": [{"number": 12, "reason": "blocked by #11"}],
                 "ruling_landings": None,
                 "ruling_old": None,
             },
@@ -689,16 +690,16 @@ def expectation_block(
             (),
             ("next",),
             3,
-            "",
-            id="returns_three_when_every_item_is_incomplete",
+            "No actionable item.\n\nSKIPPED\n#10: body incomplete\n",
+            id="names_an_incomplete_body_as_the_reason_nothing_is_pullable",
         ),
         pytest.param(
             (board_issue(10, "Claimed", complete_contract("Claim #10.")),),
             (request(issue=10),),
             ("next",),
             3,
-            "",
-            id="returns_three_when_every_item_is_claimed",
+            "No actionable item.\n\nSKIPPED\n#10: claimed\n",
+            id="names_a_live_claim_as_the_reason_nothing_is_pullable",
         ),
         pytest.param(
             (
@@ -708,7 +709,8 @@ def expectation_block(
             (),
             ("next",),
             0,
-            "#9 score 10: Open blocker\nNext: Claim #9.\n",
+            "#9 score 10: Open blocker\nNext: Claim #9.\n"
+            "\nSKIPPED\n#10: blocked by #9\n",
             id="excludes_items_with_open_blockers",
         ),
     ],
@@ -741,6 +743,13 @@ def test_next_reports_the_highest_scored_actionable_item(
         assert json.loads(rendered) == expected_output
 
 
+PULLED_WITH_REFINING_FIRST = (
+    "#10 score -10: Work\n"
+    "Next: Claim #10.\n"
+    "Erwartungen ungeregelt, beim Ziehen zuerst refinen\n"
+)
+
+
 @pytest.mark.parametrize(
     ("expectations", "expected_state", "expected_exit", "expected_output"),
     [
@@ -754,23 +763,23 @@ def test_next_reports_the_highest_scored_actionable_item(
         pytest.param(
             expectation_block("- Name it. *(Default: yes)*"),
             board.ExpectationState.PROPOSED,
-            3,
-            "No actionable item.\n\nSKIPPED\n#10: Erwartungen ungeregelt\n",
-            id="proposed_expectations_are_skipped",
+            0,
+            PULLED_WITH_REFINING_FIRST,
+            id="proposed_expectations_are_pulled_with_refining_first",
         ),
         pytest.param(
             expectation_block("- Name it without a ruling."),
             board.ExpectationState.PROPOSED,
-            3,
-            "No actionable item.\n\nSKIPPED\n#10: Erwartungen ungeregelt\n",
-            id="unmarked_expectations_are_skipped",
+            0,
+            PULLED_WITH_REFINING_FIRST,
+            id="unmarked_expectations_are_pulled_with_refining_first",
         ),
         pytest.param(
             expectation_block("- Name it. *(geregelt: maybe)*"),
             board.ExpectationState.PROPOSED,
-            3,
-            "No actionable item.\n\nSKIPPED\n#10: Erwartungen ungeregelt\n",
-            id="malformed_expectations_are_skipped",
+            0,
+            PULLED_WITH_REFINING_FIRST,
+            id="malformed_expectations_are_pulled_with_refining_first",
         ),
         pytest.param(
             expectation_block(
@@ -789,9 +798,9 @@ def test_next_reports_the_highest_scored_actionable_item(
                 heading="Erwartungsliste",
             ),
             board.ExpectationState.PROPOSED,
-            3,
-            "No actionable item.\n\nSKIPPED\n#10: Erwartungen ungeregelt\n",
-            id="mixed_expectations_are_skipped",
+            0,
+            PULLED_WITH_REFINING_FIRST,
+            id="mixed_expectations_are_pulled_with_refining_first",
         ),
     ],
 )
@@ -827,25 +836,22 @@ def test_next_reports_expectation_state(
     assert projected.items[0].expectation_state is expected_state
 
 
-def test_next_json_names_skipped_proposed_expectations(
+def test_next_pulls_an_unruled_item_and_names_only_unworkable_ones_as_skipped(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    proposed = board_issue(
+    unruled = board_issue(
         11,
         "Needs rulings",
         complete_contract("Claim #11.")
         + "\n\n"
         + expectation_block("- Name it. *(Default: no)*", heading="Erwartungen"),
     )
-    ruled = board_issue(
-        10,
-        "Ready work",
-        complete_contract("Claim #10.")
-        + "\n\n"
-        + expectation_block("- Name it. *(geregelt: ja)*"),
+    blocked = board_issue(
+        12, "Waits for rulings", complete_contract("Claim #12.", blocked_by="#11")
     )
-    client = _claims_client()
-    monkeypatch.setattr(client, "list_open_board_issues", lambda: (proposed, ruled))
+    claimed = board_issue(13, "Another lane", complete_contract("Claim #13."))
+    client = _claims_client(request(issue=13))
+    monkeypatch.setattr(client, "list_open_board_issues", lambda: (unruled, blocked, claimed))
     monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
     monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
     monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
@@ -853,36 +859,50 @@ def test_next_json_names_skipped_proposed_expectations(
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
     monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
 
+    assert issue_claim.main(["--repo", "example/agent-claim", "next"]) == 0
+    assert capsys.readouterr().out == (
+        "#11 score 10: Needs rulings\n"
+        "Next: Claim #11.\n"
+        "Erwartungen ungeregelt, beim Ziehen zuerst refinen\n"
+        "\n"
+        "SKIPPED\n"
+        "#12: blocked by #11\n"
+        "#13: claimed\n"
+    )
+
     assert issue_claim.main(["--repo", "example/agent-claim", "next", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == {
-        "number": 10,
-        "score": -10,
-        "title": "Ready work",
-        "next": "Claim #10.",
-        "skipped": [{"number": 11, "reason": "Erwartungen ungeregelt"}],
-        "ruling_landings": 0,
-        "ruling_old": False,
+        "number": 11,
+        "score": 10,
+        "title": "Needs rulings",
+        "next": "Claim #11.",
+        "ruling_landings": None,
+        "ruling_old": None,
+        "ruling_hint": "Erwartungen ungeregelt, beim Ziehen zuerst refinen",
+        "skipped": [
+            {"number": 12, "reason": "blocked by #11"},
+            {"number": 13, "reason": "claimed"},
+        ],
     }
 
 
-def test_claim_does_not_treat_proposed_expectations_as_an_out_of_order_competitor(
+def test_claim_warns_that_a_higher_scored_unruled_item_is_free(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     client = _claims_client()
-    proposed = board_issue(
+    unruled = board_issue(
         11,
         "Needs rulings",
         complete_contract("Claim #11.")
         + "\n\n"
         + expectation_block("- Name it. *(Default: yes)*"),
-        labels=("security",),
     )
+    waiting = board_issue(
+        12, "Waits for rulings", complete_contract("Claim #12.", blocked_by="#11")
+    )
+    ready = board_issue(10, "Ready work", complete_contract("Claim #10."))
     claimed_request = request(issue=10, scope=("src/work.py",))
-    monkeypatch.setattr(
-        client,
-        "list_open_board_issues",
-        lambda: (board_issue(10, "Ready work", complete_contract("Claim #10.")), proposed),
-    )
+    monkeypatch.setattr(client, "list_open_board_issues", lambda: (ready, unruled, waiting))
     monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
     monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
     monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
@@ -906,7 +926,10 @@ def test_claim_does_not_treat_proposed_expectations_as_an_out_of_order_competito
         )
         == 0
     )
-    assert "WARNING" not in capsys.readouterr().out
+    assert (
+        "WARNING: higher-scored actionable item #11 (score 10) is free: Needs rulings"
+        in capsys.readouterr().out
+    )
 
 
 @pytest.mark.parametrize(

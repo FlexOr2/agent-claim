@@ -423,7 +423,6 @@ def build_board(
             active_claim=active_claim,
             open_blockers=blockers[issue.number],
             contract_complete=contract.complete,
-            expectation_state=expectations,
         )
         items.append(
             BoardItem(
@@ -544,10 +543,7 @@ def _actionable_reason(
     active_claim: str | None,
     open_blockers: tuple[int, ...],
     contract_complete: bool,
-    expectation_state: ExpectationState,
 ) -> str | None:
-    if expectation_state is ExpectationState.PROPOSED:
-        return "Erwartungen ungeregelt"
     if active_claim is not None:
         return "claimed"
     if open_blockers:

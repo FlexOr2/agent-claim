@@ -74,6 +74,11 @@ POLICY_LOADER = (
 )
 DEFAULT_CLAIM_ROLE = "builder"
 SCOPE_SHARE_LIMIT = 0.25
+NEXT_PULL_DESCRIPTION = (
+    "Pulling is not dispatching: an item whose expectations are still unruled is "
+    "named here with refining as its first step, while dispatching a builder onto "
+    "it waits for the operator's ruling."
+)
 ALLOW_DIRECTORY_HELP = (
     "permit a directory without a cut, or a scope covering more than a quarter "
     "of versioned files"
@@ -260,7 +265,11 @@ def _parser() -> argparse.ArgumentParser:
     board_command = commands.add_parser("board", help="project the open work board without writes")
     board_command.add_argument("--json", action="store_true")
 
-    next_command = commands.add_parser("next", help="show the highest-scored actionable item")
+    next_command = commands.add_parser(
+        "next",
+        help="name the highest-scored item to pull",
+        description=NEXT_PULL_DESCRIPTION,
+    )
     next_command.add_argument("--json", action="store_true")
 
     claim = commands.add_parser("claim", help="claim an issue and scope before editing")
@@ -634,6 +643,8 @@ def _board(
 
 
 def _ruling_pull_hint(item: board.BoardItem) -> str | None:
+    if item.expectation_state is board.ExpectationState.PROPOSED:
+        return "Erwartungen ungeregelt, beim Ziehen zuerst refinen"
     if not item.ruling_old:
         return None
     return (
@@ -686,12 +697,8 @@ def _next(item: board.BoardItem | None, skipped: tuple[board.BoardItem, ...]) ->
     return 0
 
 
-def _proposed_expectations(projected: board.Board) -> tuple[board.BoardItem, ...]:
-    return tuple(
-        item
-        for item in projected.items
-        if item.expectation_state is board.ExpectationState.PROPOSED
-    )
+def _unworkable(projected: board.Board) -> tuple[board.BoardItem, ...]:
+    return tuple(item for item in projected.items if not item.actionable)
 
 
 def _out_of_order_warning(
@@ -862,7 +869,7 @@ def main(arguments: list[str] | None = None) -> int:
             comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
             projected = _board(client, protocol.active_claims(comments))
             item = board.highest_scored_actionable(projected)
-            skipped = _proposed_expectations(projected)
+            skipped = _unworkable(projected)
             if item is None:
                 if skipped:
                     if parsed.json:
