@@ -52,6 +52,7 @@ issue_claim.configure_ledger(71)
 LEDGER_ISSUE = 71
 
 _LIVE_VERSIONED_PATHS = checkout.versioned_paths
+_LIVE_TRUNK_LANDING_TIMES = checkout.trunk_landing_times
 
 BASE = "a" * 40
 
@@ -4844,6 +4845,13 @@ def _stub_versioned_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+# A PR checkout has no origin/main, so the live function would fail loud in CI;
+# tests of trunk_landing_times itself call _LIVE_TRUNK_LANDING_TIMES.
+@pytest.fixture(autouse=True)
+def _stub_trunk_landing_times(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
+
+
 def test_versioned_paths_reads_nul_terminated_ls_files_without_stripping(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -8255,7 +8263,7 @@ def test_trunk_landing_times_read_the_default_branch_not_the_work_branch(
         raise AssertionError(arguments)
 
     monkeypatch.setattr(checkout, "_git_output", git_output)
-    times = checkout.trunk_landing_times()
+    times = _LIVE_TRUNK_LANDING_TIMES()
 
     assert times == (
         datetime(2026, 8, 29, tzinfo=timezone.utc),
@@ -8305,7 +8313,7 @@ def test_trunk_landing_times_count_a_five_commit_merge_once(
 
     unrestricted = git("log", "--reverse", "--format=%cI").stdout.splitlines()
     assert len(unrestricted) == 7
-    assert len(checkout.trunk_landing_times()) == 2
+    assert len(_LIVE_TRUNK_LANDING_TIMES()) == 2
 
 
 def test_no_path_class_list_is_read_or_written() -> None:
