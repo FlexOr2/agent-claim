@@ -426,11 +426,18 @@ def _strict_keys(
     payload: dict[str, object], expected: frozenset[str], comment: IssueComment
 ) -> None:
     observed = frozenset(payload)
-    if observed != expected:
-        raise InvalidClaimMarker(
-            f"trusted comment {comment.url} claim fields differ: "
-            f"expected {sorted(expected)}, got {sorted(observed)}"
+    if observed == expected:
+        return
+    message = (
+        f"trusted comment {comment.url} claim fields differ: "
+        f"expected {sorted(expected)}, got {sorted(observed)}"
+    )
+    if observed > expected:
+        message += (
+            "; unknown fields in a trusted comment usually mean a newer "
+            "agent-claim wrote this ledger - upgrade the installed tool"
         )
+    raise InvalidClaimMarker(message)
 
 
 def is_protocol_candidate(comment: IssueComment) -> bool:
