@@ -1591,10 +1591,13 @@ def test_unknown_or_missing_marker_fields_fail_loud() -> None:
         "surprise": True,
     }
 
-    with pytest.raises(InvalidClaimMarker, match="fields differ"):
+    with pytest.raises(InvalidClaimMarker, match="upgrade the installed tool"):
         parse_claim_event(comment(1, marker(unknown)))
     with pytest.raises(InvalidClaimMarker):
         parse_claim_event(comment(2, marker({"action": "claim"})))
+    missing = {key: value for key, value in unknown.items() if key not in {"surprise", "scope"}}
+    with pytest.raises(InvalidClaimMarker, match="fields differ(?!.*upgrade)"):
+        parse_claim_event(comment(3, marker(missing)))
 
 
 def test_release_must_come_from_original_claimant() -> None:
@@ -3624,7 +3627,7 @@ def test_cli_version_exits_before_requiring_a_command(
         issue_claim.main(["--version"])
 
     assert exited.value.code == 0
-    assert capsys.readouterr().out == "agent-claim 0.5.0\n"
+    assert capsys.readouterr().out == "agent-claim 0.6.0\n"
 
 
 @pytest.mark.parametrize(

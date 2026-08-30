@@ -23,6 +23,13 @@ where = ["src"]
 [tool.setuptools.dynamic]
 version = {attr = "agent_claim.__version__"}
 
+# uv invalidates builds of path sources only via pyproject.toml's mtime by
+# default, so `uv tool install --from .` can silently reinstall a cached wheel
+# from an older commit (issue #70). Keying the cache on the git commit makes
+# every landing invalidate it.
+[tool.uv]
+cache-keys = [{ file = "pyproject.toml" }, { git = { commit = true } }]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
