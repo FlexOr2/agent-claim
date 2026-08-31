@@ -1311,6 +1311,47 @@ def test_a_tilde_fenced_example_is_not_a_live_marker() -> None:
     assert projected.items[0].actionable is True
 
 
+def test_an_info_stringed_delimiter_does_not_close_a_fence() -> None:
+    # ```python carries an info string, so CommonMark/GitHub never read it as
+    # a closing delimiter: the fence opened by ```text only closes at the
+    # bare ``` on the next line, and the real marker after it is live prose.
+    reopened_by_info_string = board_issue(
+        10,
+        "Info string does not close",
+        complete_contract("Claim #10.")
+        + "\n\n```text\nstuff\n```python\n```\n"
+        "Eingefroren bis: real trigger (Operator, 31.08.2026)\n",
+    )
+
+    assert board.frozen_trigger(reopened_by_info_string.body) == "real trigger"
+    projected = board.build_board(
+        (reopened_by_info_string,), (), (), (), board.BoardConfig(),
+        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+    )
+    assert projected.items[0].actionable is False
+    assert projected.items[0].actionable_reason == "frozen: real trigger"
+
+
+def test_an_info_stringed_middle_line_keeps_the_whole_block_one_fence() -> None:
+    # Same shape, but the marker sits before the fence's only valid (bare)
+    # closing line: GitHub renders ```text ... ``` as a single code block, so
+    # the marker in the middle is fence content, never live.
+    one_fence = board_issue(
+        10,
+        "Marker stays inside one fence",
+        complete_contract("Claim #10.")
+        + "\n\n```text\ninside\n```python\n"
+        "Eingefroren bis: real trigger (Operator, 31.08.2026)\n```\n",
+    )
+
+    assert board.frozen_trigger(one_fence.body) is None
+    projected = board.build_board(
+        (one_fence,), (), (), (), board.BoardConfig(),
+        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+    )
+    assert projected.items[0].actionable is True
+
+
 def test_next_skips_a_frozen_item_and_names_it_as_such(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:

@@ -38,11 +38,15 @@ FROZEN_TRIGGER_PATTERN = re.compile(
     r"(?P<trigger>\S.*?)[ \t]*\(Operator,[ \t]*"
     r"(?P<day>[0-3]?\d)\.(?P<month>[01]?\d)\.(?P<year>20\d{2})\)"
 )
-# CommonMark fence delimiter: at most 3 leading spaces, then a run of 3+
-# backticks or 3+ tildes. A 4-space-indented code block (CommonMark's other
-# fencing form) is not modeled here; see `_live_text` for why that gap is
-# safe.
-FENCE_DELIMITER_PATTERN = re.compile(r"^[ ]{0,3}(?P<run>`{3,}|~{3,})")
+# CommonMark fence delimiters: at most 3 leading spaces, then a run of 3+
+# backticks or 3+ tildes. An OPENING delimiter may carry an info string after
+# the run (` ```python `); a CLOSING delimiter may not — only trailing
+# spaces/tabs are allowed after the run (` ``` `, never ` ```python `), so
+# `Closing`'s stricter pattern requires nothing but whitespace to follow.
+# A 4-space-indented code block (CommonMark's other fencing form) is not
+# modeled here; see `_live_text` for why that gap is safe.
+FENCE_OPENING_PATTERN = re.compile(r"^[ ]{0,3}(?P<run>`{3,}|~{3,})")
+FENCE_CLOSING_PATTERN = re.compile(r"^[ ]{0,3}(?P<run>`{3,}|~{3,})[ \t]*$")
 PROPOSED_EXPECTATION_PATTERN = re.compile(
     r"\*\(Default:[ \t]*(?:yes|no|later)\)\*", re.IGNORECASE
 )
@@ -250,8 +254,16 @@ def parse_ruling_date(body: str) -> date:
     raise protocol.ClaimError("ruled expectations have more than one date")
 
 
-def _fence_delimiter(line: str) -> tuple[str, int] | None:
-    match = FENCE_DELIMITER_PATTERN.match(line)
+def _opening_fence_delimiter(line: str) -> tuple[str, int] | None:
+    match = FENCE_OPENING_PATTERN.match(line)
+    if match is None:
+        return None
+    run = match.group("run")
+    return run[0], len(run)
+
+
+def _closing_fence_delimiter(line: str) -> tuple[str, int] | None:
+    match = FENCE_CLOSING_PATTERN.match(line)
     if match is None:
         return None
     run = match.group("run")
@@ -261,14 +273,18 @@ def _fence_delimiter(line: str) -> tuple[str, int] | None:
 def _live_text(body: str) -> str:
     """The body's non-fenced lines, joined back in order — what GitHub renders as prose.
 
-    Walks the body once carrying CommonMark fence state: a line opens a fence,
-    and only a later line with the *same* fence character and a run at least as
-    long closes it again (a tilde run never closes a backtick fence, and a
-    shorter run never closes a longer one). An opened fence that never closes
-    runs to the end of the document, exactly as GitHub renders it — so an
-    operator who left a fence unclosed sees the rest of the issue turn into a
-    code block too; the tool never diverges from what they see. `#72`'s own
-    body fences its example this way, and it must never itself read as live.
+    Walks the body once carrying CommonMark fence state: a line opens a fence
+    (an info string after the run is allowed, e.g. ` ```python `), and only a
+    later line with the *same* fence character, a run at least as long, and
+    nothing but trailing whitespace after the run closes it again — a line
+    like ` ```python ` never closes a fence, even one opened with backticks,
+    because CommonMark forbids an info string on a closing delimiter; it is
+    read as fence content instead. An opened fence that never closes runs to
+    the end of the document, exactly as GitHub renders it — so an operator
+    who left a fence unclosed, or wrote an info string on what they meant as
+    a close, sees the same code block the tool does; there is no invisible
+    divergence. `#72`'s own body fences its example this way, and it must
+    never itself read as live.
 
     Not modeled: a 4-space-indented code block (CommonMark's other fencing
     form). A marker written there is read as live — visible on `board`/`next`
@@ -278,14 +294,15 @@ def _live_text(body: str) -> str:
     fence_char: str | None = None
     fence_length = 0
     for line in body.splitlines():
-        delimiter = _fence_delimiter(line)
         if fence_char is None:
-            if delimiter is not None:
-                fence_char, fence_length = delimiter
+            opening = _opening_fence_delimiter(line)
+            if opening is not None:
+                fence_char, fence_length = opening
                 continue
             live_lines.append(line)
             continue
-        if delimiter is not None and delimiter[0] == fence_char and delimiter[1] >= fence_length:
+        closing = _closing_fence_delimiter(line)
+        if closing is not None and closing[0] == fence_char and closing[1] >= fence_length:
             fence_char, fence_length = None, 0
         # Still inside the fence (or just closed it): never scanned for a marker.
     return "\n".join(live_lines)
