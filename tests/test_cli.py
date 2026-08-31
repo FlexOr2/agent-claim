@@ -1204,6 +1204,50 @@ def test_frozen_marker_without_a_valid_form_fails_loud() -> None:
         )
 
 
+def test_frozen_marker_syntax_documented_in_a_fence_is_not_a_live_marker() -> None:
+    # Shaped like #72's own body: it fences the marker grammar as an example
+    # with placeholders, which must never itself freeze the item that
+    # introduced the mechanism.
+    documented = board_issue(
+        72,
+        "Freeze marker proposal",
+        complete_contract("Claim #72.")
+        + "\n\n## Die Scheibe\n\n"
+        "Ein parsebarer Einfrier-Vermerk im Item-Body — eine Zeile in der Art\n\n"
+        "```\n"
+        "Eingefroren bis: <Auslöser in einem Satz> (Operator, <Datum>)\n"
+        "```\n\n"
+        "— den `next` und `board` respektieren.",
+    )
+    projected = board.build_board(
+        (documented,), (), (), (), board.BoardConfig(),
+        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+    )
+    item = projected.items[0]
+
+    assert board.frozen_trigger(documented.body) is None
+    assert item.frozen_trigger is None
+    assert item.actionable is True
+    assert item.actionable_reason is None
+    assert item in projected.ready_now
+
+
+def test_frozen_marker_outside_a_fence_still_fails_loud_when_malformed() -> None:
+    issue = board_issue(
+        10,
+        "Malformed freeze next to a fence",
+        complete_contract("Claim #10.")
+        + "\n\n```\nEingefroren bis: <trigger> (Operator, <Datum>)\n```\n\n"
+        "Eingefroren bis: no operator or date",
+    )
+
+    with pytest.raises(ClaimError, match="Eingefroren bis"):
+        board.build_board(
+            (issue,), (), (), (), board.BoardConfig(),
+            now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+        )
+
+
 def test_next_skips_a_frozen_item_and_names_it_as_such(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:

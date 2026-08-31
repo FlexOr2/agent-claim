@@ -38,6 +38,8 @@ FROZEN_TRIGGER_PATTERN = re.compile(
     r"(?P<trigger>\S.*?)[ \t]*\(Operator,[ \t]*"
     r"(?P<day>[0-3]?\d)\.(?P<month>[01]?\d)\.(?P<year>20\d{2})\)"
 )
+FENCED_CODE_BLOCK_PATTERN = re.compile(r"(?ms)^```.*?^```[ \t]*$")
+BLOCKQUOTE_LINE_PATTERN = re.compile(r"(?m)^[ \t]*>.*$")
 PROPOSED_EXPECTATION_PATTERN = re.compile(
     r"\*\(Default:[ \t]*(?:yes|no|later)\)\*", re.IGNORECASE
 )
@@ -245,15 +247,29 @@ def parse_ruling_date(body: str) -> date:
     raise protocol.ClaimError("ruled expectations have more than one date")
 
 
+def _strip_documentation_blocks(body: str) -> str:
+    """Remove fenced code blocks and blockquote lines before scanning for markers.
+
+    A body may quote or fence example syntax for humans — #72's own body fences
+    the frozen-marker grammar as documentation with `<placeholder>` text — and
+    that prose is never a live marker; only a body line the parser sees directly
+    ever freezes an item.
+    """
+    without_fences = FENCED_CODE_BLOCK_PATTERN.sub("", body)
+    return BLOCKQUOTE_LINE_PATTERN.sub("", without_fences)
+
+
 def frozen_trigger(body: str) -> str | None:
     """The operator's frozen-marker trigger sentence, or None when the item is not frozen.
 
     A line `Eingefroren bis: <trigger> (Operator, DD.MM.YYYY)` — bold or plain,
     matching the Now/Next/Blocked by/Done when field grammar — freezes the item.
     The tool checks only this form, never who wrote it: authority over freezing
-    is the coordination contract's, not this parser's.
+    is the coordination contract's, not this parser's. A malformed marker line
+    still fails loud everywhere except inside a fence/blockquote: a real typo
+    must stay visible, but a documented example must never be read as live.
     """
-    line = FROZEN_LINE_PATTERN.search(body)
+    line = FROZEN_LINE_PATTERN.search(_strip_documentation_blocks(body))
     if line is None:
         return None
     match = FROZEN_TRIGGER_PATTERN.fullmatch(line.group("value").strip())
