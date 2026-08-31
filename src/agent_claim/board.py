@@ -32,14 +32,17 @@ OPERATOR_RULING_DATE_PATTERN = re.compile(
 )
 RULING_OLD_AFTER_LANDINGS = 10
 FROZEN_LINE_PATTERN = re.compile(
-    r"(?m)^(?:\*\*Eingefroren bis:\*\*|Eingefroren bis:)[ \t]*(?P<value>[^\r\n]*)$"
+    r"(?m)^(?:>[ \t]*)*(?:\*\*Eingefroren bis:\*\*|Eingefroren bis:)[ \t]*(?P<value>[^\r\n]*)$"
 )
 FROZEN_TRIGGER_PATTERN = re.compile(
     r"(?P<trigger>\S.*?)[ \t]*\(Operator,[ \t]*"
     r"(?P<day>[0-3]?\d)\.(?P<month>[01]?\d)\.(?P<year>20\d{2})\)"
 )
-FENCED_CODE_BLOCK_PATTERN = re.compile(r"(?ms)^```.*?^```[ \t]*$")
-BLOCKQUOTE_LINE_PATTERN = re.compile(r"(?m)^[ \t]*>.*$")
+# CommonMark fence delimiter: at most 3 leading spaces, then a run of 3+
+# backticks or 3+ tildes. A 4-space-indented code block (CommonMark's other
+# fencing form) is not modeled here; see `_live_text` for why that gap is
+# safe.
+FENCE_DELIMITER_PATTERN = re.compile(r"^[ ]{0,3}(?P<run>`{3,}|~{3,})")
 PROPOSED_EXPECTATION_PATTERN = re.compile(
     r"\*\(Default:[ \t]*(?:yes|no|later)\)\*", re.IGNORECASE
 )
@@ -247,29 +250,61 @@ def parse_ruling_date(body: str) -> date:
     raise protocol.ClaimError("ruled expectations have more than one date")
 
 
-def _strip_documentation_blocks(body: str) -> str:
-    """Remove fenced code blocks and blockquote lines before scanning for markers.
+def _fence_delimiter(line: str) -> tuple[str, int] | None:
+    match = FENCE_DELIMITER_PATTERN.match(line)
+    if match is None:
+        return None
+    run = match.group("run")
+    return run[0], len(run)
 
-    A body may quote or fence example syntax for humans — #72's own body fences
-    the frozen-marker grammar as documentation with `<placeholder>` text — and
-    that prose is never a live marker; only a body line the parser sees directly
-    ever freezes an item.
+
+def _live_text(body: str) -> str:
+    """The body's non-fenced lines, joined back in order — what GitHub renders as prose.
+
+    Walks the body once carrying CommonMark fence state: a line opens a fence,
+    and only a later line with the *same* fence character and a run at least as
+    long closes it again (a tilde run never closes a backtick fence, and a
+    shorter run never closes a longer one). An opened fence that never closes
+    runs to the end of the document, exactly as GitHub renders it — so an
+    operator who left a fence unclosed sees the rest of the issue turn into a
+    code block too; the tool never diverges from what they see. `#72`'s own
+    body fences its example this way, and it must never itself read as live.
+
+    Not modeled: a 4-space-indented code block (CommonMark's other fencing
+    form). A marker written there is read as live — visible on `board`/`next`
+    and correctable by fencing it properly, never a silent divergence.
     """
-    without_fences = FENCED_CODE_BLOCK_PATTERN.sub("", body)
-    return BLOCKQUOTE_LINE_PATTERN.sub("", without_fences)
+    live_lines: list[str] = []
+    fence_char: str | None = None
+    fence_length = 0
+    for line in body.splitlines():
+        delimiter = _fence_delimiter(line)
+        if fence_char is None:
+            if delimiter is not None:
+                fence_char, fence_length = delimiter
+                continue
+            live_lines.append(line)
+            continue
+        if delimiter is not None and delimiter[0] == fence_char and delimiter[1] >= fence_length:
+            fence_char, fence_length = None, 0
+        # Still inside the fence (or just closed it): never scanned for a marker.
+    return "\n".join(live_lines)
 
 
 def frozen_trigger(body: str) -> str | None:
     """The operator's frozen-marker trigger sentence, or None when the item is not frozen.
 
     A line `Eingefroren bis: <trigger> (Operator, DD.MM.YYYY)` — bold or plain,
-    matching the Now/Next/Blocked by/Done when field grammar — freezes the item.
-    The tool checks only this form, never who wrote it: authority over freezing
-    is the coordination contract's, not this parser's. A malformed marker line
-    still fails loud everywhere except inside a fence/blockquote: a real typo
-    must stay visible, but a documented example must never be read as live.
+    matching the Now/Next/Blocked by/Done when field grammar, optionally
+    prefixed by blockquote `>` markers — freezes the item. The tool checks
+    only this form, never who wrote it: authority over freezing is the
+    coordination contract's, not this parser's. Fenced text is documentation,
+    never a live marker (see `_live_text`); a blockquoted marker is still
+    live — this repo already quotes operator rulings, so a quoted freeze line
+    reads as the freeze itself. A malformed marker outside a fence still
+    fails loud: a real typo must stay visible.
     """
-    line = FROZEN_LINE_PATTERN.search(_strip_documentation_blocks(body))
+    line = FROZEN_LINE_PATTERN.search(_live_text(body))
     if line is None:
         return None
     match = FROZEN_TRIGGER_PATTERN.fullmatch(line.group("value").strip())

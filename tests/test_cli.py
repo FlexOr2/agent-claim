@@ -1248,6 +1248,69 @@ def test_frozen_marker_outside_a_fence_still_fails_loud_when_malformed() -> None
         )
 
 
+def test_a_marker_swallowed_by_an_unclosed_fence_is_not_frozen() -> None:
+    # An unclosed ~~~ fence runs to the end of the document per CommonMark, so
+    # GitHub renders everything after it — including the two backtick lines
+    # and the "marker" sitting between them — as one code block. The tool's
+    # blindness here matches exactly what the operator sees in the issue UI:
+    # no invisible divergence, so this is correctly read as not frozen.
+    unclosed_fence_body = board_issue(
+        10,
+        "Unclosed fence",
+        complete_contract("Claim #10.")
+        + "\n\n## Notes\n\n"
+        "~~~text\n"
+        "placeholder\n"
+        "```\n"
+        "Eingefroren bis: real trigger candidate (Operator, 31.08.2026)\n"
+        "```\n"
+        "more text\n",
+    )
+
+    assert board.frozen_trigger(unclosed_fence_body.body) is None
+    projected = board.build_board(
+        (unclosed_fence_body,), (), (), (), board.BoardConfig(),
+        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+    )
+    assert projected.items[0].actionable is True
+
+
+def test_a_blockquoted_marker_still_freezes() -> None:
+    # This repo already blockquotes operator rulings; a quoted freeze line
+    # reads as the freeze itself, so over-freezing here is visible (SKIPPED
+    # names it) rather than a silent, invisible un-freeze.
+    quoted = board_issue(
+        10,
+        "Quoted ruling",
+        complete_contract("Claim #10.")
+        + "\n\n> Eingefroren bis: quoted real trigger (Operator, 31.08.2026)",
+    )
+
+    assert board.frozen_trigger(quoted.body) == "quoted real trigger"
+    projected = board.build_board(
+        (quoted,), (), (), (), board.BoardConfig(),
+        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+    )
+    assert projected.items[0].actionable is False
+    assert projected.items[0].actionable_reason == "frozen: quoted real trigger"
+
+
+def test_a_tilde_fenced_example_is_not_a_live_marker() -> None:
+    tilde_fenced = board_issue(
+        10,
+        "Tilde-fenced example",
+        complete_contract("Claim #10.")
+        + "\n\n~~~\nEingefroren bis: <trigger> (Operator, <Datum>)\n~~~\n",
+    )
+
+    assert board.frozen_trigger(tilde_fenced.body) is None
+    projected = board.build_board(
+        (tilde_fenced,), (), (), (), board.BoardConfig(),
+        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+    )
+    assert projected.items[0].actionable is True
+
+
 def test_next_skips_a_frozen_item_and_names_it_as_such(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:

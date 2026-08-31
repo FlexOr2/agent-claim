@@ -141,7 +141,12 @@ A body line `Eingefroren bis: <trigger in one sentence> (Operator, DD.MM.YYYY)`
 freezes an issue: it drops out of `next` and out of the out-of-order warning
 even though its score keeps showing on `board`, and deleting the line thaws it
 again. The tool only checks the line's form, never who wrote it — that
-authority is the coordination contract's.
+authority is the coordination contract's. It reads the body the way GitHub
+renders it: a marker inside a fenced code block (` ``` ` or `~~~`, including
+one left unclosed to the end of the body) is documentation, never a live
+marker — examples belong in a fence. A blockquoted `> Eingefroren bis: …`
+still freezes; this repo already quotes operator rulings, so a quoted freeze
+line reads as the freeze itself.
 
 ## Issueless lane claims
 
