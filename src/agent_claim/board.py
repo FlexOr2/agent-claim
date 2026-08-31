@@ -31,6 +31,13 @@ OPERATOR_RULING_DATE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 RULING_OLD_AFTER_LANDINGS = 10
+FROZEN_LINE_PATTERN = re.compile(
+    r"(?m)^(?:\*\*Eingefroren bis:\*\*|Eingefroren bis:)[ \t]*(?P<value>[^\r\n]*)$"
+)
+FROZEN_TRIGGER_PATTERN = re.compile(
+    r"(?P<trigger>\S.*?)[ \t]*\(Operator,[ \t]*"
+    r"(?P<day>[0-3]?\d)\.(?P<month>[01]?\d)\.(?P<year>20\d{2})\)"
+)
 PROPOSED_EXPECTATION_PATTERN = re.compile(
     r"\*\(Default:[ \t]*(?:yes|no|later)\)\*", re.IGNORECASE
 )
@@ -114,6 +121,7 @@ class BoardItem:
     expectation_state: ExpectationState
     ruling_landings: int | None
     ruling_old: bool | None
+    frozen_trigger: str | None
     open_blockers: tuple[int, ...]
     stage: Stage
     age_days: int
@@ -235,6 +243,27 @@ def parse_ruling_date(body: str) -> date:
     if not dates:
         raise protocol.ClaimError("ruled expectations have no readable date")
     raise protocol.ClaimError("ruled expectations have more than one date")
+
+
+def frozen_trigger(body: str) -> str | None:
+    """The operator's frozen-marker trigger sentence, or None when the item is not frozen.
+
+    A line `Eingefroren bis: <trigger> (Operator, DD.MM.YYYY)` — bold or plain,
+    matching the Now/Next/Blocked by/Done when field grammar — freezes the item.
+    The tool checks only this form, never who wrote it: authority over freezing
+    is the coordination contract's, not this parser's.
+    """
+    line = FROZEN_LINE_PATTERN.search(body)
+    if line is None:
+        return None
+    match = FROZEN_TRIGGER_PATTERN.fullmatch(line.group("value").strip())
+    if match is None:
+        raise protocol.ClaimError(
+            "frozen marker must read "
+            "'Eingefroren bis: <trigger in one sentence> (Operator, DD.MM.YYYY)'"
+        )
+    _parse_dotted_date(match.group("day"), match.group("month"), match.group("year"))
+    return match.group("trigger").strip()
 
 
 def landings_since(trunk_landings: tuple[datetime, ...], ruling: date) -> int:
@@ -390,6 +419,7 @@ def build_board(
         contract = contracts[issue.number]
         expectations = expectation_state(issue.body)
         ruling_landings, ruling_old = ruling_freshness(issue.body, trunk_landings)
+        frozen = frozen_trigger(issue.body)
         claim = claims_by_issue.get(issue.number)
         in_flight = issue.number in in_flight_references or (
             claim is not None and claim.branch in open_branches
@@ -420,6 +450,7 @@ def build_board(
             claim_age_text = format_claim_age(age)
             claim_old = claim_is_old(age)
         actionable_reason = _actionable_reason(
+            frozen_trigger=frozen,
             active_claim=active_claim,
             open_blockers=blockers[issue.number],
             contract_complete=contract.complete,
@@ -436,6 +467,7 @@ def build_board(
                 expectation_state=expectations,
                 ruling_landings=ruling_landings,
                 ruling_old=ruling_old,
+                frozen_trigger=frozen,
                 open_blockers=blockers[issue.number],
                 stage=stage,
                 age_days=age_days,
@@ -540,10 +572,13 @@ def _contract_summary(contract: Contract) -> str:
 
 def _actionable_reason(
     *,
+    frozen_trigger: str | None,
     active_claim: str | None,
     open_blockers: tuple[int, ...],
     contract_complete: bool,
 ) -> str | None:
+    if frozen_trigger is not None:
+        return f"frozen: {frozen_trigger}"
     if active_claim is not None:
         return "claimed"
     if open_blockers:
