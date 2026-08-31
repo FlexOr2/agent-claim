@@ -31,6 +31,22 @@ OPERATOR_RULING_DATE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 RULING_OLD_AFTER_LANDINGS = 10
+FROZEN_LINE_PATTERN = re.compile(
+    r"(?m)^(?:>[ \t]*)*(?:\*\*Eingefroren bis:\*\*|Eingefroren bis:)[ \t]*(?P<value>[^\r\n]*)$"
+)
+FROZEN_TRIGGER_PATTERN = re.compile(
+    r"(?P<trigger>\S.*?)[ \t]*\(Operator,[ \t]*"
+    r"(?P<day>[0-3]?\d)\.(?P<month>[01]?\d)\.(?P<year>20\d{2})\)"
+)
+# CommonMark fence delimiters: at most 3 leading spaces, then a run of 3+
+# backticks or 3+ tildes. An OPENING delimiter may carry an info string after
+# the run (` ```python `); a CLOSING delimiter may not — only trailing
+# spaces/tabs are allowed after the run (` ``` `, never ` ```python `), so
+# `Closing`'s stricter pattern requires nothing but whitespace to follow.
+# A 4-space-indented code block (CommonMark's other fencing form) is not
+# modeled here; see `_live_text` for why that gap is safe.
+FENCE_OPENING_PATTERN = re.compile(r"^[ ]{0,3}(?P<run>`{3,}|~{3,})")
+FENCE_CLOSING_PATTERN = re.compile(r"^[ ]{0,3}(?P<run>`{3,}|~{3,})[ \t]*$")
 PROPOSED_EXPECTATION_PATTERN = re.compile(
     r"\*\(Default:[ \t]*(?:yes|no|later)\)\*", re.IGNORECASE
 )
@@ -114,6 +130,7 @@ class BoardItem:
     expectation_state: ExpectationState
     ruling_landings: int | None
     ruling_old: bool | None
+    frozen_trigger: str | None
     open_blockers: tuple[int, ...]
     stage: Stage
     age_days: int
@@ -235,6 +252,86 @@ def parse_ruling_date(body: str) -> date:
     if not dates:
         raise protocol.ClaimError("ruled expectations have no readable date")
     raise protocol.ClaimError("ruled expectations have more than one date")
+
+
+def _opening_fence_delimiter(line: str) -> tuple[str, int] | None:
+    match = FENCE_OPENING_PATTERN.match(line)
+    if match is None:
+        return None
+    run = match.group("run")
+    return run[0], len(run)
+
+
+def _closing_fence_delimiter(line: str) -> tuple[str, int] | None:
+    match = FENCE_CLOSING_PATTERN.match(line)
+    if match is None:
+        return None
+    run = match.group("run")
+    return run[0], len(run)
+
+
+def _live_text(body: str) -> str:
+    """The body's non-fenced lines, joined back in order — what GitHub renders as prose.
+
+    Walks the body once carrying CommonMark fence state: a line opens a fence
+    (an info string after the run is allowed, e.g. ` ```python `), and only a
+    later line with the *same* fence character, a run at least as long, and
+    nothing but trailing whitespace after the run closes it again — a line
+    like ` ```python ` never closes a fence, even one opened with backticks,
+    because CommonMark forbids an info string on a closing delimiter; it is
+    read as fence content instead. An opened fence that never closes runs to
+    the end of the document, exactly as GitHub renders it — so an operator
+    who left a fence unclosed, or wrote an info string on what they meant as
+    a close, sees the same code block the tool does; there is no invisible
+    divergence. `#72`'s own body fences its example this way, and it must
+    never itself read as live.
+
+    Not modeled: a 4-space-indented code block (CommonMark's other fencing
+    form). A marker written there is read as live — visible on `board`/`next`
+    and correctable by fencing it properly, never a silent divergence.
+    """
+    live_lines: list[str] = []
+    fence_char: str | None = None
+    fence_length = 0
+    for line in body.splitlines():
+        if fence_char is None:
+            opening = _opening_fence_delimiter(line)
+            if opening is not None:
+                fence_char, fence_length = opening
+                continue
+            live_lines.append(line)
+            continue
+        closing = _closing_fence_delimiter(line)
+        if closing is not None and closing[0] == fence_char and closing[1] >= fence_length:
+            fence_char, fence_length = None, 0
+        # Still inside the fence (or just closed it): never scanned for a marker.
+    return "\n".join(live_lines)
+
+
+def frozen_trigger(body: str) -> str | None:
+    """The operator's frozen-marker trigger sentence, or None when the item is not frozen.
+
+    A line `Eingefroren bis: <trigger> (Operator, DD.MM.YYYY)` — bold or plain,
+    matching the Now/Next/Blocked by/Done when field grammar, optionally
+    prefixed by blockquote `>` markers — freezes the item. The tool checks
+    only this form, never who wrote it: authority over freezing is the
+    coordination contract's, not this parser's. Fenced text is documentation,
+    never a live marker (see `_live_text`); a blockquoted marker is still
+    live — this repo already quotes operator rulings, so a quoted freeze line
+    reads as the freeze itself. A malformed marker outside a fence still
+    fails loud: a real typo must stay visible.
+    """
+    line = FROZEN_LINE_PATTERN.search(_live_text(body))
+    if line is None:
+        return None
+    match = FROZEN_TRIGGER_PATTERN.fullmatch(line.group("value").strip())
+    if match is None:
+        raise protocol.ClaimError(
+            "frozen marker must read "
+            "'Eingefroren bis: <trigger in one sentence> (Operator, DD.MM.YYYY)'"
+        )
+    _parse_dotted_date(match.group("day"), match.group("month"), match.group("year"))
+    return match.group("trigger").strip()
 
 
 def landings_since(trunk_landings: tuple[datetime, ...], ruling: date) -> int:
@@ -390,6 +487,7 @@ def build_board(
         contract = contracts[issue.number]
         expectations = expectation_state(issue.body)
         ruling_landings, ruling_old = ruling_freshness(issue.body, trunk_landings)
+        frozen = frozen_trigger(issue.body)
         claim = claims_by_issue.get(issue.number)
         in_flight = issue.number in in_flight_references or (
             claim is not None and claim.branch in open_branches
@@ -420,6 +518,7 @@ def build_board(
             claim_age_text = format_claim_age(age)
             claim_old = claim_is_old(age)
         actionable_reason = _actionable_reason(
+            frozen_trigger=frozen,
             active_claim=active_claim,
             open_blockers=blockers[issue.number],
             contract_complete=contract.complete,
@@ -436,6 +535,7 @@ def build_board(
                 expectation_state=expectations,
                 ruling_landings=ruling_landings,
                 ruling_old=ruling_old,
+                frozen_trigger=frozen,
                 open_blockers=blockers[issue.number],
                 stage=stage,
                 age_days=age_days,
@@ -540,10 +640,13 @@ def _contract_summary(contract: Contract) -> str:
 
 def _actionable_reason(
     *,
+    frozen_trigger: str | None,
     active_claim: str | None,
     open_blockers: tuple[int, ...],
     contract_complete: bool,
 ) -> str | None:
+    if frozen_trigger is not None:
+        return f"frozen: {frozen_trigger}"
     if active_claim is not None:
         return "claimed"
     if open_blockers:

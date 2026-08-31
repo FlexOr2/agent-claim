@@ -1036,6 +1036,32 @@ def test_claim_warns_about_a_higher_scored_actionable_item(
             (False, "body incomplete"),
             id="incomplete",
         ),
+        pytest.param(
+            board_issue(
+                10,
+                "Frozen",
+                complete_contract("Claim #10.")
+                + "\n\nEingefroren bis: eine zweite Maschine bekommt einen Grund "
+                "(Operator, 31.08.2026)",
+            ),
+            (),
+            True,
+            (False, "frozen: eine zweite Maschine bekommt einen Grund"),
+            id="frozen",
+        ),
+        pytest.param(
+            board_issue(
+                10,
+                "Frozen and claimed",
+                complete_contract("Claim #10.")
+                + "\n\nEingefroren bis: eine zweite Maschine bekommt einen Grund "
+                "(Operator, 31.08.2026)",
+            ),
+            (request(issue=10),),
+            True,
+            (False, "frozen: eine zweite Maschine bekommt einen Grund"),
+            id="frozen_takes_priority_over_claimed",
+        ),
     ],
 )
 def test_board_reports_each_item_actionability_reason(
@@ -1105,6 +1131,298 @@ def test_board_treats_nothing_blocker_values_as_unblocked(blocked_by: str) -> No
     assert projected.items[0].open_blockers == ()
     assert projected.items[0].actionable is True
     assert projected.items[0].actionable_reason is None
+
+
+FROZEN_LINE = (
+    "Eingefroren bis: eine zweite Maschine bekommt einen Grund (Operator, 31.08.2026)"
+)
+
+
+def test_frozen_item_leaves_actionable_and_thaws_when_the_line_is_removed() -> None:
+    frozen_body = complete_contract("Claim #301.") + f"\n\n{FROZEN_LINE}"
+    frozen = board_issue(301, "Highest scored", frozen_body)
+    projected_while_frozen = board.build_board(
+        (frozen,), (), (), (), board.BoardConfig(),
+        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+    )
+    item = projected_while_frozen.items[0]
+
+    assert item.actionable is False
+    assert item.actionable_reason == "frozen: eine zweite Maschine bekommt einen Grund"
+    assert item.frozen_trigger == "eine zweite Maschine bekommt einen Grund"
+    assert item not in projected_while_frozen.ready_now
+    assert board.highest_scored_actionable(projected_while_frozen) is None
+
+    thawed_body = complete_contract("Claim #301.")
+    thawed = board_issue(301, "Highest scored", thawed_body)
+    projected_after_thaw = board.build_board(
+        (thawed,), (), (), (), board.BoardConfig(),
+        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+    )
+    thawed_item = projected_after_thaw.items[0]
+
+    assert thawed_item.actionable is True
+    assert thawed_item.actionable_reason is None
+    assert thawed_item.frozen_trigger is None
+    assert thawed_item in projected_after_thaw.ready_now
+    assert board.highest_scored_actionable(projected_after_thaw) is thawed_item
+    # The frozen marker alone changes actionability, never the score itself.
+    assert item.score == thawed_item.score
+
+
+def test_frozen_item_score_stays_visible_on_the_rendered_board() -> None:
+    frozen = board_issue(
+        301,
+        "Highest scored",
+        complete_contract("Claim #301.") + f"\n\n{FROZEN_LINE}",
+    )
+    projected = board.build_board(
+        (frozen,), (), (), (), board.BoardConfig(),
+        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+    )
+    item = projected.items[0]
+    rendered = board.render(projected)
+
+    frozen_row = next(line for line in rendered.splitlines() if "#301" in line)
+    assert str(item.score) in frozen_row
+    assert "frozen: eine zweite Maschine bekommt einen Grund" in frozen_row
+    ready_now_section = rendered.split("READY NOW\n", 1)[1].split("\n\nSTALE", 1)[0]
+    assert "#301" not in ready_now_section
+
+
+def test_frozen_marker_without_a_valid_form_fails_loud() -> None:
+    issue = board_issue(
+        10,
+        "Malformed freeze",
+        complete_contract("Claim #10.") + "\n\nEingefroren bis: no operator or date",
+    )
+
+    with pytest.raises(ClaimError, match="Eingefroren bis"):
+        board.build_board(
+            (issue,), (), (), (), board.BoardConfig(),
+            now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+        )
+
+
+def test_frozen_marker_syntax_documented_in_a_fence_is_not_a_live_marker() -> None:
+    # Shaped like #72's own body: it fences the marker grammar as an example
+    # with placeholders, which must never itself freeze the item that
+    # introduced the mechanism.
+    documented = board_issue(
+        72,
+        "Freeze marker proposal",
+        complete_contract("Claim #72.")
+        + "\n\n## Die Scheibe\n\n"
+        "Ein parsebarer Einfrier-Vermerk im Item-Body — eine Zeile in der Art\n\n"
+        "```\n"
+        "Eingefroren bis: <Auslöser in einem Satz> (Operator, <Datum>)\n"
+        "```\n\n"
+        "— den `next` und `board` respektieren.",
+    )
+    projected = board.build_board(
+        (documented,), (), (), (), board.BoardConfig(),
+        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+    )
+    item = projected.items[0]
+
+    assert board.frozen_trigger(documented.body) is None
+    assert item.frozen_trigger is None
+    assert item.actionable is True
+    assert item.actionable_reason is None
+    assert item in projected.ready_now
+
+
+def test_frozen_marker_outside_a_fence_still_fails_loud_when_malformed() -> None:
+    issue = board_issue(
+        10,
+        "Malformed freeze next to a fence",
+        complete_contract("Claim #10.")
+        + "\n\n```\nEingefroren bis: <trigger> (Operator, <Datum>)\n```\n\n"
+        "Eingefroren bis: no operator or date",
+    )
+
+    with pytest.raises(ClaimError, match="Eingefroren bis"):
+        board.build_board(
+            (issue,), (), (), (), board.BoardConfig(),
+            now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+        )
+
+
+def test_a_marker_swallowed_by_an_unclosed_fence_is_not_frozen() -> None:
+    # An unclosed ~~~ fence runs to the end of the document per CommonMark, so
+    # GitHub renders everything after it — including the two backtick lines
+    # and the "marker" sitting between them — as one code block. The tool's
+    # blindness here matches exactly what the operator sees in the issue UI:
+    # no invisible divergence, so this is correctly read as not frozen.
+    unclosed_fence_body = board_issue(
+        10,
+        "Unclosed fence",
+        complete_contract("Claim #10.")
+        + "\n\n## Notes\n\n"
+        "~~~text\n"
+        "placeholder\n"
+        "```\n"
+        "Eingefroren bis: real trigger candidate (Operator, 31.08.2026)\n"
+        "```\n"
+        "more text\n",
+    )
+
+    assert board.frozen_trigger(unclosed_fence_body.body) is None
+    projected = board.build_board(
+        (unclosed_fence_body,), (), (), (), board.BoardConfig(),
+        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+    )
+    assert projected.items[0].actionable is True
+
+
+def test_a_blockquoted_marker_still_freezes() -> None:
+    # This repo already blockquotes operator rulings; a quoted freeze line
+    # reads as the freeze itself, so over-freezing here is visible (SKIPPED
+    # names it) rather than a silent, invisible un-freeze.
+    quoted = board_issue(
+        10,
+        "Quoted ruling",
+        complete_contract("Claim #10.")
+        + "\n\n> Eingefroren bis: quoted real trigger (Operator, 31.08.2026)",
+    )
+
+    assert board.frozen_trigger(quoted.body) == "quoted real trigger"
+    projected = board.build_board(
+        (quoted,), (), (), (), board.BoardConfig(),
+        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+    )
+    assert projected.items[0].actionable is False
+    assert projected.items[0].actionable_reason == "frozen: quoted real trigger"
+
+
+def test_a_tilde_fenced_example_is_not_a_live_marker() -> None:
+    tilde_fenced = board_issue(
+        10,
+        "Tilde-fenced example",
+        complete_contract("Claim #10.")
+        + "\n\n~~~\nEingefroren bis: <trigger> (Operator, <Datum>)\n~~~\n",
+    )
+
+    assert board.frozen_trigger(tilde_fenced.body) is None
+    projected = board.build_board(
+        (tilde_fenced,), (), (), (), board.BoardConfig(),
+        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+    )
+    assert projected.items[0].actionable is True
+
+
+def test_an_info_stringed_delimiter_does_not_close_a_fence() -> None:
+    # ```python carries an info string, so CommonMark/GitHub never read it as
+    # a closing delimiter: the fence opened by ```text only closes at the
+    # bare ``` on the next line, and the real marker after it is live prose.
+    reopened_by_info_string = board_issue(
+        10,
+        "Info string does not close",
+        complete_contract("Claim #10.")
+        + "\n\n```text\nstuff\n```python\n```\n"
+        "Eingefroren bis: real trigger (Operator, 31.08.2026)\n",
+    )
+
+    assert board.frozen_trigger(reopened_by_info_string.body) == "real trigger"
+    projected = board.build_board(
+        (reopened_by_info_string,), (), (), (), board.BoardConfig(),
+        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+    )
+    assert projected.items[0].actionable is False
+    assert projected.items[0].actionable_reason == "frozen: real trigger"
+
+
+def test_an_info_stringed_middle_line_keeps_the_whole_block_one_fence() -> None:
+    # Same shape, but the marker sits before the fence's only valid (bare)
+    # closing line: GitHub renders ```text ... ``` as a single code block, so
+    # the marker in the middle is fence content, never live.
+    one_fence = board_issue(
+        10,
+        "Marker stays inside one fence",
+        complete_contract("Claim #10.")
+        + "\n\n```text\ninside\n```python\n"
+        "Eingefroren bis: real trigger (Operator, 31.08.2026)\n```\n",
+    )
+
+    assert board.frozen_trigger(one_fence.body) is None
+    projected = board.build_board(
+        (one_fence,), (), (), (), board.BoardConfig(),
+        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+    )
+    assert projected.items[0].actionable is True
+
+
+def test_next_skips_a_frozen_item_and_names_it_as_such(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    frozen = board_issue(
+        301,
+        "Highest scored",
+        complete_contract("Claim #301.") + f"\n\n{FROZEN_LINE}",
+    )
+    lower = board_issue(10, "Lower work", complete_contract("Claim #10."))
+    client = _claims_client()
+    monkeypatch.setattr(client, "list_open_board_issues", lambda: (frozen, lower))
+    monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
+    monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+    monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "next"]) == 0
+    assert capsys.readouterr().out == (
+        "#10 score -10: Lower work\n"
+        "Next: Claim #10.\n"
+        "\n"
+        "SKIPPED\n"
+        "#301: frozen: eine zweite Maschine bekommt einen Grund\n"
+    )
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "next", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["number"] == 10
+    assert payload["skipped"] == [
+        {"number": 301, "reason": "frozen: eine zweite Maschine bekommt einen Grund"}
+    ]
+
+
+def test_claim_does_not_warn_about_a_frozen_higher_scored_item(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    client = _claims_client()
+    frozen = board_issue(
+        301,
+        "Highest scored",
+        complete_contract("Claim #301.") + f"\n\n{FROZEN_LINE}",
+    )
+    lower = board_issue(10, "Lower work", complete_contract("Claim #10."))
+    claimed_request = request(issue=10, scope=("src/lower.py",))
+    monkeypatch.setattr(client, "list_open_board_issues", lambda: (frozen, lower))
+    monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
+    monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+    monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
+    monkeypatch.setattr(issue_claim, "_request", lambda _arguments: claimed_request)
+
+    assert (
+        issue_claim.main(
+            [
+                "--repo",
+                "example/agent-claim",
+                "claim",
+                "10",
+                "--agent",
+                "Codex Sol",
+                "--scope",
+                "src/lower.py",
+            ]
+        )
+        == 0
+    )
+    assert "WARNING" not in capsys.readouterr().out
 
 
 def test_board_parses_the_last_atelier_contract_projection() -> None:

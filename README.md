@@ -124,18 +124,29 @@ buckets, followed by items that unblock other work, then the remaining labels;
 stage and Next bonuses sort only within a bucket.
 
 Use `agent-claim next` (or `agent-claim next --json`) to name the highest-scored
-actionable item: it is open, free, unblocked, and has a complete
+actionable item: it is open, free, unblocked, not frozen, and has a complete
 Now/Next/Blocked by/Done when contract. Pulling is not dispatching, so unruled
 expectations never withhold an item; the pulled item carries `Erwartungen
 ungeregelt, beim Ziehen zuerst refinen` instead, and an item ruled long ago
 carries `vor N Landungen geregelt, beim Ziehen neu refinen` (both as the JSON
 `ruling_hint`). Items that genuinely cannot be worked — claimed, blocked by an
-open issue, or without a complete contract — are named with that reason under
-`SKIPPED` (also in the JSON `skipped` list), and `next` exits 3 when none
-qualifies.
+open issue, frozen, or without a complete contract — are named with that
+reason under `SKIPPED` (also in the JSON `skipped` list), and `next` exits 3
+when none qualifies.
 `claim` still allows work out of order, but warns when a higher-scored
 actionable item is free; pass `--out-of-order REASON` to preserve why in the
 claim comment.
+
+A body line `Eingefroren bis: <trigger in one sentence> (Operator, DD.MM.YYYY)`
+freezes an issue: it drops out of `next` and out of the out-of-order warning
+even though its score keeps showing on `board`, and deleting the line thaws it
+again. The tool only checks the line's form, never who wrote it — that
+authority is the coordination contract's. It reads the body the way GitHub
+renders it: a marker inside a fenced code block (` ``` ` or `~~~`, including
+one left unclosed to the end of the body) is documentation, never a live
+marker — examples belong in a fence. A blockquoted `> Eingefroren bis: …`
+still freezes; this repo already quotes operator rulings, so a quoted freeze
+line reads as the freeze itself.
 
 ## Issueless lane claims
 
