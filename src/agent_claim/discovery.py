@@ -16,6 +16,11 @@ from .protocol import (
     claim_label,
 )
 
+# GitHub's issues-list pagination fills every page but the last, so a result
+# strictly under this count could only have come from one request — one live
+# snapshot a concurrent open/close cannot have shifted an issue across.
+ISSUES_PER_PAGE = 100
+
 
 @dataclass(frozen=True)
 class _LedgerIssue:
@@ -28,12 +33,15 @@ class _LedgerIssue:
     is_pull_request: bool
 
 
-def _ledger_issue_rows(client: GitHubIssueComments, state: str = "all") -> tuple[_LedgerIssue, ...]:
+def _ledger_issue_rows(
+    client: GitHubIssueComments, state: str = "all", *, label: str | None = None
+) -> tuple[_LedgerIssue, ...]:
+    label_filter = f"&labels={label}" if label else ""
     raw = client._run(
         [
             "api",
             "--paginate",
-            f"repos/{client.repository}/issues?state={state}&per_page=100",
+            f"repos/{client.repository}/issues?state={state}{label_filter}&per_page={ISSUES_PER_PAGE}",
             "--jq",
             (
                 ".[] | {number,state,locked,body,author_association,"
@@ -89,11 +97,12 @@ def _trusted_ledger_issue(issue: _LedgerIssue) -> bool:
     return issue.author_association in TRUSTED_ASSOCIATIONS
 
 
-def discover_ledger(client: GitHubIssueComments) -> int | None:
-    """Find the single open, locked protocol ledger without changing GitHub state."""
+def _select_ledger(rows: tuple[_LedgerIssue, ...]) -> int | None:
+    """Resolve the canonical ledger from an issue-row snapshot, or raise on
+    a locked-marker violation or a competing foreign coordination contract."""
     ledgers: list[int] = []
     foreign: list[int] = []
-    for issue in _ledger_issue_rows(client):
+    for issue in rows:
         if issue.is_pull_request:
             continue
         if not _trusted_ledger_issue(issue):
@@ -113,7 +122,78 @@ def discover_ledger(client: GitHubIssueComments) -> int | None:
     return min(ledgers) if ledgers else None
 
 
+def _open_issue_count(client: GitHubIssueComments) -> int:
+    """The repository's live open-issue-and-pull-request count, from the
+    single-request repository resource rather than a paginated listing."""
+    raw = client._run(["api", f"repos/{client.repository}", "--jq", ".open_issues_count"])
+    try:
+        count = int(raw)
+    except ValueError as error:
+        raise ClaimError("GitHub returned a malformed open-issue count") from error
+    if count < 0:
+        raise ClaimError("GitHub returned a malformed open-issue count")
+    return count
+
+
+def discover_ledger(client: GitHubIssueComments) -> int | None:
+    """Find the single open, locked protocol ledger without changing GitHub state.
+
+    Every bootstrapped ledger is labelled `LEDGER_LABEL` (`_ensure_ledger_labels`
+    attaches it, and `reconcile` backfills it onto an older, unlabelled ledger —
+    see `protocol.reconcile_all_labels`), and only the canonical ledger ever
+    carries it. Asking GitHub for that exact label is genuinely atomic under
+    normal operation: the answer is at most one issue, always one response,
+    one snapshot — never a fetch spanning multiple page requests that a
+    concurrent open/close could shift an issue across.
+
+    Only when the labelled query comes back empty — an unlabelled legacy
+    ledger, or a genuine absence — does discovery fall back to scanning every
+    open issue. That scan can only report absence (return `None`) when it
+    was a single page: `len(rows) < ISSUES_PER_PAGE` is the only condition
+    under which the fetch was provably one snapshot, since GitHub's
+    pagination fills every page but the last. A fallback spanning more than
+    one page can never prove absence, no matter how the counts line up — an
+    issue that closed on an already-consumed page while another opened could
+    leave `len(rows)` exactly equal to the live open-issue count while still
+    hiding an unlabelled legacy ledger that shifted across the page
+    boundary — so that case always fails loud instead. Within a genuinely
+    single-page fetch, the open-issue-count comparison is still worth
+    keeping as an additional detector: it cannot involve a page-boundary
+    shift, but the count itself comes from a separate request that could
+    still have raced an open or close between the two calls. Whichever
+    check trips, this must fail loud rather than report "no ledger" —
+    reporting that wrongly invites `bootstrap`, which would create a
+    second, competing ledger next to one that still exists.
+    """
+    labelled = _select_ledger(_ledger_issue_rows(client, state="open", label=LEDGER_LABEL))
+    if labelled is not None:
+        return labelled
+    rows = _ledger_issue_rows(client, state="open")
+    ledger = _select_ledger(rows)
+    if ledger is not None:
+        return ledger
+    if len(rows) >= ISSUES_PER_PAGE:
+        page_count = (len(rows) + ISSUES_PER_PAGE - 1) // ISSUES_PER_PAGE
+        raise ClaimError(
+            f"could not establish ledger absence over {page_count} pages of "
+            "open issues; retry, do not bootstrap"
+        )
+    if len(rows) != _open_issue_count(client):
+        raise ClaimError(
+            "ledger discovery fetch may be incomplete (the open-issue count "
+            "changed mid-fetch); retry rather than bootstrap"
+        )
+    return None
+
+
 def _ensure_ledger_labels(client: GitHubIssueComments, ledger: int) -> None:
+    """Create both label definitions and attach `LEDGER_LABEL` to `ledger` itself.
+
+    `claim_label(ledger)` is never attached here — it belongs on whichever
+    other issues carry an active claim rooted in this ledger, applied by
+    `protocol.reconcile_issue_label`; this only needs the definition to exist
+    before that first attach.
+    """
     for label, description in (
         (LEDGER_LABEL, "agent-claim canonical ledger"),
         (claim_label(ledger), "agent-claim active issue projection"),
@@ -132,6 +212,7 @@ def _ensure_ledger_labels(client: GitHubIssueComments, ledger: int) -> None:
                 "--force",
             ]
         )
+    client.add_label(ledger, LEDGER_LABEL)
 
 
 def _create_ledger(client: GitHubIssueComments) -> int:

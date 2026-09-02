@@ -1400,6 +1400,11 @@ def reconcile_issue_label(
 
 
 def reconcile_all_labels(client: IssueComments) -> tuple[int, ...]:
+    # `discover_ledger` trusts `LEDGER_LABEL` on the ledger issue itself to find
+    # it in one atomic request instead of scanning every open issue (#74); an
+    # older ledger, bootstrapped before that label existed, never got it
+    # attached, so reconcile is what backfills it going forward.
+    client.add_label(LEDGER_ISSUE, LEDGER_LABEL)
     try:
         active_issues = {
             claim.identity.issue

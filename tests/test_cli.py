@@ -64,6 +64,7 @@ def ledger_row(
     state: str = "open",
     locked: bool = True,
     association: str = "OWNER",
+    labels: tuple[str, ...] = (),
 ) -> dict[str, object]:
     return {
         "number": number,
@@ -71,24 +72,44 @@ def ledger_row(
         "locked": locked,
         "body": body,
         "author_association": association,
-        "labels": [],
+        "labels": list(labels),
         "is_pull_request": False,
     }
 
 
 def ledger_client(
-    monkeypatch: pytest.MonkeyPatch, rows: list[dict[str, object]]
+    monkeypatch: pytest.MonkeyPatch,
+    rows: list[dict[str, object]],
+    *,
+    open_issue_count: int | None = None,
 ) -> tuple[GitHubIssueComments, list[list[str]]]:
+    """`open_issue_count` defaults to the open rows actually served, i.e. a
+    fetch discovery can trust; pass a different number to simulate an issue
+    opening or closing while a snapshot was mid-fetch."""
     client = GitHubIssueComments("example/agent-claim")
     observed: list[list[str]] = []
+    open_rows = [row for row in rows if row["state"] == "open"]
+    trustworthy_count = len(open_rows) if open_issue_count is None else open_issue_count
+
+    labelled_open_rows = [
+        row for row in open_rows if issue_claim.LEDGER_LABEL in row["labels"]
+    ]
 
     def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
         observed.append(arguments)
         issue_path = f"repos/{client.repository}/issues"
         if arguments[:3] == ["api", "--paginate", f"{issue_path}?state=all&per_page=100"]:
             return "\n".join(json.dumps(row) for row in rows)
+        if arguments[:3] == [
+            "api",
+            "--paginate",
+            f"{issue_path}?state=open&labels={issue_claim.LEDGER_LABEL}&per_page=100",
+        ]:
+            return "\n".join(json.dumps(row) for row in labelled_open_rows)
         if arguments[:3] == ["api", "--paginate", f"{issue_path}?state=open&per_page=100"]:
-            return "\n".join(json.dumps(row) for row in rows if row["state"] == "open")
+            return "\n".join(json.dumps(row) for row in open_rows)
+        if arguments == ["api", f"repos/{client.repository}", "--jq", ".open_issues_count"]:
+            return str(trustworthy_count)
         return ""
 
     monkeypatch.setattr(client, "_run", run)
@@ -184,6 +205,97 @@ def test_bootstrap_ignores_an_untrusted_unlocked_marker(
     assert not any(arguments[-1].endswith("/issues/1/lock") for arguments in observed)
 
 
+def test_discovery_finds_a_labelled_ledger_without_scanning_open_issues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A labelled ledger answers from one atomic, label-filtered request;
+    discovery must never fall back to scanning every open issue for it."""
+    client, observed = ledger_client(
+        monkeypatch, [ledger_row(2, labels=(issue_claim.LEDGER_LABEL,))]
+    )
+
+    assert issue_claim.discover_ledger(client) == 2
+    assert len(observed) == 1
+    assert f"labels={issue_claim.LEDGER_LABEL}" in observed[0][2]
+
+
+def test_discovery_finds_the_ledger_from_open_issues_without_full_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A repository with a huge closed-issue history must not pay for it:
+    discovery must resolve straight from the open-issue snapshot and never
+    fall back to the full `state=all` scan."""
+    rows = [
+        ledger_row(2),
+        *(ledger_row(number, state="closed") for number in range(100, 120)),
+    ]
+    client, observed = ledger_client(monkeypatch, rows)
+
+    assert issue_claim.discover_ledger(client) == 2
+    assert not any(
+        "state=all" in argument for arguments in observed for argument in arguments
+    )
+
+
+def test_discovery_reports_a_genuine_absence_when_the_open_count_is_stable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _ = ledger_client(monkeypatch, [])
+
+    assert issue_claim.discover_ledger(client) is None
+
+
+def test_discovery_refuses_to_report_absence_after_an_inconsistent_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Zero markers in a snapshot whose issue count already moved on is not
+    proof of absence; it must fail loud instead of inviting `bootstrap`,
+    which would create a second, competing ledger."""
+    client, _ = ledger_client(monkeypatch, [], open_issue_count=1)
+
+    with pytest.raises(ClaimError, match="incomplete") as excinfo:
+        issue_claim.discover_ledger(client)
+    assert "run agent-claim bootstrap" not in str(excinfo.value)
+
+
+def test_discovery_refuses_absence_over_a_multi_page_fallback_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page-boundary shift could hide an unlabelled ledger even when the
+    live open-issue count happens to match; a fallback spanning more than
+    one page can never prove absence, so it must fail loud regardless."""
+    rows = [ledger_row(number, body="ordinary open issue") for number in range(1, 151)]
+    client, _ = ledger_client(monkeypatch, rows)
+
+    with pytest.raises(ClaimError, match="could not establish ledger absence") as excinfo:
+        issue_claim.discover_ledger(client)
+    assert "run agent-claim bootstrap" not in str(excinfo.value)
+
+
+def test_discovery_reports_absence_after_a_single_page_fallback_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [ledger_row(number, body="ordinary open issue") for number in range(1, 51)]
+    client, _ = ledger_client(monkeypatch, rows)
+
+    assert issue_claim.discover_ledger(client) is None
+
+
+def test_discovery_fetch_failure_propagates_loudly_without_bootstrap_advice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GitHubIssueComments("example/agent-claim")
+
+    def failing_run(arguments: list[str], *, input_data: bytes | None = None) -> str:
+        raise ClaimError("GitHub issue coordination failed with exit 1")
+
+    monkeypatch.setattr(client, "_run", failing_run)
+
+    with pytest.raises(ClaimError) as excinfo:
+        issue_claim.discover_ledger(client)
+    assert "bootstrap" not in str(excinfo.value)
+
+
 def comment(
     identifier: int,
     body: str,
@@ -253,6 +365,7 @@ class FakeComments:
     comments: dict[int, list[IssueComment]] = field(default_factory=dict)
     labels: set[int] = field(default_factory=set)
     other_labels: dict[str, set[int]] = field(default_factory=dict)
+    ledger_labelled_issues: set[int] = field(default_factory=set)
     valid_successors: set[int] = field(default_factory=set)
     inject_before_next_ledger_post: IssueComment | None = None
     inject_after_next_ledger_post: IssueComment | None = None
@@ -295,6 +408,9 @@ class FakeComments:
         return posted.url
 
     def add_label(self, issue: int, label: str) -> None:
+        if label == protocol.LEDGER_LABEL:
+            self.ledger_labelled_issues.add(issue)
+            return
         assert label == claim_label()
         if self.fail_add_label:
             raise ClaimError("label add failed")
@@ -3377,6 +3493,16 @@ def test_reconcile_all_repairs_active_and_stale_labels() -> None:
     assert client.labels == {72}
 
 
+def test_reconcile_labels_the_ledger_when_it_carries_no_label_yet() -> None:
+    """Discovery trusts LEDGER_LABEL on the ledger issue to answer atomically
+    (#74); reconcile is what backfills it onto an older, unlabelled ledger."""
+    client = FakeComments()
+
+    reconcile_all_labels(client)
+
+    assert client.ledger_labelled_issues == {LEDGER_ISSUE}
+
+
 def test_reconcile_all_labels_ignores_lane_claims_on_a_mixed_ledger(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3393,14 +3519,17 @@ def test_reconcile_all_labels_ignores_lane_claims_on_a_mixed_ledger(
     original_add_label = client.add_label
     original_remove_label = client.remove_label
     original_upsert_projection = client.upsert_projection
+    # reconcile always backfills LEDGER_LABEL onto the ledger issue itself
+    # (#74); that is not a lane call, so it is excluded here alongside 72.
+    non_lane_issues = {72, LEDGER_ISSUE}
 
     def add_label(issue: object, label: str) -> None:
-        if issue != 72:
+        if issue not in non_lane_issues:
             lane_calls.append(("add_label", issue))
         return original_add_label(issue, label)
 
     def remove_label(issue: object, label: str) -> None:
-        if issue != 72:
+        if issue not in non_lane_issues:
             lane_calls.append(("remove_label", issue))
         return original_remove_label(issue, label)
 
@@ -3838,18 +3967,25 @@ def test_github_comment_reader_accepts_paginated_json_lines(
     }
     client = GitHubIssueComments("example/agent-claim")
     monkeypatch.setattr(github, "COMMENTS_PER_PAGE", 2)
+    calls: list[list[str]] = []
 
-    def page(arguments: list[str]) -> str:
-        endpoint = arguments[1]
-        rows = ordinary_rows if "page=1" in endpoint else [protocol_row]
-        return "\n".join(map(json.dumps, rows))
+    def paginate(arguments: list[str]) -> str:
+        calls.append(arguments)
+        # A real `gh api --paginate` invocation concatenates every page's
+        # `--jq`-filtered output into one stdout stream from a single
+        # subprocess; the fake mirrors that instead of branching per page.
+        all_rows = [*ordinary_rows, protocol_row]
+        return "\n".join(map(json.dumps, all_rows))
 
-    monkeypatch.setattr(client, "_run", page)
+    monkeypatch.setattr(client, "_run", paginate)
 
     observed = client.list_protocol_candidates(71)
 
     assert [entry.identifier for entry in observed] == [12]
     assert observed[0].body == protocol_row["body"]
+    assert len(calls) == 1
+    assert "--paginate" in calls[0]
+    assert not any("&page=" in argument for argument in calls[0])
 
 
 def _comment_row(identifier: int, body: str = "ordinary prose") -> dict[str, object]:
