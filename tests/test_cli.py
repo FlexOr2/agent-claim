@@ -540,7 +540,10 @@ def test_board_projects_fixture_json_without_github_writes(
     assert all("--method" not in arguments for arguments in observed)
     assert all("--jq" in arguments for arguments in observed)
     merged_request = next(arguments for arguments in observed if "merged" in arguments)
-    assert "merged:>=2026-08-07" in merged_request
+    # The floor is the oldest open issue's creation (#12, 2026-08-01), not a
+    # fixed 14 days back — nothing merged before #12 existed could touch any
+    # currently open issue.
+    assert "merged:>=2026-08-01" in merged_request
 
     assert issue_claim.main(["--repo", "example/agent-claim", "board", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
@@ -559,7 +562,10 @@ def test_board_projects_fixture_json_without_github_writes(
     assert eleven["active_claim"] == "Codex Sol (builder)"
     assert eleven["actionable_reason"] == "claimed"
     assert thirteen["stage"] == "code-landed"
-    assert fourteen["stage"] == "text-only"
+    # #94 "Fixes #14" merged 2026-08-06, five days before the old fixed
+    # 14-day floor (2026-08-07) would have admitted it — the oldest-open-
+    # issue floor (2026-08-01) correctly still counts it.
+    assert fourteen["stage"] == "code-landed"
     assert fourteen["actionable_reason"] == "body incomplete"
     assert [item["number"] for item in payload["ready_now"]] == [10, 13]
     assert [item["number"] for item in payload["stale"]] == [12]
@@ -927,7 +933,7 @@ def test_claim_warns_that_a_higher_scored_unruled_item_is_free(
         == 0
     )
     assert (
-        "WARNING: higher-scored actionable item #11 (score 10) is free: Needs rulings"
+        "WARNING: higher-priority actionable item #11 (score 10) is free: Needs rulings"
         in capsys.readouterr().out
     )
 
@@ -996,6 +1002,57 @@ def test_claim_warns_about_a_higher_scored_actionable_item(
         assert "Out-of-order reason:" not in comment_body
     else:
         assert expected_comment_reason in comment_body
+
+
+def test_claim_warns_about_a_higher_priority_item_even_at_a_lower_score(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """`board`/`next` rank a labelled blocker ahead of an unlabelled item even
+    when the blocker scores lower; the out-of-order warning must agree, or
+    claiming the unlabelled item would silently skip past the very item
+    `next` would have named.
+    """
+    client = _claims_client()
+    blocker = board_issue(
+        50, "Prerequisite the operator prioritized", complete_contract("Unblock #52.")
+    )
+    dependent = board_issue(52, "Depends on the prerequisite", "## Blocked by\n#50")
+    in_flight_unlabelled = board_issue(51, "In-flight, unlabelled", complete_contract("Ship it."))
+    open_pull_request = board.PullRequest(200, "Fixes #51", "", "branch")
+    claimed_request = request("lower-priority", issue=51, scope=("src/lower.py",))
+    monkeypatch.setattr(
+        client, "list_open_board_issues", lambda: (blocker, dependent, in_flight_unlabelled)
+    )
+    monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: (open_pull_request,))
+    monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+    monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
+    monkeypatch.setattr(issue_claim, "_request", lambda _arguments: claimed_request)
+
+    assert (
+        issue_claim.main(
+            [
+                "--repo",
+                "example/agent-claim",
+                "claim",
+                "51",
+                "--agent",
+                "Codex Sol",
+                "--scope",
+                "src/lower.py",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+
+    # #51 (score 40: in-flight + single next) outscores #50 (score 10: it
+    # unblocks #52, text-only, single next), but #50 leads on the board
+    # because it carries the higher-priority "blocker" bucket.
+    assert "WARNING" in output
+    assert "#50" in output
 
 
 @pytest.mark.parametrize(
@@ -1575,6 +1632,194 @@ def test_board_category_order_keeps_ci_ahead_of_a_high_scoring_blocker() -> None
 
     assert [item.number for item in projected.items[:2]] == [30, 31]
     assert projected.items[1].score > projected.items[0].score
+
+
+def test_next_names_the_boards_top_row_even_when_it_is_not_the_highest_score() -> None:
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    in_flight_unlabelled = board_issue(
+        50, "In-flight, unlabelled", complete_contract("Ship it.")
+    )
+    blocker = board_issue(
+        51, "Prerequisite the operator prioritized", complete_contract("Unblock #52.")
+    )
+    dependent = board_issue(52, "Depends on the prerequisite", "## Blocked by\n#51")
+    open_pull_request = board.PullRequest(200, "Fixes #50", "", "branch")
+
+    projected = board.build_board(
+        (in_flight_unlabelled, blocker, dependent),
+        (open_pull_request,),
+        (),
+        (),
+        board.BoardConfig(),
+        now=now,
+    )
+    by_number = {item.number: item for item in projected.items}
+
+    # #50 outscores #51 on raw score alone; #51 still leads because it carries
+    # the higher-priority "blocker" bucket (it unblocks #52) that `board`
+    # already sorts on ahead of score.
+    assert by_number[50].score > by_number[51].score
+    assert projected.items[0].number == 51
+
+    recommended = board.highest_scored_actionable(projected)
+    assert recommended is not None
+    assert recommended.number == 51
+
+
+def _slice_pull_request_body(epic: int) -> str:
+    """A genuine slice-to-epic pull request body, in the shape observed
+    verbatim in atelier-2's #848 and #960: the epic is named twice, once in
+    substantive prose and again in a dedicated, non-closing trailer line.
+    Both mentions are required — see
+    `test_a_dedicated_reference_line_without_corroboration_confers_no_stage`
+    for why a single, uncorroborated trailer line is not enough on its own.
+    """
+    return f"Ships one slice of epic #{epic}'s plan.\n\nPart of #{epic}."
+
+
+def test_an_epic_inherits_the_landed_stage_of_a_slice_that_did_not_close_it() -> None:
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    epic = board_issue(
+        60, "Epic cut into dispatched slices", complete_contract("Cut the next slice.")
+    )
+    slice_pull_request = board.PullRequest(120, "Slice 1", _slice_pull_request_body(60), "branch")
+
+    projected = board.build_board(
+        (epic,), (), (slice_pull_request,), (), board.BoardConfig(), now=now
+    )
+
+    assert projected.items[0].stage is board.Stage.CODE_LANDED
+
+
+def test_an_epic_is_in_flight_while_an_open_slice_touches_it_without_closing_it() -> None:
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    epic = board_issue(
+        62, "Epic cut into dispatched slices", complete_contract("Cut the next slice.")
+    )
+    open_slice_pull_request = board.PullRequest(
+        122, "Slice 1", _slice_pull_request_body(62), "branch"
+    )
+
+    projected = board.build_board(
+        (epic,), (open_slice_pull_request,), (), (), board.BoardConfig(), now=now
+    )
+
+    assert projected.items[0].stage is board.Stage.IN_FLIGHT
+
+
+def test_a_pull_request_merely_mentioning_the_epic_number_confers_no_stage() -> None:
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    epic = board_issue(
+        61, "Epic untouched by this pull request", complete_contract("Cut the next slice.")
+    )
+    unrelated_pull_request = board.PullRequest(
+        121,
+        "Unrelated fix",
+        "This closes a bug that was discovered while reading #61's plan.",
+        "branch",
+    )
+
+    projected = board.build_board(
+        (epic,), (), (unrelated_pull_request,), (), board.BoardConfig(), now=now
+    )
+
+    assert projected.items[0].stage is board.Stage.TEXT_ONLY
+
+
+def test_a_dedicated_reference_line_without_corroboration_confers_no_stage() -> None:
+    """A foreign pull request can still write a dedicated `Refs #N` line for an
+    unrelated reason; this tool has no typed parentage relation to rule that
+    out (see `_touched_without_closing`'s docstring). The one thing it can
+    require is that the epic is discussed, not just named once in a trailer —
+    dropping this drops the false positive without dropping the two real
+    landings above, which both name their epic a second time.
+    """
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    epic = board_issue(
+        63, "Epic named only once, in passing", complete_contract("Cut the next slice.")
+    )
+    drive_by_pull_request = board.PullRequest(123, "Unrelated cleanup", "Refs #63.", "branch")
+
+    projected = board.build_board(
+        (epic,), (), (drive_by_pull_request,), (), board.BoardConfig(), now=now
+    )
+
+    assert projected.items[0].stage is board.Stage.TEXT_ONLY
+
+
+def test_a_reference_line_inside_a_fenced_code_block_confers_no_stage() -> None:
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    epic = board_issue(
+        64, "Epic quoted inside an example, not touched", complete_contract("Cut the next slice.")
+    )
+    fenced_pull_request = board.PullRequest(
+        124,
+        "Documents the marker syntax",
+        "Example of the convention:\n\n```\nPart of #64.\n```\n\nSee also #64 above.",
+        "branch",
+    )
+
+    projected = board.build_board(
+        (epic,), (), (fenced_pull_request,), (), board.BoardConfig(), now=now
+    )
+
+    assert projected.items[0].stage is board.Stage.TEXT_ONLY
+
+
+def test_a_fenced_closing_keyword_confers_no_stage() -> None:
+    """The closing-keyword path (`_associated_issues`) must read the body the
+    same way `_touched_without_closing` already does: a fenced example of the
+    `Fixes #N` convention documents the syntax, it does not close #65.
+    """
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    issue = board_issue(
+        65, "Issue documented, never actually closed", complete_contract("Cut the next slice.")
+    )
+    fenced_pull_request = board.PullRequest(
+        125,
+        "Documents the closing-keyword syntax",
+        "Example of the convention:\n\n```\nFixes #65.\n```\n\nNot itself a closing PR.",
+        "branch",
+    )
+
+    projected = board.build_board(
+        (issue,), (), (fenced_pull_request,), (), board.BoardConfig(), now=now
+    )
+
+    assert projected.items[0].stage is board.Stage.TEXT_ONLY
+
+
+def test_board_queries_merged_pull_requests_back_to_the_oldest_open_issue(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    old_epic = replace(
+        board_issue(70, "Epic open for months", complete_contract("Cut the next slice.")),
+        created_at="2026-06-01T00:00:00Z",
+    )
+    recent_issue = board_issue(71, "Recently filed work", complete_contract("Ship it."))
+    observed_since: list[datetime] = []
+
+    class BoardClient:
+        def list_open_board_issues(self) -> tuple[board.Issue, ...]:
+            return (old_epic, recent_issue)
+
+        def list_open_board_pull_requests(self) -> tuple[board.PullRequest, ...]:
+            return ()
+
+        def list_recent_merged_board_pull_requests(
+            self, since: datetime
+        ) -> tuple[board.PullRequest, ...]:
+            observed_since.append(since)
+            return ()
+
+    monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+    monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
+
+    issue_claim._board(BoardClient(), ())
+
+    # A fixed 14-day window (now - 14 days = 2026-08-07) would have missed
+    # anything the six-month-old epic's own slices landed months ago.
+    assert observed_since == [datetime(2026, 6, 1, tzinfo=timezone.utc)]
 
 
 def test_board_configuration_requires_unique_ordered_labels(tmp_path: Path) -> None:
@@ -3742,6 +3987,58 @@ def test_github_comment_body_uses_stdin_instead_of_process_argument(
     assert body not in arguments
     assert arguments[-2:] == ["--body-file", "-"]
     assert observed["input"] == body.encode()
+
+
+def test_merged_pull_request_history_warns_when_it_reaches_the_result_cap(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A full result page from GitHub means more merged pull requests could
+    exist beyond the cap; `build_board`'s durable floor (the oldest open
+    issue's creation) can legitimately ask this far back on a busy repository,
+    so the board must say the history may be incomplete rather than silently
+    compute stages from a truncated query.
+    """
+    since = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    saturated_rows = [
+        {
+            "number": index,
+            "title": f"Fixes #{index}",
+            "body": "",
+            "headRefName": f"codex/issue-{index}",
+            "mergedAt": "2026-08-20T00:00:00Z",
+        }
+        for index in range(1, github.MAX_RECENT_MERGED_PULL_REQUESTS + 1)
+    ]
+    client = GitHubIssueComments("example/agent-claim")
+    monkeypatch.setattr(
+        client, "_run", lambda arguments: "\n".join(json.dumps(row) for row in saturated_rows)
+    )
+
+    pull_requests = client.list_recent_merged_board_pull_requests(since)
+
+    assert len(pull_requests) == github.MAX_RECENT_MERGED_PULL_REQUESTS
+    error = capsys.readouterr().err
+    assert "WARNING" in error
+    assert str(github.MAX_RECENT_MERGED_PULL_REQUESTS) in error
+
+
+def test_merged_pull_request_history_below_the_cap_warns_of_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    since = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    row = {
+        "number": 1,
+        "title": "Fixes #1",
+        "body": "",
+        "headRefName": "codex/issue-1",
+        "mergedAt": "2026-08-20T00:00:00Z",
+    }
+    client = GitHubIssueComments("example/agent-claim")
+    monkeypatch.setattr(client, "_run", lambda arguments: json.dumps(row))
+
+    client.list_recent_merged_board_pull_requests(since)
+
+    assert capsys.readouterr().err == ""
 
 
 def test_github_projection_update_patches_one_comment_and_deletes_duplicates(

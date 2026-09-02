@@ -58,6 +58,20 @@ CLOSING_REFERENCE_PATTERN = re.compile(
     r"(?im)\b(?:close(?:s|d)?|fix(?:es|ed)?|resolve(?:s|d)?|"
     r"land(?:s|ed)?|implement(?:s|ed)?)\s*:?\s*#([1-9][0-9]*)"
 )
+# A slice's pull request must never close its still-open epic — that would
+# retire the epic before its remaining slices exist. This repository's
+# established substitute is a whole line opening with one of these markers
+# (observed verbatim in atelier-2 PRs #848 "Part of #79.", #960 "Refs #956
+# and #80", #965/#967 "Refs #<n> ..."). Anchoring to the start of the line
+# is what keeps a casual mid-paragraph mention — "as noted in #79's plan" —
+# from ever counting; only a dedicated reference line does. This is still a
+# syntactic marker, not a validated relation: GitHub has no structured field
+# for a non-closing PR-to-issue link, and this repository's own children use
+# it inconsistently (see `_touched_without_closing`'s docstring for the
+# named residual and the corroboration this module still requires).
+TOUCHES_WITHOUT_CLOSING_LINE_PATTERN = re.compile(
+    r"(?im)^(?:Refs?|References?|Part of|Teil von)\b[:\s].*$"
+)
 NOTHING_BLOCKER_VALUES = frozenset({"nichts", "none", "keine", "-"})
 CLAIM_OLD_AFTER = timedelta(hours=1)
 CUT_HEADING_PATTERN = re.compile(r"(?m)^##[ \t]+Schnitt")
@@ -147,6 +161,13 @@ class BoardItem:
 
 @dataclass(frozen=True)
 class Board:
+    """`items`, and therefore `ready_now`, are ordered `(priority_category, -score, number)`.
+
+    `ready_now` and `stale` are filters over `items`; filtering never
+    reorders, so `ready_now[0]` is always `items`' first actionable row —
+    the same row a human reading `board` sees first. `next` relies on this.
+    """
+
     items: tuple[BoardItem, ...]
     ready_now: tuple[BoardItem, ...]
     stale: tuple[BoardItem, ...]
@@ -441,16 +462,75 @@ def _priority_bucket(
 
 
 def _associated_issues(pull_requests: tuple[PullRequest, ...]) -> frozenset[int]:
+    """Issues a pull request closes, read the way GitHub renders it.
+
+    Routed through `_live_text` for the same reason every other marker in
+    this module is: a fenced example of the closing-keyword convention
+    ("Fixes #64" inside a code block, say) must document the syntax without
+    silently closing #64.
+    """
     return frozenset(
         reference
         for pull_request in pull_requests
         for reference in (
             int(number)
             for number in CLOSING_REFERENCE_PATTERN.findall(
-                f"{pull_request.title}\n{pull_request.body}"
+                _live_text(f"{pull_request.title}\n{pull_request.body}")
             )
         )
     )
+
+
+def _touched_without_closing(pull_requests: tuple[PullRequest, ...]) -> frozenset[int]:
+    """Issues a pull request advances without closing — an epic's slices, typically.
+
+    The coordination contract requires a slice to become its own item at
+    dispatch, so an epic's work lands through its children's pull requests,
+    which deliberately avoid a closing keyword against the epic itself (see
+    `TOUCHES_WITHOUT_CLOSING_LINE_PATTERN`). Without this, an epic that is
+    cut correctly can never earn a landed or in-flight stage.
+
+    Named residual: this is a syntactic marker, not a validated parent-child
+    relation. `unblocks`/`open_blockers` (this module's one real relation)
+    only connect two issues through a structured `Blocked by` field; GitHub
+    exposes no equivalent structured field for a non-closing PR-to-issue
+    link, and this repository's own children reference their epic through
+    inconsistent free text (a title suffix, a "Nachbarn" list, a "Refs"/"Part
+    of" line) — there is no honest typed relation here to check against. A
+    foreign pull request that writes a dedicated, single "Refs #N" line for
+    an unrelated reason still confers a stage; that risk is real and is not
+    eliminated below, only narrowed. The one real narrowing available:
+    every observed genuine slice-to-epic reference (#848, #960, #965) names
+    its epic a second time elsewhere in the same pull request, in
+    substantive prose — never only in the trailer line — so a marker with no
+    corroborating mention elsewhere in the text is dropped. Fenced code
+    blocks are never live text (`_live_text`), matching every other marker
+    this module reads.
+    """
+    touched: set[int] = set()
+    for pull_request in pull_requests:
+        live = _live_text(f"{pull_request.title}\n{pull_request.body}")
+        marked = frozenset(
+            number
+            for line in TOUCHES_WITHOUT_CLOSING_LINE_PATTERN.findall(live)
+            for number in _references(line)
+        )
+        if not marked:
+            continue
+        corroborated = _references(TOUCHES_WITHOUT_CLOSING_LINE_PATTERN.sub("", live))
+        touched |= marked & corroborated
+    return frozenset(touched)
+
+
+def board_rank(item: BoardItem) -> tuple[int, int, int]:
+    """The one order `items`, `ready_now`, and every "is X ahead of Y" comparison share.
+
+    `build_board` sorts by this key; any caller that needs to know whether
+    one item outranks another — the out-of-order warning, for instance —
+    reads this instead of re-deriving its own notion of "ahead", which is
+    exactly how `board` and `next` fell out of agreement before.
+    """
+    return (item.priority_category, -item.score, item.number)
 
 
 def build_board(
@@ -478,8 +558,12 @@ def build_board(
         for issue in issues
     }
     claims_by_issue = _claim_by_issue(claims)
-    in_flight_references = _associated_issues(open_pull_requests)
-    landed_references = _associated_issues(recent_merged_pull_requests)
+    in_flight_references = _associated_issues(open_pull_requests) | _touched_without_closing(
+        open_pull_requests
+    )
+    landed_references = _associated_issues(recent_merged_pull_requests) | _touched_without_closing(
+        recent_merged_pull_requests
+    )
     open_branches = frozenset(pr.head_ref_name for pr in open_pull_requests)
 
     items: list[BoardItem] = []
@@ -550,9 +634,7 @@ def build_board(
                 actionable_reason=actionable_reason,
             )
         )
-    ordered = tuple(
-        sorted(items, key=lambda item: (item.priority_category, -item.score, item.number))
-    )
+    ordered = tuple(sorted(items, key=board_rank))
     return Board(
         items=ordered,
         ready_now=tuple(
@@ -569,7 +651,16 @@ def build_board(
 
 
 def highest_scored_actionable(board: Board) -> BoardItem | None:
-    return max(board.ready_now, key=lambda item: item.score, default=None)
+    """The one item `next` recommends — always `board`'s own top row.
+
+    `ready_now` is a filtered view of `items`, which `build_board` orders by
+    `(priority_category, -score, number)`; filtering preserves that order, so
+    its first element is `board`'s own top-ranked actionable row. Two
+    commands over one board must not disagree, so this reads that order
+    instead of maximizing score on its own — an unlabelled item with a
+    higher score must never outrank a human's priority label.
+    """
+    return next(iter(board.ready_now), None)
 
 
 def board_json(board: Board) -> str:

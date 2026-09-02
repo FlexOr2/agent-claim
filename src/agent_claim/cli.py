@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__, board, checkout, discovery, github, protocol
@@ -40,6 +40,7 @@ _projection_ledger = protocol._projection_ledger
 _projection_marker = protocol._projection_marker
 _repository = checkout._repository
 _resolved_agent = checkout._resolved_agent
+_timestamp = board._timestamp
 _unclaimed_projection = protocol._unclaimed_projection
 _validate_checkout = checkout._validate_checkout
 acquire_claim = protocol.acquire_claim
@@ -267,7 +268,7 @@ def _parser() -> argparse.ArgumentParser:
 
     next_command = commands.add_parser(
         "next",
-        help="name the highest-scored item to pull",
+        help="name the board's top-priority item to pull",
         description=NEXT_PULL_DESCRIPTION,
     )
     next_command.add_argument("--json", action="store_true")
@@ -293,7 +294,7 @@ def _parser() -> argparse.ArgumentParser:
     claim.add_argument(
         "--out-of-order",
         metavar="REASON",
-        help="record why this claim proceeds ahead of a higher-scored actionable item",
+        help="record why this claim proceeds ahead of a higher-priority actionable item",
     )
     claim.add_argument(
         "--allow-directory",
@@ -625,16 +626,38 @@ def _release_json(
     return 0
 
 
+def _merged_pull_request_floor(issues: tuple[board.Issue, ...], now: datetime) -> datetime:
+    """The earliest merge that could still matter to a currently open issue.
+
+    A pull request can only touch or close an issue that already exists, so
+    nothing merged before the oldest still-open issue was filed can ever
+    change any open item's stage. Anchoring the query here — instead of an
+    arbitrary fixed window — is what lets a slice's "Refs #N"/"Part of #N"
+    landing keep crediting its still-open epic for as long as the epic stays
+    open, rather than for a fixed number of days after which the credit
+    silently reverts. Residual: the underlying query is still capped (see
+    `GitHubIssueComments.list_recent_merged_board_pull_requests`), so an epic
+    old enough to have more merges than that cap between its filing and now
+    can still lose credit for an early slice; this floor removes the
+    fortnight-sized version of that gap, not every version of it.
+    """
+    if not issues:
+        return now
+    return min(_timestamp(issue.created_at) for issue in issues)
+
+
 def _board(
     client: github.GitHubIssueComments,
     claims: tuple[protocol.ActiveClaim, ...],
 ) -> board.Board:
     now = datetime.now(timezone.utc)
     toplevel = Path(checkout._git_output(["rev-parse", "--show-toplevel"]))
+    issues = client.list_open_board_issues()
+    since = _merged_pull_request_floor(issues, now)
     return board.build_board(
-        client.list_open_board_issues(),
+        issues,
         client.list_open_board_pull_requests(),
-        client.list_recent_merged_board_pull_requests(now - timedelta(days=14)),
+        client.list_recent_merged_board_pull_requests(since),
         claims,
         board.load_config(toplevel / ".agent-claim" / "board.toml"),
         now=now,
@@ -708,10 +731,10 @@ def _out_of_order_warning(
     if highest is None or issue is None:
         return None
     claimed_item = next((item for item in projected.items if item.number == issue), None)
-    if claimed_item is None or highest.score <= claimed_item.score:
+    if claimed_item is None or board.board_rank(highest) >= board.board_rank(claimed_item):
         return None
     return (
-        f"WARNING: higher-scored actionable item #{highest.number} "
+        f"WARNING: higher-priority actionable item #{highest.number} "
         f"(score {highest.score}) is free: {highest.title}"
     )
 

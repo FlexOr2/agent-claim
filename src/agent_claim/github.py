@@ -34,6 +34,7 @@ ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 COMMENTS_PER_PAGE = 100
 MAX_LEDGER_PAGES = 100
 LEDGER_ROLLOVER_WARNING_PAGES = 80
+MAX_RECENT_MERGED_PULL_REQUESTS = 1000
 MAX_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024
 GH_TIMEOUT_SECONDS = 60
 GH_QUIET_ENVIRONMENT = {
@@ -394,7 +395,7 @@ class GitHubIssueComments:
                 "--search",
                 f"merged:>={since.date().isoformat()}",
                 "--limit",
-                "1000",
+                str(MAX_RECENT_MERGED_PULL_REQUESTS),
                 "--json",
                 "number,title,body,headRefName,mergedAt",
                 "--jq",
@@ -406,6 +407,22 @@ class GitHubIssueComments:
             self._board_pull_request(value)
             for value in self._json_lines(raw, "merged board pull request")
         )
+        if len(pull_requests) >= MAX_RECENT_MERGED_PULL_REQUESTS:
+            # `build_board`'s durable floor (the oldest open issue's creation)
+            # can ask for a wide "since" on a long-lived, busy repository; a
+            # full result page here means GitHub may hold more merged pull
+            # requests than this call fetched, so an older landing could be
+            # silently missing from a derived stage. Matches the existing
+            # ledger-rollover-approaching warning above: say so on stderr
+            # rather than compute board/next from a history we know may be
+            # incomplete without telling anyone.
+            print(
+                "WARNING: merged pull request history is capped at "
+                f"{MAX_RECENT_MERGED_PULL_REQUESTS} results since "
+                f"{since.date().isoformat()}; an older landing could be "
+                "missing from a board/next stage",
+                file=sys.stderr,
+            )
         recent: list[board.PullRequest] = []
         for pull_request in pull_requests:
             if pull_request.merged_at is None:
