@@ -1577,6 +1577,71 @@ def test_board_category_order_keeps_ci_ahead_of_a_high_scoring_blocker() -> None
     assert projected.items[1].score > projected.items[0].score
 
 
+def test_next_names_the_boards_top_row_even_when_it_is_not_the_highest_score() -> None:
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    in_flight_unlabelled = board_issue(
+        50, "In-flight, unlabelled", complete_contract("Ship it.")
+    )
+    blocker = board_issue(
+        51, "Prerequisite the operator prioritized", complete_contract("Unblock #52.")
+    )
+    dependent = board_issue(52, "Depends on the prerequisite", "## Blocked by\n#51")
+    open_pull_request = board.PullRequest(200, "Fixes #50", "", "branch")
+
+    projected = board.build_board(
+        (in_flight_unlabelled, blocker, dependent),
+        (open_pull_request,),
+        (),
+        (),
+        board.BoardConfig(),
+        now=now,
+    )
+    by_number = {item.number: item for item in projected.items}
+
+    # #50 outscores #51 on raw score alone; #51 still leads because it carries
+    # the higher-priority "blocker" bucket (it unblocks #52) that `board`
+    # already sorts on ahead of score.
+    assert by_number[50].score > by_number[51].score
+    assert projected.items[0].number == 51
+
+    recommended = board.highest_scored_actionable(projected)
+    assert recommended is not None
+    assert recommended.number == 51
+
+
+def test_an_epic_inherits_the_landed_stage_of_a_slice_that_did_not_close_it() -> None:
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    epic = board_issue(
+        60, "Epic cut into dispatched slices", complete_contract("Cut the next slice.")
+    )
+    slice_pull_request = board.PullRequest(120, "Slice 1", "Part of #60.", "branch")
+
+    projected = board.build_board(
+        (epic,), (), (slice_pull_request,), (), board.BoardConfig(), now=now
+    )
+
+    assert projected.items[0].stage is board.Stage.CODE_LANDED
+
+
+def test_a_pull_request_merely_mentioning_the_epic_number_confers_no_stage() -> None:
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    epic = board_issue(
+        61, "Epic untouched by this pull request", complete_contract("Cut the next slice.")
+    )
+    unrelated_pull_request = board.PullRequest(
+        121,
+        "Unrelated fix",
+        "This closes a bug that was discovered while reading #61's plan.",
+        "branch",
+    )
+
+    projected = board.build_board(
+        (epic,), (), (unrelated_pull_request,), (), board.BoardConfig(), now=now
+    )
+
+    assert projected.items[0].stage is board.Stage.TEXT_ONLY
+
+
 def test_board_configuration_requires_unique_ordered_labels(tmp_path: Path) -> None:
     config_path = tmp_path / "board.toml"
     config_path.write_text('priority_labels = ["ux", "security"]\n')

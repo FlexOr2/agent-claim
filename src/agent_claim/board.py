@@ -58,6 +58,16 @@ CLOSING_REFERENCE_PATTERN = re.compile(
     r"(?im)\b(?:close(?:s|d)?|fix(?:es|ed)?|resolve(?:s|d)?|"
     r"land(?:s|ed)?|implement(?:s|ed)?)\s*:?\s*#([1-9][0-9]*)"
 )
+# A slice's pull request must never close its still-open epic — that would
+# retire the epic before its remaining slices exist. This repository's
+# established substitute is a whole line opening with one of these markers
+# (observed verbatim in atelier-2 PRs #848 "Part of #79.", #960 "Refs #956
+# and #80", #965/#967 "Refs #<n> ..."). Anchoring to the start of the line
+# is what keeps a casual mid-paragraph mention — "as noted in #79's plan" —
+# from ever counting; only a dedicated reference line does.
+TOUCHES_WITHOUT_CLOSING_LINE_PATTERN = re.compile(
+    r"(?im)^(?:Refs?|References?|Part of|Teil von)\b[:\s].*$"
+)
 NOTHING_BLOCKER_VALUES = frozenset({"nichts", "none", "keine", "-"})
 CLAIM_OLD_AFTER = timedelta(hours=1)
 CUT_HEADING_PATTERN = re.compile(r"(?m)^##[ \t]+Schnitt")
@@ -147,6 +157,13 @@ class BoardItem:
 
 @dataclass(frozen=True)
 class Board:
+    """`items`, and therefore `ready_now`, are ordered `(priority_category, -score, number)`.
+
+    `ready_now` and `stale` are filters over `items`; filtering never
+    reorders, so `ready_now[0]` is always `items`' first actionable row —
+    the same row a human reading `board` sees first. `next` relies on this.
+    """
+
     items: tuple[BoardItem, ...]
     ready_now: tuple[BoardItem, ...]
     stale: tuple[BoardItem, ...]
@@ -453,6 +470,25 @@ def _associated_issues(pull_requests: tuple[PullRequest, ...]) -> frozenset[int]
     )
 
 
+def _touched_without_closing(pull_requests: tuple[PullRequest, ...]) -> frozenset[int]:
+    """Issues a pull request advances without closing — an epic's slices, typically.
+
+    The coordination contract requires a slice to become its own item at
+    dispatch, so an epic's work lands through its children's pull requests,
+    which deliberately avoid a closing keyword against the epic itself (see
+    `TOUCHES_WITHOUT_CLOSING_LINE_PATTERN`). Without this, an epic that is
+    cut correctly can never earn a landed or in-flight stage.
+    """
+    return frozenset(
+        number
+        for pull_request in pull_requests
+        for line in TOUCHES_WITHOUT_CLOSING_LINE_PATTERN.findall(
+            f"{pull_request.title}\n{pull_request.body}"
+        )
+        for number in _references(line)
+    )
+
+
 def build_board(
     issues: tuple[Issue, ...],
     open_pull_requests: tuple[PullRequest, ...],
@@ -478,8 +514,12 @@ def build_board(
         for issue in issues
     }
     claims_by_issue = _claim_by_issue(claims)
-    in_flight_references = _associated_issues(open_pull_requests)
-    landed_references = _associated_issues(recent_merged_pull_requests)
+    in_flight_references = _associated_issues(open_pull_requests) | _touched_without_closing(
+        open_pull_requests
+    )
+    landed_references = _associated_issues(recent_merged_pull_requests) | _touched_without_closing(
+        recent_merged_pull_requests
+    )
     open_branches = frozenset(pr.head_ref_name for pr in open_pull_requests)
 
     items: list[BoardItem] = []
@@ -569,7 +609,16 @@ def build_board(
 
 
 def highest_scored_actionable(board: Board) -> BoardItem | None:
-    return max(board.ready_now, key=lambda item: item.score, default=None)
+    """The one item `next` recommends — always `board`'s own top row.
+
+    `ready_now` is a filtered view of `items`, which `build_board` orders by
+    `(priority_category, -score, number)`; filtering preserves that order, so
+    its first element is `board`'s own top-ranked actionable row. Two
+    commands over one board must not disagree, so this reads that order
+    instead of maximizing score on its own — an unlabelled item with a
+    higher score must never outrank a human's priority label.
+    """
+    return next(iter(board.ready_now), None)
 
 
 def board_json(board: Board) -> str:
