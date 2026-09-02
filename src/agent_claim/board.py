@@ -50,9 +50,20 @@ FENCE_CLOSING_PATTERN = re.compile(r"^[ ]{0,3}(?P<run>`{3,}|~{3,})[ \t]*$")
 PROPOSED_EXPECTATION_PATTERN = re.compile(
     r"\*\(Default:[ \t]*(?:yes|no|later)\)\*", re.IGNORECASE
 )
+# `ja` and `NEIN` both may carry trailing justification text before the
+# closing `)*` (`*(geregelt: ja — Owner ist #567)*`, `*(geregelt: NEIN, it
+# stays)*`) — real operator rulings cite an owner or a reservation on a
+# "yes" as often as on a "no", so the two keywords take the same shape. Any
+# trailing text must start past a separator so a look-alike word right
+# after the keyword (`jawohl`) does not slip through as a bare "ja".
 RULED_EXPECTATION_PATTERN = re.compile(
-    r"\*\(geregelt:[ \t]*(?:ja|NEIN(?:[^\r\n]*))\)\*", re.IGNORECASE
+    r"\*\(geregelt:[ \t]*(?:ja|NEIN)(?:[ \t,.;:\u2014-][^\r\n]*)?\)\*", re.IGNORECASE
 )
+# Both RULED_EXPECTATION_PATTERN and PROPOSED_EXPECTATION_PATTERN mark a
+# CommonMark list item (`- ...` or `1. ...`): every expectation line in this
+# contract is written as one. A line with that shape is a candidate
+# expectation, whether or not it happens to carry either marker yet.
+EXPECTATION_LINE_SHAPE_PATTERN = re.compile(r"^(?:[-*+]|\d+[.)])[ \t]+")
 REFERENCE_PATTERN = re.compile(r"(?<![A-Za-z0-9_])#([1-9][0-9]*)")
 CLOSING_REFERENCE_PATTERN = re.compile(
     r"(?im)\b(?:close(?:s|d)?|fix(?:es|ed)?|resolve(?:s|d)?|"
@@ -241,17 +252,32 @@ def _expectation_block_state(body: str, heading: re.Match[str]) -> ExpectationSt
     necessarily prose, not a machine-parsable pattern on every line. A line
     that still carries the explicit proposal marker is a contradiction to
     surface, not to swallow under a ruled heading, so it still forces
-    PROPOSED. Without that heading marker, every non-empty line must carry
-    the ruled-line pattern (issue #62): silence never rules.
+    PROPOSED. A ruled heading only excuses lines that are not themselves
+    shaped like an expectation item (EXPECTATION_LINE_SHAPE_PATTERN): a list
+    item added later, under the same heading, without its own ruled marker
+    is silence wearing the heading's ruling, not a ruling of its own, so it
+    still forces PROPOSED. A heading with no lines beneath it rules nothing
+    and is PROPOSED. Without the heading marker, every non-empty line must
+    carry the ruled-line pattern (issue #62): silence never rules.
     """
     lines = tuple(
         line.strip() for line in _expectation_block_text(body, heading).splitlines() if line.strip()
     )
     if any(PROPOSED_EXPECTATION_PATTERN.search(line) for line in lines):
         return ExpectationState.PROPOSED
+    if not lines:
+        return ExpectationState.PROPOSED
     if OPERATOR_RULING_DATE_PATTERN.search(heading.group(0)) is not None:
+        unruled_expectation_shaped_lines = (
+            line
+            for line in lines
+            if EXPECTATION_LINE_SHAPE_PATTERN.match(line)
+            and not RULED_EXPECTATION_PATTERN.search(line)
+        )
+        if any(unruled_expectation_shaped_lines):
+            return ExpectationState.PROPOSED
         return ExpectationState.RULED
-    if lines and all(RULED_EXPECTATION_PATTERN.search(line) for line in lines):
+    if all(RULED_EXPECTATION_PATTERN.search(line) for line in lines):
         return ExpectationState.RULED
     return ExpectationState.PROPOSED
 
@@ -276,6 +302,17 @@ def _parse_dotted_date(day: str, month: str, year: str) -> date:
 
 
 def parse_ruling_date(body: str) -> date:
+    """The date of the ruling shown for freshness (issue #62's "old" hint).
+
+    Reads only the first expectation heading matched by
+    EXPECTATION_HEADING_PATTERN. A body with several dated `## Erwartungen…`
+    blocks (issue #78) therefore has its freshness driven by block order,
+    not by the oldest or most relevant ruling — a known residual, left
+    unfixed here. EXPECTATION_HEADING_PATTERN itself requires the heading to
+    start with "Erwartung"/"Erwartungen"/"Erwartungsliste"; a heading like
+    "Geregelte Erwartungen …" is not matched at all and contributes neither
+    a state nor a date. Both gaps are named, not widened, by issue #78.
+    """
     heading = expectation_heading(body)
     if heading is None:
         raise protocol.ClaimError("ruled expectations have no readable date")

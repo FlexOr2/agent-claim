@@ -8774,6 +8774,71 @@ def test_one_unruled_block_among_ruled_ones_keeps_the_item_proposed() -> None:
     assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
 
 
+def test_a_new_line_without_its_own_marker_stays_proposed_under_a_ruled_heading() -> None:
+    """Codex review of #78 (finding 1): a ruled heading only excuses prose, tables,
+    examples and sub-headings — not a list item shaped like an expectation
+    line (RULED_EXPECTATION_PATTERN/PROPOSED_EXPECTATION_PATTERN are both
+    written against that shape) that was added later without carrying its
+    own ruled marker. That is silence wearing the heading's ruling, which
+    #62 excludes.
+    """
+    issue = board_issue(
+        10,
+        "New line under an old ruling",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "- Name it. *(geregelt: ja)*",
+            "- Some new expectation added after the ruling.",
+            heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
+        ),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
+
+
+def test_prose_and_a_table_row_stay_ruled_under_a_ruled_heading() -> None:
+    """Positive control for finding 1: only expectation-shaped lines need their own marker."""
+    issue = board_issue(
+        10,
+        "Prose and a table row under a ruling",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "- Name it. *(geregelt: ja)*",
+            "Beispiel: so sieht die Anwendung im Alltag aus.",
+            "| Spalte A | Spalte B |",
+            "| -------- | -------- |",
+            "| Wert 1   | Wert 2   |",
+            heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
+        ),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.RULED
+
+
+def test_a_ruled_heading_with_no_lines_beneath_it_reads_as_proposed() -> None:
+    """Codex review of #78 (finding 3): a ruling over nothing is not a ruling."""
+    issue = board_issue(
+        10,
+        "Ruled heading, empty block",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(heading="Erwartungen (GEREGELT: Operator 27.08.2026)"),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
+
+
 def test_a_ruling_is_old_after_ten_trunk_landings() -> None:
     issue = board_issue(
         10,
