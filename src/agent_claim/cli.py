@@ -1227,7 +1227,26 @@ def main(arguments: list[str] | None = None) -> int:
             # of a fresh `protocol._ledger_claims(client)` call) removes the
             # slowest step of `claim` — the wait was reported as a hang that
             # landed after the mutation was already visible on the ledger.
-            claimed, observed = protocol._acquire_claim_with_observed(client, requested)
+            try:
+                claimed, observed = protocol._acquire_claim_with_observed(client, requested)
+            except protocol.ClaimPostedReconcileFailed as error:
+                # The claim comment already exists and already won the
+                # ledger; a failure in the post-claim label/projection
+                # reconcile must never read as a refusal — that would leave
+                # the operator believing nothing happened while a live claim
+                # sits on the ledger. Print the claim plainly even under
+                # --json: there is no well-formed claim payload to emit when
+                # the reconcile itself is what failed.
+                print(
+                    f"CLAIMED {_claim_subject(error.claim)}: "
+                    f"{error.claim.claim_id} {error.claim.comment.url}"
+                )
+                print(
+                    f"ERROR: the claim above exists, but the post-claim "
+                    f"reconcile failed: {error.reconcile_error}",
+                    file=sys.stderr,
+                )
+                return 2
             touches = protocol.conflicting_claims(observed, claimed)
             if parsed.json:
                 return _claim_json(

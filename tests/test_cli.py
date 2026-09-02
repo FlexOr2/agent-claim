@@ -7407,6 +7407,50 @@ def test_cli_claim_share_at_a_quarter_does_not_need_allow_directory(
     )
 
 
+def test_cli_claim_reports_the_claim_when_the_post_claim_reconcile_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The label/projection reconcile that follows a winning claim post can
+    itself fail; the claim above is already live on the ledger (the earlier
+    race checks all passed), so this must never read as a refusal — the
+    operator must see the claim id and an explicit "the claim exists"
+    message, even under --json where there is no well-formed claim payload
+    left to emit."""
+    client = FakeComments(fail_add_label=True)
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+
+    exit_code = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Codex Sol",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "src/work.py",
+            "--claim-id",
+            "flaky-reconcile",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "CLAIMED issue #72: flaky-reconcile" in captured.out
+    assert "ERROR: the claim above exists, but the post-claim reconcile failed" in captured.err
+    posted = active_claims(tuple(client.comments[LEDGER_ISSUE]))
+    assert any(claim.claim_id == "flaky-reconcile" for claim in posted)
+
+
 def test_cli_claim_touches_stay_empty_beside_a_disjoint_standing_claim(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

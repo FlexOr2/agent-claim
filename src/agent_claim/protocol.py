@@ -1549,6 +1549,23 @@ def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
     return claimed
 
 
+class ClaimPostedReconcileFailed(ClaimError):
+    """The requested claim is live on the ledger, but the label/projection
+    reconcile that normally follows a winning post failed.
+
+    `acquire_claim` only reaches this step after confirming its own post won
+    the ledger, so the claim itself is not in doubt — a caller must report it
+    as live (never as a refusal), and separately surface what the reconcile
+    failed on.
+    """
+
+    def __init__(self, claim: ActiveClaim, observed: tuple[ActiveClaim, ...], error: Exception):
+        self.claim = claim
+        self.observed = observed
+        self.reconcile_error = error
+        super().__init__(str(error))
+
+
 def _acquire_claim_with_observed(
     client: IssueComments, request: ClaimRequest
 ) -> tuple[ActiveClaim, tuple[ActiveClaim, ...]]:
@@ -1651,7 +1668,13 @@ def _acquire_claim_with_observed(
                 f"{request.resource} but derivation produced no hold"
             )
 
-    _reconcile_identity(client, request.identity)
+    try:
+        _reconcile_identity(client, request.identity)
+    except ClaimError as error:
+        # The claim comment above already won the ledger (the earlier race
+        # checks all passed), so a failure reconciling the issue's label or
+        # projection must never surface as if the claim itself had failed.
+        raise ClaimPostedReconcileFailed(own, observed, error) from error
     return own, observed
 
 
