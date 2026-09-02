@@ -16,6 +16,11 @@ from .protocol import (
     claim_label,
 )
 
+# GitHub's issues-list pagination fills every page but the last, so a result
+# strictly under this count could only have come from one request — one live
+# snapshot a concurrent open/close cannot have shifted an issue across.
+ISSUES_PER_PAGE = 100
+
 
 @dataclass(frozen=True)
 class _LedgerIssue:
@@ -36,7 +41,7 @@ def _ledger_issue_rows(
         [
             "api",
             "--paginate",
-            f"repos/{client.repository}/issues?state={state}{label_filter}&per_page=100",
+            f"repos/{client.repository}/issues?state={state}{label_filter}&per_page={ISSUES_PER_PAGE}",
             "--jq",
             (
                 ".[] | {number,state,locked,body,author_association,"
@@ -143,15 +148,22 @@ def discover_ledger(client: GitHubIssueComments) -> int | None:
 
     Only when the labelled query comes back empty — an unlabelled legacy
     ledger, or a genuine absence — does discovery fall back to scanning every
-    open issue, which usually still fits one page today but is not provably
-    atomic once it does not. The open-issue-count comparison below only
-    detects a fetch that a mid-scan open/close made incomplete; it cannot
-    prove completeness (an issue that closed on an already-read page and
-    reopened, or shifted within the same fetch, could still leave the count
-    unchanged while an issue moved across a page boundary). Either way this
-    must fail loud rather than report "no ledger" — reporting that wrongly
-    invites `bootstrap`, which would create a second, competing ledger next
-    to one that still exists.
+    open issue. That scan can only report absence (return `None`) when it
+    was a single page: `len(rows) < ISSUES_PER_PAGE` is the only condition
+    under which the fetch was provably one snapshot, since GitHub's
+    pagination fills every page but the last. A fallback spanning more than
+    one page can never prove absence, no matter how the counts line up — an
+    issue that closed on an already-consumed page while another opened could
+    leave `len(rows)` exactly equal to the live open-issue count while still
+    hiding an unlabelled legacy ledger that shifted across the page
+    boundary — so that case always fails loud instead. Within a genuinely
+    single-page fetch, the open-issue-count comparison is still worth
+    keeping as an additional detector: it cannot involve a page-boundary
+    shift, but the count itself comes from a separate request that could
+    still have raced an open or close between the two calls. Whichever
+    check trips, this must fail loud rather than report "no ledger" —
+    reporting that wrongly invites `bootstrap`, which would create a
+    second, competing ledger next to one that still exists.
     """
     labelled = _select_ledger(_ledger_issue_rows(client, state="open", label=LEDGER_LABEL))
     if labelled is not None:
@@ -160,6 +172,12 @@ def discover_ledger(client: GitHubIssueComments) -> int | None:
     ledger = _select_ledger(rows)
     if ledger is not None:
         return ledger
+    if len(rows) >= ISSUES_PER_PAGE:
+        page_count = (len(rows) + ISSUES_PER_PAGE - 1) // ISSUES_PER_PAGE
+        raise ClaimError(
+            f"could not establish ledger absence over {page_count} pages of "
+            "open issues; retry, do not bootstrap"
+        )
     if len(rows) != _open_issue_count(client):
         raise ClaimError(
             "ledger discovery fetch may be incomplete (the open-issue count "

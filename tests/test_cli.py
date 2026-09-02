@@ -258,6 +258,29 @@ def test_discovery_refuses_to_report_absence_after_an_inconsistent_fetch(
     assert "run agent-claim bootstrap" not in str(excinfo.value)
 
 
+def test_discovery_refuses_absence_over_a_multi_page_fallback_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page-boundary shift could hide an unlabelled ledger even when the
+    live open-issue count happens to match; a fallback spanning more than
+    one page can never prove absence, so it must fail loud regardless."""
+    rows = [ledger_row(number, body="ordinary open issue") for number in range(1, 151)]
+    client, _ = ledger_client(monkeypatch, rows)
+
+    with pytest.raises(ClaimError, match="could not establish ledger absence") as excinfo:
+        issue_claim.discover_ledger(client)
+    assert "run agent-claim bootstrap" not in str(excinfo.value)
+
+
+def test_discovery_reports_absence_after_a_single_page_fallback_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [ledger_row(number, body="ordinary open issue") for number in range(1, 51)]
+    client, _ = ledger_client(monkeypatch, rows)
+
+    assert issue_claim.discover_ledger(client) is None
+
+
 def test_discovery_fetch_failure_propagates_loudly_without_bootstrap_advice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
