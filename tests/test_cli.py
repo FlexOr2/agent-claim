@@ -8839,6 +8839,90 @@ def test_a_ruled_heading_with_no_lines_beneath_it_reads_as_proposed() -> None:
     assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
 
 
+def test_a_hyphenated_ja_nein_contradiction_is_not_ruled() -> None:
+    """Codex review of #78 (RULED_EXPECTATION_PATTERN boundary): a hyphen glues two
+
+    contradicting words together (`ja-nein`) rather than separating a
+    keyword from its justification; the pattern's trailing-text boundary
+    excludes it on purpose.
+    """
+    issue = board_issue(
+        10,
+        "Hyphenated contradiction after ja",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "- Name it. *(geregelt: ja-nein)*",
+            heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
+        ),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
+
+
+def test_a_hyphenated_nein_ja_contradiction_is_not_ruled() -> None:
+    """Codex review of #78 (RULED_EXPECTATION_PATTERN boundary): the same hyphen guard
+
+    applies symmetrically to `NEIN-ja`.
+    """
+    issue = board_issue(
+        10,
+        "Hyphenated contradiction after NEIN",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "- Remove it. *(geregelt: NEIN-ja)*",
+            heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
+        ),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
+
+
+def test_ja_with_an_owner_reference_still_rules() -> None:
+    """Positive control: the real #79 convention (`ja — Owner ist #567`) still rules."""
+    issue = board_issue(
+        10,
+        "Ja with an owner reference",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "- Name it. *(geregelt: ja — Owner ist #567)*",
+            heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
+        ),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.RULED
+
+
+def test_nein_with_a_reason_still_rules() -> None:
+    """Positive control: the established `NEIN, weil …` convention still rules."""
+    issue = board_issue(
+        10,
+        "NEIN with a reason",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "- Remove it. *(geregelt: NEIN, weil es woanders geregelt ist)*",
+            heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
+        ),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.RULED
+
+
 def test_a_ruling_is_old_after_ten_trunk_landings() -> None:
     issue = board_issue(
         10,

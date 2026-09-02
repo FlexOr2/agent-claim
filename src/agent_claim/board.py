@@ -53,11 +53,14 @@ PROPOSED_EXPECTATION_PATTERN = re.compile(
 # `ja` and `NEIN` both may carry trailing justification text before the
 # closing `)*` (`*(geregelt: ja — Owner ist #567)*`, `*(geregelt: NEIN, it
 # stays)*`) — real operator rulings cite an owner or a reservation on a
-# "yes" as often as on a "no", so the two keywords take the same shape. Any
-# trailing text must start past a separator so a look-alike word right
-# after the keyword (`jawohl`) does not slip through as a bare "ja".
+# "yes" as often as on a "no", so the two keywords take the same shape. The
+# character right after the keyword must be the closing `)`, whitespace, an
+# em dash `—`, or one of `, ; :` — every real separator seen in #79 and in
+# #62's own tests (`ja — Owner`, `ja mit Schärfung,`, `ja, aber`, `NEIN, it
+# stays`). A hyphen or any other letter-joining character is excluded on
+# purpose: `ja-nein` is a contradiction in the ruling text, not a "yes".
 RULED_EXPECTATION_PATTERN = re.compile(
-    r"\*\(geregelt:[ \t]*(?:ja|NEIN)(?:[ \t,.;:\u2014-][^\r\n]*)?\)\*", re.IGNORECASE
+    r"\*\(geregelt:[ \t]*(?:ja|NEIN)(?:[ \t,;:\u2014][^\r\n]*)?\)\*", re.IGNORECASE
 )
 # Both RULED_EXPECTATION_PATTERN and PROPOSED_EXPECTATION_PATTERN mark a
 # CommonMark list item (`- ...` or `1. ...`): every expectation line in this
