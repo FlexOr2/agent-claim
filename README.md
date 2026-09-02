@@ -99,9 +99,16 @@ every duplicated id, not just the conflicting one — instead of picking a winne
 
 ## Read-only board projection
 
-`agent-claim board` reads the open issues, open PRs, PRs merged in the last 14
-days, and the claim ledger, then prints a ranked projection with `READY NOW` and
-`STALE` sections. The table exposes which exact contract headings were found, an
+`agent-claim board` reads the open issues, open PRs, PRs merged since the
+oldest open issue was filed, and the claim ledger, then prints a ranked
+projection with `READY NOW` and `STALE` sections. A pull request that
+advances an issue without closing it — an epic's dispatched slice, typically
+— credits that issue when the pull request names it a second time outside a
+dedicated `Refs #N`/`Part of #N` line; that is a syntactic marker, not a
+verified relation, so an unrelated pull request naming the same issue twice
+by coincidence would still credit it.
+
+The table exposes which exact contract headings were found, an
 `EXPECT` state (`-`, `proposed`, or `ruled N` / `ruled N old`), a concise `Next`, and a CLAIM
 cell with `-` or the agent, role, claim age, and `old` when the claim comment
 is older than one hour; JSON includes the complete derived contract state. An `Erwartung`, `Erwartungen`, or
@@ -123,19 +130,21 @@ The current checkout may set `priority_labels` as an ordered non-empty list in
 buckets, followed by items that unblock other work, then the remaining labels;
 stage and Next bonuses sort only within a bucket.
 
-Use `agent-claim next` (or `agent-claim next --json`) to name the highest-scored
-actionable item: it is open, free, unblocked, not frozen, and has a complete
-Now/Next/Blocked by/Done when contract. Pulling is not dispatching, so unruled
-expectations never withhold an item; the pulled item carries `Erwartungen
+Use `agent-claim next` (or `agent-claim next --json`) to name the board's
+top-ranked actionable item — the same bucket-then-score-then-number order
+`board` shows, read from its first row: it is open, free, unblocked, not
+frozen, and has a complete Now/Next/Blocked by/Done when contract. Pulling is
+not dispatching, so unruled expectations never withhold an item; the pulled
+item carries `Erwartungen
 ungeregelt, beim Ziehen zuerst refinen` instead, and an item ruled long ago
 carries `vor N Landungen geregelt, beim Ziehen neu refinen` (both as the JSON
 `ruling_hint`). Items that genuinely cannot be worked — claimed, blocked by an
 open issue, frozen, or without a complete contract — are named with that
 reason under `SKIPPED` (also in the JSON `skipped` list), and `next` exits 3
 when none qualifies.
-`claim` still allows work out of order, but warns when a higher-scored
-actionable item is free; pass `--out-of-order REASON` to preserve why in the
-claim comment.
+`claim` still allows work out of order, but warns when a higher-priority
+actionable item — the same order `board` and `next` use — is free; pass
+`--out-of-order REASON` to preserve why in the claim comment.
 
 A body line `Eingefroren bis: <trigger in one sentence> (Operator, DD.MM.YYYY)`
 freezes an issue: it drops out of `next` and out of the out-of-order warning
