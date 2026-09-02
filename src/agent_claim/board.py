@@ -227,22 +227,41 @@ def expectation_heading(body: str) -> re.Match[str] | None:
     return EXPECTATION_HEADING_PATTERN.search(body)
 
 
-def expectation_state(body: str) -> ExpectationState:
-    heading = expectation_heading(body)
-    if heading is None:
-        return ExpectationState.NONE
+def _expectation_block_text(body: str, heading: re.Match[str]) -> str:
     next_heading = MARKDOWN_HEADING_PATTERN.search(body, heading.end())
-    expectation_block = body[
-        heading.end() : next_heading.start() if next_heading is not None else len(body)
-    ]
-    expectation_lines = tuple(
-        line.strip() for line in expectation_block.splitlines() if line.strip()
+    return body[heading.end() : next_heading.start() if next_heading is not None else len(body)]
+
+
+def _expectation_block_state(body: str, heading: re.Match[str]) -> ExpectationState:
+    """The state of one expectation block.
+
+    The heading itself carries the ruling when it matches the operator's
+    `GEREGELT: Operator DD.MM.YYYY` marker (issue #78): the contract requires
+    example, counterexample and default per line, so a ruled block is
+    necessarily prose, not a machine-parsable pattern on every line. A line
+    that still carries the explicit proposal marker is a contradiction to
+    surface, not to swallow under a ruled heading, so it still forces
+    PROPOSED. Without that heading marker, every non-empty line must carry
+    the ruled-line pattern (issue #62): silence never rules.
+    """
+    lines = tuple(
+        line.strip() for line in _expectation_block_text(body, heading).splitlines() if line.strip()
     )
-    if (
-        not expectation_lines
-        or any(PROPOSED_EXPECTATION_PATTERN.search(line) for line in expectation_lines)
-        or not all(RULED_EXPECTATION_PATTERN.search(line) for line in expectation_lines)
-    ):
+    if any(PROPOSED_EXPECTATION_PATTERN.search(line) for line in lines):
+        return ExpectationState.PROPOSED
+    if OPERATOR_RULING_DATE_PATTERN.search(heading.group(0)) is not None:
+        return ExpectationState.RULED
+    if lines and all(RULED_EXPECTATION_PATTERN.search(line) for line in lines):
+        return ExpectationState.RULED
+    return ExpectationState.PROPOSED
+
+
+def expectation_state(body: str) -> ExpectationState:
+    headings = tuple(EXPECTATION_HEADING_PATTERN.finditer(body))
+    if not headings:
+        return ExpectationState.NONE
+    block_states = tuple(_expectation_block_state(body, heading) for heading in headings)
+    if any(state is ExpectationState.PROPOSED for state in block_states):
         return ExpectationState.PROPOSED
     return ExpectationState.RULED
 

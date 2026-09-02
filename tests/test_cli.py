@@ -8673,6 +8673,107 @@ def test_proposed_expectations_have_neither_fresh_nor_old() -> None:
     assert projected.items[0].ruling_old is None
 
 
+def test_a_ruled_heading_rules_a_block_of_prose_lines() -> None:
+    """Issue #78: the heading carries the ruling, so prose lines below it are fine."""
+    issue = board_issue(
+        10,
+        "Ruled by heading",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "Rueckspiegel: so habe ich dich verstanden, in eigenen Worten.",
+            "1. **Ein Arbeitspunkt entsteht sichtbar.** *(geregelt: ja)*",
+            "   Wenn du das Projekt anbindest, erscheint der Punkt in der Warteschlange.",
+            "   Sagst du nein, bleibt er unsichtbar.",
+            heading="Erwartungen (refine-Lauf 27.08.2026 — GEREGELT: Operator 27.08.2026)",
+        ),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.RULED
+
+
+def test_a_proposal_marker_under_a_ruled_heading_still_surfaces_as_proposed() -> None:
+    """Issue #78: an explicit still-open line contradicts its ruled heading and wins.
+
+    A ruled heading over a line explicitly marked as a proposal is a
+    contradiction to surface, not to swallow — the same silence-never-rules
+    guarantee from #62 applies to an explicit contradiction, not only to an
+    unmarked line.
+    """
+    issue = board_issue(
+        10,
+        "Contradicts its heading",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "Rueckspiegel: so habe ich dich verstanden, in eigenen Worten.",
+            "1. **Etwas Geregeltes.** *(geregelt: ja)*",
+            "2. **Etwas noch Offenes.** *(Default: later)*",
+            heading="Erwartungen (refine-Lauf 27.08.2026 — GEREGELT: Operator 27.08.2026)",
+        ),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
+
+
+def test_prose_without_a_ruled_heading_still_reads_as_proposed() -> None:
+    """Negative guard for #78: without the heading marker, #62's per-line rule still stands."""
+    issue = board_issue(
+        10,
+        "Unruled prose",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "Rueckspiegel: so habe ich dich verstanden, in eigenen Worten.",
+            "1. **Ein Arbeitspunkt entsteht sichtbar.** *(geregelt: ja)*",
+            "   Wenn du das Projekt anbindest, erscheint der Punkt in der Warteschlange.",
+            heading="Erwartungen (refine-Lauf 27.08.2026)",
+        ),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
+
+
+def test_one_unruled_block_among_ruled_ones_keeps_the_item_proposed() -> None:
+    """Issue #78: the code only ever read the first expectation heading; a body with
+    several `## Erwartungen…` blocks must reflect every one of them, not just the first.
+    """
+    issue = board_issue(
+        10,
+        "Three expectation blocks",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "- Name it. *(geregelt: ja)*",
+            heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
+        )
+        + "\n\n"
+        + expectation_block(
+            "- Name it. *(geregelt: ja)*",
+            heading="Erwartungen des Pulls (GEREGELT: Operator 31.08.2026)",
+        )
+        + "\n\n"
+        + expectation_block(
+            "- Name it without a ruling.",
+            heading="Erwartungen aus echter Benutzung",
+        )
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
+
+
 def test_a_ruling_is_old_after_ten_trunk_landings() -> None:
     issue = board_issue(
         10,
