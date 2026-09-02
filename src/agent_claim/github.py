@@ -9,7 +9,10 @@ import selectors
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta, timezone
+from typing import TypeVar
 
 from . import board, protocol
 from .protocol import (
@@ -28,6 +31,7 @@ from .protocol import (
     is_protocol_candidate,
 )
 
+_Page = TypeVar("_Page")
 TIMESTAMP_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 # gh 2.45 colorizes --jq output when it believes stdout is a TTY.
 ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -37,14 +41,23 @@ COMMENTS_PER_PAGE = 100
 # fetches before giving up and asking for a ledger rollover.
 MAX_LEDGER_PAGES = 100
 LEDGER_ROLLOVER_WARNING_PAGES = 80
-# `list_protocol_candidates` fetches every comment in one `gh api --paginate`
-# subprocess call before it can inspect anything, so by the time either of
-# these is checked the full cost has already been paid; they bound how much
-# is held and processed afterward (and when to ask for a rollover), not the
-# fetch cost itself.
+# `list_protocol_candidates` fetches every comment page before it can inspect
+# anything, so by the time either of these is checked the full cost has
+# already been paid; they bound how much is held and processed afterward
+# (and when to ask for a rollover), not the fetch cost itself.
 MAX_LEDGER_COMMENTS = MAX_LEDGER_PAGES * COMMENTS_PER_PAGE
 LEDGER_ROLLOVER_WARNING_COMMENTS = LEDGER_ROLLOVER_WARNING_PAGES * COMMENTS_PER_PAGE
 MAX_RECENT_MERGED_PULL_REQUESTS = 1000
+# GitHub's issue-comments listing is offset-paginated (a page past the last
+# one comes back empty rather than erroring) and its merged-pull-request
+# search accepts an exact-day filter, so both a ledger's comment pages and a
+# board's merged-pull-request date shards are independent, order-agnostic
+# fetches. Walking them one `gh` subprocess at a time made a growing ledger
+# the dominant cost of `status`/`board`/`next`/`claim` (measured ~7-8s for an
+# ~18-page ledger; ~0.8s fetched in parallel batches). This bounds how many
+# `gh` subprocesses run at once, comfortably under GitHub's secondary rate
+# limit for concurrent requests.
+PARALLEL_FETCH_CONCURRENCY = 20
 MAX_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024
 GH_TIMEOUT_SECONDS = 60
 GH_QUIET_ENVIRONMENT = {
@@ -61,6 +74,13 @@ def github_command_environment() -> dict[str, str]:
 
 def strip_ansi(text: str) -> str:
     return ANSI_ESCAPE.sub("", text)
+
+
+def _query_days(start: date, end: date) -> tuple[date, ...]:
+    """One calendar UTC day per merged-pull-request query shard, `start` through `end` inclusive."""
+    if end < start:
+        raise ClaimError("merged pull request window ends before it starts")
+    return tuple(start + timedelta(days=offset) for offset in range((end - start).days + 1))
 
 
 def _stop_process(process: subprocess.Popen[bytes]) -> None:
@@ -227,18 +247,39 @@ class GitHubIssueComments:
             for value in self._json_lines(raw, "issue-comment")
         )
 
+    def _fetch_pages(
+        self, page: Callable[[int], tuple[_Page, ...]], *, per_page: int
+    ) -> tuple[_Page, ...]:
+        """Every page from `page` (1-indexed), the first fetched alone and the
+        rest in concurrent batches of `PARALLEL_FETCH_CONCURRENCY`.
+
+        A single-page listing (the common case for a small or fresh
+        repository) costs exactly the one round trip it always did. A page
+        past the last one returns an empty array rather than erroring, so
+        once page 1 comes back full, a batch can ask for the next
+        `PARALLEL_FETCH_CONCURRENCY` page numbers at once; the batch's last
+        page coming back short of a full page is what ends the fetch, exactly
+        as a single `gh api --paginate` call would stop, just without waiting
+        for each page's round trip in turn.
+        """
+        first_page = page(1)
+        if len(first_page) < per_page:
+            return first_page
+        pages: list[_Page] = list(first_page)
+        start = 2
+        while True:
+            batch = range(start, start + PARALLEL_FETCH_CONCURRENCY)
+            with ThreadPoolExecutor(max_workers=PARALLEL_FETCH_CONCURRENCY) as pool:
+                fetched = list(pool.map(page, batch))
+            for page_values in fetched:
+                pages.extend(page_values)
+            if len(fetched[-1]) < per_page:
+                return tuple(pages)
+            start += PARALLEL_FETCH_CONCURRENCY
+
     def list_protocol_candidates(self, issue: int) -> tuple[IssueComment, ...]:
-        raw = self._run(
-            [
-                "api",
-                "--paginate",
-                f"repos/{self.repository}/issues/{issue}/comments?per_page={COMMENTS_PER_PAGE}",
-                "--jq",
-                ".[] | {id,created_at,updated_at,body,author_association,html_url}",
-            ]
-        )
-        all_comments = tuple(
-            self._parse_comment(value) for value in self._json_lines(raw, "issue-comment")
+        all_comments = self._fetch_pages(
+            lambda page: self._comment_page(issue, page), per_page=COMMENTS_PER_PAGE
         )
         total_comments = len(all_comments)
         if total_comments > MAX_LEDGER_COMMENTS:
@@ -359,21 +400,33 @@ class GitHubIssueComments:
             raise ClaimError("GitHub returned a malformed board pull request")
         return board.PullRequest(number, title, body, head_ref_name, merged_at)
 
-    def list_open_board_issues(self) -> tuple[board.Issue, ...]:
+    def _open_issue_page(self, page: int) -> tuple[object, ...]:
         raw = self._run(
             [
                 "api",
-                "--paginate",
-                f"repos/{self.repository}/issues?state=open&per_page=100",
+                f"repos/{self.repository}/issues"
+                f"?state=open&per_page={COMMENTS_PER_PAGE}&page={page}",
                 "--jq",
                 (
-                    '.[] | select(has("pull_request") | not) | '
-                    '{number,title,labels:(.labels | map(.name)),body:(.body // ""),'
-                    'createdAt:.created_at,updatedAt:.updated_at}'
+                    # No `select` here (unlike the old single `--paginate` call):
+                    # a page must report its true raw item count so a short page
+                    # still correctly signals "no more pages" even when some of
+                    # its items are pull requests, filtered out below instead.
+                    '.[] | {number,title,labels:(.labels | map(.name)),body:(.body // ""),'
+                    'createdAt:.created_at,updatedAt:.updated_at,'
+                    'isPullRequest:has("pull_request")}'
                 ),
             ]
         )
-        return tuple(self._board_issue(value) for value in self._json_lines(raw, "board issue"))
+        return self._json_lines(raw, "board issue")
+
+    def list_open_board_issues(self) -> tuple[board.Issue, ...]:
+        values = self._fetch_pages(self._open_issue_page, per_page=COMMENTS_PER_PAGE)
+        return tuple(
+            self._board_issue(value)
+            for value in values
+            if not (isinstance(value, dict) and value.get("isPullRequest"))
+        )
 
     def list_open_board_pull_requests(self) -> tuple[board.PullRequest, ...]:
         raw = self._run(
@@ -397,9 +450,7 @@ class GitHubIssueComments:
             for value in self._json_lines(raw, "open board pull request")
         )
 
-    def list_recent_merged_board_pull_requests(
-        self, since: datetime
-    ) -> tuple[board.PullRequest, ...]:
+    def _merged_pull_requests_for_day(self, day: date) -> tuple[board.PullRequest, ...]:
         raw = self._run(
             [
                 "pr",
@@ -409,7 +460,7 @@ class GitHubIssueComments:
                 "--state",
                 "merged",
                 "--search",
-                f"merged:>={since.date().isoformat()}",
+                f"merged:{day.isoformat()}",
                 "--limit",
                 str(MAX_RECENT_MERGED_PULL_REQUESTS),
                 "--json",
@@ -418,29 +469,39 @@ class GitHubIssueComments:
                 ".[]",
             ]
         )
-        cutoff = since.astimezone(timezone.utc)
-        pull_requests = tuple(
+        return tuple(
             self._board_pull_request(value)
             for value in self._json_lines(raw, "merged board pull request")
         )
-        if len(pull_requests) >= MAX_RECENT_MERGED_PULL_REQUESTS:
-            # `build_board`'s durable floor (the oldest open issue's creation)
-            # can ask for a wide "since" on a long-lived, busy repository; a
-            # full result page here means GitHub may hold more merged pull
-            # requests than this call fetched, so an older landing could be
-            # silently missing from a derived stage. Matches the existing
-            # ledger-rollover-approaching warning above: say so on stderr
-            # rather than compute board/next from a history we know may be
-            # incomplete without telling anyone.
+
+    def list_recent_merged_board_pull_requests(
+        self, since: datetime
+    ) -> tuple[board.PullRequest, ...]:
+        cutoff = since.astimezone(timezone.utc)
+        days = _query_days(cutoff.date(), datetime.now(timezone.utc).date())
+        with ThreadPoolExecutor(max_workers=min(len(days), PARALLEL_FETCH_CONCURRENCY)) as pool:
+            shards = list(pool.map(self._merged_pull_requests_for_day, days))
+        # GitHub's search date qualifier is an exact UTC day, so slicing the
+        # window this way turns one query that walks `since` to today through
+        # GraphQL cursor pagination (measured ~4-9s for a three-week, ~630-PR
+        # window) into independent single-page requests fetched in parallel
+        # (~1-2s for the same window). A day whose own shard fills its limit
+        # is now the only way a merged pull request can go missing (the old
+        # single query's cap instead truncated the *whole* window), so that is
+        # what the residual warning below watches for.
+        saturated_days = tuple(
+            day for day, shard in zip(days, shards) if len(shard) >= MAX_RECENT_MERGED_PULL_REQUESTS
+        )
+        if saturated_days:
             print(
                 "WARNING: merged pull request history is capped at "
-                f"{MAX_RECENT_MERGED_PULL_REQUESTS} results since "
-                f"{since.date().isoformat()}; an older landing could be "
-                "missing from a board/next stage",
+                f"{MAX_RECENT_MERGED_PULL_REQUESTS} results for "
+                f"{', '.join(day.isoformat() for day in saturated_days)}; "
+                "an older landing that day could be missing from a board/next stage",
                 file=sys.stderr,
             )
         recent: list[board.PullRequest] = []
-        for pull_request in pull_requests:
+        for pull_request in (pr for shard in shards for pr in shard):
             if pull_request.merged_at is None:
                 continue
             try:
