@@ -6,7 +6,9 @@ import argparse
 import json
 import sys
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
 
 from . import __version__, board, checkout, discovery, github, protocol
@@ -585,6 +587,7 @@ def _claim_json(
     versioned_files_total: int,
     share: float,
     touches: tuple[protocol.ActiveClaim, ...],
+    checks: tuple[SliceCheck, ...],
 ) -> int:
     print(
         json.dumps(
@@ -602,6 +605,7 @@ def _claim_json(
                 "versioned_files_total": versioned_files_total,
                 "share": share,
                 "touches": [_touch_json(claim) for claim in touches],
+                "checks": [check.as_json() for check in checks],
             }
         )
     )
@@ -649,10 +653,13 @@ def _merged_pull_request_floor(issues: tuple[board.Issue, ...], now: datetime) -
 def _board(
     client: github.GitHubIssueComments,
     claims: tuple[protocol.ActiveClaim, ...],
+    *,
+    issues: tuple[board.Issue, ...] | None = None,
 ) -> board.Board:
     now = datetime.now(timezone.utc)
     toplevel = Path(checkout._git_output(["rev-parse", "--show-toplevel"]))
-    issues = client.list_open_board_issues()
+    if issues is None:
+        issues = client.list_open_board_issues()
     since = _merged_pull_request_floor(issues, now)
     return board.build_board(
         issues,
@@ -724,19 +731,221 @@ def _unworkable(projected: board.Board) -> tuple[board.BoardItem, ...]:
     return tuple(item for item in projected.items if not item.actionable)
 
 
-def _out_of_order_warning(
-    projected: board.Board, issue: int | None
-) -> str | None:
+class ReferenceState(StrEnum):
+    """A referenced issue's state, as seen from this repository."""
+
+    OPEN = "open"
+    CLOSED = "closed"
+    MISSING = "missing"
+
+
+@dataclass(frozen=True)
+class _IssueReference:
+    state: ReferenceState
+    title: str | None = None
+    body: str | None = None
+
+
+@dataclass(frozen=True)
+class SliceCheck:
+    """One slice-rule finding — the `check` table `#79` rules.
+
+    `slice`/`issue` carry whichever numbers the message names, so a `--json`
+    caller can act on the finding without re-parsing `text`; either is
+    `None` when the check has nothing of that kind to name.
+    """
+
+    level: str
+    check: str
+    text: str
+    slice: int | None = None
+    issue: int | None = None
+
+    def render(self) -> str:
+        prefix = "ERROR" if self.level == "error" else "WARNING"
+        return f"{prefix}: {self.text}"
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "level": self.level,
+            "check": self.check,
+            "text": self.text,
+            "slice": self.slice,
+            "issue": self.issue,
+        }
+
+
+def _fetch_issue_reference(repository: str, number: int) -> _IssueReference:
+    """The live state, title, and body of issue `number` in `repository`.
+
+    Called only for a claim target or a slice-table `#n` link that the
+    already-fetched open board didn't resolve as OPEN — a closed or missing
+    issue never appears in `list_open_board_issues`, so those two states
+    need their own targeted lookup; this is that lookup, kept to one issue
+    at a time rather than a repository-wide query.
+    """
+    try:
+        raw = _bounded_command(
+            ["gh", "api", f"repos/{repository}/issues/{number}", "--jq", "{state,title,body}"],
+            purpose="claim reference lookup",
+        )
+    except protocol.ClaimError as error:
+        # `gh api` reports a nonexistent issue as an HTTP 404 in its combined
+        # stdout/stderr text; `_bounded_command` doesn't expose the process's
+        # real exit status, so this substring is the only signal available
+        # to tell a missing issue apart from every other adapter failure.
+        if "HTTP 404" in str(error):
+            return _IssueReference(ReferenceState.MISSING)
+        raise
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise protocol.ClaimError("GitHub returned a malformed issue reference") from error
+    state = value.get("state") if isinstance(value, dict) else None
+    title = value.get("title") if isinstance(value, dict) else None
+    body = value.get("body") if isinstance(value, dict) else None
+    if (
+        state not in {"open", "closed"}
+        or not isinstance(title, str)
+        or (body is not None and not isinstance(body, str))
+    ):
+        raise protocol.ClaimError("GitHub returned a malformed issue reference")
+    return _IssueReference(
+        ReferenceState.OPEN if state == "open" else ReferenceState.CLOSED,
+        title,
+        body or "",
+    )
+
+
+def _issue_reference_state(
+    repository: str, open_by_number: dict[int, board.Issue], number: int
+) -> tuple[ReferenceState, str | None, str | None]:
+    open_issue = open_by_number.get(number)
+    if open_issue is not None:
+        return ReferenceState.OPEN, open_issue.title, open_issue.body
+    reference = _fetch_issue_reference(repository, number)
+    return reference.state, reference.title, reference.body
+
+
+def _out_of_order_check(projected: board.Board, issue: int | None) -> SliceCheck | None:
     highest = board.highest_scored_actionable(projected)
     if highest is None or issue is None:
         return None
     claimed_item = next((item for item in projected.items if item.number == issue), None)
     if claimed_item is None or board.board_rank(highest) >= board.board_rank(claimed_item):
         return None
-    return (
-        f"WARNING: higher-priority actionable item #{highest.number} "
-        f"(score {highest.score}) is free: {highest.title}"
+    return SliceCheck(
+        "warning",
+        "out-of-order",
+        f"higher-priority actionable item #{highest.number} "
+        f"(score {highest.score}) is free: {highest.title}",
+        issue=highest.number,
     )
+
+
+def _slice_row_checks(
+    repository: str, open_by_number: dict[int, board.Issue], row: board.SliceTableRow
+) -> tuple[SliceCheck, ...]:
+    if row.item_issue is not None:
+        state, _title, _body = _issue_reference_state(repository, open_by_number, row.item_issue)
+        if state is ReferenceState.CLOSED:
+            return (
+                SliceCheck(
+                    "error",
+                    "landed-slice-in-table",
+                    f"slice {row.index} links closed #{row.item_issue}; "
+                    "a landed slice leaves the table",
+                    slice=row.index,
+                    issue=row.item_issue,
+                ),
+            )
+        if state is ReferenceState.MISSING:
+            return (
+                SliceCheck(
+                    "error",
+                    "missing-slice-item",
+                    f"slice {row.index} links #{row.item_issue}, which does not exist here",
+                    slice=row.index,
+                    issue=row.item_issue,
+                ),
+            )
+        return ()
+    if row.item_cell == board.UNDISPATCHED_SLICE_CELL:
+        return (
+            SliceCheck(
+                "warning",
+                "undispatched-slice",
+                f'slice {row.index} "{row.name}" is not dispatched; '
+                "make it an item before building it",
+                slice=row.index,
+            ),
+        )
+    return (
+        SliceCheck(
+            "error",
+            "malformed-slice-cell",
+            f'slice {row.index} item cell "{row.item_cell}" is neither — nor #n',
+            slice=row.index,
+        ),
+    )
+
+
+def _parent_line_checks(title: str, body: str) -> tuple[SliceCheck, ...]:
+    match = board.slice_title_match(title)
+    if match is None:
+        return ()
+    slice_number, parent_issue = match
+    if parent_issue in board.parent_line_numbers(body):
+        return ()
+    return (
+        SliceCheck(
+            "warning",
+            "missing-parent-line",
+            f"looks like slice {slice_number} of #{parent_issue} but carries no "
+            f'"Part of #{parent_issue}" line; the parent inherits nothing',
+            slice=slice_number,
+            issue=parent_issue,
+        ),
+    )
+
+
+def _slice_rule_checks(
+    repository: str,
+    open_by_number: dict[int, board.Issue],
+    issue: int,
+    projected: board.Board,
+) -> tuple[SliceCheck, ...]:
+    checks: list[SliceCheck] = []
+    out_of_order = _out_of_order_check(projected, issue)
+    if out_of_order is not None:
+        checks.append(out_of_order)
+    state, title, body = _issue_reference_state(repository, open_by_number, issue)
+    if state is ReferenceState.CLOSED:
+        checks.append(
+            SliceCheck("error", "closed-issue", f"issue #{issue} is closed", issue=issue)
+        )
+    elif state is ReferenceState.MISSING:
+        checks.append(
+            SliceCheck(
+                "error", "missing-issue", f"issue #{issue} does not exist here", issue=issue
+            )
+        )
+    if body is not None:
+        for row in board.parse_slice_table(body):
+            checks.extend(_slice_row_checks(repository, open_by_number, row))
+    if title is not None and body is not None:
+        checks.extend(_parent_line_checks(title, body))
+    return tuple(checks)
+
+
+def _refuse_claim(json_mode: bool, issue: int | None, checks: tuple[SliceCheck, ...]) -> int:
+    if json_mode:
+        payload = {"refused": True, "issue": issue, "checks": [c.as_json() for c in checks]}
+        print(json.dumps(payload))
+        return 2
+    for check in checks:
+        print(check.render(), file=sys.stderr)
+    return 2
 
 
 MUTATING_HOOK_TOOLS = frozenset({"Edit", "MultiEdit", "Write", "search_replace", "write"})
@@ -863,7 +1072,8 @@ def main(arguments: list[str] | None = None) -> int:
                         "release without --claim-id requires a non-empty current branch; "
                         "pass --claim-id"
                     )
-        client = github.GitHubIssueComments(checkout._repository(parsed.repo))
+        repository = checkout._repository(parsed.repo)
+        client = github.GitHubIssueComments(repository)
         if parsed.command == "bootstrap":
             ledger = discovery.bootstrap_ledger(client)
             protocol.configure_ledger(ledger)
@@ -966,13 +1176,20 @@ def main(arguments: list[str] | None = None) -> int:
             n, total, share = _reject_oversized_scope(
                 requested.scope, requested.allow_directory_reason, versioned
             )
-            warning = None
+            checks: tuple[SliceCheck, ...] = ()
+            target_issue: int | None = None
             if isinstance(requested.identity, protocol.IssueIdentity):
-                warning = _out_of_order_warning(
-                    _board(client, protocol._ledger_claims(client)), requested.identity.issue
+                target_issue = requested.identity.issue
+                open_issues = client.list_open_board_issues()
+                open_by_number = {issue.number: issue for issue in open_issues}
+                projected = _board(
+                    client, protocol._ledger_claims(client), issues=open_issues
                 )
-            if warning is not None:
-                print(warning, file=sys.stderr if parsed.json else sys.stdout)
+                checks = _slice_rule_checks(repository, open_by_number, target_issue, projected)
+            if any(check.level == "error" for check in checks):
+                return _refuse_claim(parsed.json, target_issue, checks)
+            for check in checks:
+                print(check.render(), file=sys.stderr if parsed.json else sys.stdout)
             claimed = protocol.acquire_claim(client, requested)
             touches = protocol.conflicting_claims(protocol._ledger_claims(client), claimed)
             if parsed.json:
@@ -982,6 +1199,7 @@ def main(arguments: list[str] | None = None) -> int:
                     versioned_files_total=total,
                     share=share,
                     touches=touches,
+                    checks=checks,
                 )
             print(f"CLAIMED {_claim_subject(claimed)}: {claimed.claim_id} {claimed.comment.url}")
             print(_claim_cost_line(n, total, touches))
