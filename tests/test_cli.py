@@ -1766,6 +1766,29 @@ def test_a_reference_line_inside_a_fenced_code_block_confers_no_stage() -> None:
     assert projected.items[0].stage is board.Stage.TEXT_ONLY
 
 
+def test_a_fenced_closing_keyword_confers_no_stage() -> None:
+    """The closing-keyword path (`_associated_issues`) must read the body the
+    same way `_touched_without_closing` already does: a fenced example of the
+    `Fixes #N` convention documents the syntax, it does not close #65.
+    """
+    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    issue = board_issue(
+        65, "Issue documented, never actually closed", complete_contract("Cut the next slice.")
+    )
+    fenced_pull_request = board.PullRequest(
+        125,
+        "Documents the closing-keyword syntax",
+        "Example of the convention:\n\n```\nFixes #65.\n```\n\nNot itself a closing PR.",
+        "branch",
+    )
+
+    projected = board.build_board(
+        (issue,), (), (fenced_pull_request,), (), board.BoardConfig(), now=now
+    )
+
+    assert projected.items[0].stage is board.Stage.TEXT_ONLY
+
+
 def test_board_queries_merged_pull_requests_back_to_the_oldest_open_issue(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3964,6 +3987,58 @@ def test_github_comment_body_uses_stdin_instead_of_process_argument(
     assert body not in arguments
     assert arguments[-2:] == ["--body-file", "-"]
     assert observed["input"] == body.encode()
+
+
+def test_merged_pull_request_history_warns_when_it_reaches_the_result_cap(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A full result page from GitHub means more merged pull requests could
+    exist beyond the cap; `build_board`'s durable floor (the oldest open
+    issue's creation) can legitimately ask this far back on a busy repository,
+    so the board must say the history may be incomplete rather than silently
+    compute stages from a truncated query.
+    """
+    since = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    saturated_rows = [
+        {
+            "number": index,
+            "title": f"Fixes #{index}",
+            "body": "",
+            "headRefName": f"codex/issue-{index}",
+            "mergedAt": "2026-08-20T00:00:00Z",
+        }
+        for index in range(1, github.MAX_RECENT_MERGED_PULL_REQUESTS + 1)
+    ]
+    client = GitHubIssueComments("example/agent-claim")
+    monkeypatch.setattr(
+        client, "_run", lambda arguments: "\n".join(json.dumps(row) for row in saturated_rows)
+    )
+
+    pull_requests = client.list_recent_merged_board_pull_requests(since)
+
+    assert len(pull_requests) == github.MAX_RECENT_MERGED_PULL_REQUESTS
+    error = capsys.readouterr().err
+    assert "WARNING" in error
+    assert str(github.MAX_RECENT_MERGED_PULL_REQUESTS) in error
+
+
+def test_merged_pull_request_history_below_the_cap_warns_of_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    since = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    row = {
+        "number": 1,
+        "title": "Fixes #1",
+        "body": "",
+        "headRefName": "codex/issue-1",
+        "mergedAt": "2026-08-20T00:00:00Z",
+    }
+    client = GitHubIssueComments("example/agent-claim")
+    monkeypatch.setattr(client, "_run", lambda arguments: json.dumps(row))
+
+    client.list_recent_merged_board_pull_requests(since)
+
+    assert capsys.readouterr().err == ""
 
 
 def test_github_projection_update_patches_one_comment_and_deletes_duplicates(

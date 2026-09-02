@@ -462,13 +462,20 @@ def _priority_bucket(
 
 
 def _associated_issues(pull_requests: tuple[PullRequest, ...]) -> frozenset[int]:
+    """Issues a pull request closes, read the way GitHub renders it.
+
+    Routed through `_live_text` for the same reason every other marker in
+    this module is: a fenced example of the closing-keyword convention
+    ("Fixes #64" inside a code block, say) must document the syntax without
+    silently closing #64.
+    """
     return frozenset(
         reference
         for pull_request in pull_requests
         for reference in (
             int(number)
             for number in CLOSING_REFERENCE_PATTERN.findall(
-                f"{pull_request.title}\n{pull_request.body}"
+                _live_text(f"{pull_request.title}\n{pull_request.body}")
             )
         )
     )
