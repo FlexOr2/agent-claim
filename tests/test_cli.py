@@ -8673,6 +8673,256 @@ def test_proposed_expectations_have_neither_fresh_nor_old() -> None:
     assert projected.items[0].ruling_old is None
 
 
+def test_a_ruled_heading_rules_a_block_of_prose_lines() -> None:
+    """Issue #78: the heading carries the ruling, so prose lines below it are fine."""
+    issue = board_issue(
+        10,
+        "Ruled by heading",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "Rueckspiegel: so habe ich dich verstanden, in eigenen Worten.",
+            "1. **Ein Arbeitspunkt entsteht sichtbar.** *(geregelt: ja)*",
+            "   Wenn du das Projekt anbindest, erscheint der Punkt in der Warteschlange.",
+            "   Sagst du nein, bleibt er unsichtbar.",
+            heading="Erwartungen (refine-Lauf 27.08.2026 — GEREGELT: Operator 27.08.2026)",
+        ),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.RULED
+
+
+def test_a_proposal_marker_under_a_ruled_heading_still_surfaces_as_proposed() -> None:
+    """Issue #78: an explicit still-open line contradicts its ruled heading and wins.
+
+    A ruled heading over a line explicitly marked as a proposal is a
+    contradiction to surface, not to swallow — the same silence-never-rules
+    guarantee from #62 applies to an explicit contradiction, not only to an
+    unmarked line.
+    """
+    issue = board_issue(
+        10,
+        "Contradicts its heading",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "Rueckspiegel: so habe ich dich verstanden, in eigenen Worten.",
+            "1. **Etwas Geregeltes.** *(geregelt: ja)*",
+            "2. **Etwas noch Offenes.** *(Default: later)*",
+            heading="Erwartungen (refine-Lauf 27.08.2026 — GEREGELT: Operator 27.08.2026)",
+        ),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
+
+
+def test_prose_without_a_ruled_heading_still_reads_as_proposed() -> None:
+    """Negative guard for #78: without the heading marker, #62's per-line rule still stands."""
+    issue = board_issue(
+        10,
+        "Unruled prose",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "Rueckspiegel: so habe ich dich verstanden, in eigenen Worten.",
+            "1. **Ein Arbeitspunkt entsteht sichtbar.** *(geregelt: ja)*",
+            "   Wenn du das Projekt anbindest, erscheint der Punkt in der Warteschlange.",
+            heading="Erwartungen (refine-Lauf 27.08.2026)",
+        ),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
+
+
+def test_one_unruled_block_among_ruled_ones_keeps_the_item_proposed() -> None:
+    """Issue #78: the code only ever read the first expectation heading; a body with
+    several `## Erwartungen…` blocks must reflect every one of them, not just the first.
+    """
+    issue = board_issue(
+        10,
+        "Three expectation blocks",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "- Name it. *(geregelt: ja)*",
+            heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
+        )
+        + "\n\n"
+        + expectation_block(
+            "- Name it. *(geregelt: ja)*",
+            heading="Erwartungen des Pulls (GEREGELT: Operator 31.08.2026)",
+        )
+        + "\n\n"
+        + expectation_block(
+            "- Name it without a ruling.",
+            heading="Erwartungen aus echter Benutzung",
+        )
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
+
+
+def test_a_new_line_without_its_own_marker_stays_proposed_under_a_ruled_heading() -> None:
+    """Codex review of #78 (finding 1): a ruled heading only excuses prose, tables,
+    examples and sub-headings — not a list item shaped like an expectation
+    line (RULED_EXPECTATION_PATTERN/PROPOSED_EXPECTATION_PATTERN are both
+    written against that shape) that was added later without carrying its
+    own ruled marker. That is silence wearing the heading's ruling, which
+    #62 excludes.
+    """
+    issue = board_issue(
+        10,
+        "New line under an old ruling",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "- Name it. *(geregelt: ja)*",
+            "- Some new expectation added after the ruling.",
+            heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
+        ),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
+
+
+def test_prose_and_a_table_row_stay_ruled_under_a_ruled_heading() -> None:
+    """Positive control for finding 1: only expectation-shaped lines need their own marker."""
+    issue = board_issue(
+        10,
+        "Prose and a table row under a ruling",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "- Name it. *(geregelt: ja)*",
+            "Beispiel: so sieht die Anwendung im Alltag aus.",
+            "| Spalte A | Spalte B |",
+            "| -------- | -------- |",
+            "| Wert 1   | Wert 2   |",
+            heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
+        ),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.RULED
+
+
+def test_a_ruled_heading_with_no_lines_beneath_it_reads_as_proposed() -> None:
+    """Codex review of #78 (finding 3): a ruling over nothing is not a ruling."""
+    issue = board_issue(
+        10,
+        "Ruled heading, empty block",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(heading="Erwartungen (GEREGELT: Operator 27.08.2026)"),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
+
+
+def test_a_hyphenated_ja_nein_contradiction_is_not_ruled() -> None:
+    """Codex review of #78 (RULED_EXPECTATION_PATTERN boundary): a hyphen glues two
+
+    contradicting words together (`ja-nein`) rather than separating a
+    keyword from its justification; the pattern's trailing-text boundary
+    excludes it on purpose.
+    """
+    issue = board_issue(
+        10,
+        "Hyphenated contradiction after ja",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "- Name it. *(geregelt: ja-nein)*",
+            heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
+        ),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
+
+
+def test_a_hyphenated_nein_ja_contradiction_is_not_ruled() -> None:
+    """Codex review of #78 (RULED_EXPECTATION_PATTERN boundary): the same hyphen guard
+
+    applies symmetrically to `NEIN-ja`.
+    """
+    issue = board_issue(
+        10,
+        "Hyphenated contradiction after NEIN",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "- Remove it. *(geregelt: NEIN-ja)*",
+            heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
+        ),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
+
+
+def test_ja_with_an_owner_reference_still_rules() -> None:
+    """Positive control: the real #79 convention (`ja — Owner ist #567`) still rules."""
+    issue = board_issue(
+        10,
+        "Ja with an owner reference",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "- Name it. *(geregelt: ja — Owner ist #567)*",
+            heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
+        ),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.RULED
+
+
+def test_nein_with_a_reason_still_rules() -> None:
+    """Positive control: the established `NEIN, weil …` convention still rules."""
+    issue = board_issue(
+        10,
+        "NEIN with a reason",
+        complete_contract("Claim #10.")
+        + "\n\n"
+        + expectation_block(
+            "- Remove it. *(geregelt: NEIN, weil es woanders geregelt ist)*",
+            heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
+        ),
+    )
+    projected = board.build_board(
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+    )
+
+    assert projected.items[0].expectation_state is board.ExpectationState.RULED
+
+
 def test_a_ruling_is_old_after_ten_trunk_landings() -> None:
     issue = board_issue(
         10,
