@@ -218,40 +218,49 @@ class GitHubIssueComments:
         )
 
     def list_protocol_candidates(self, issue: int) -> tuple[IssueComment, ...]:
+        raw = self._run(
+            [
+                "api",
+                "--paginate",
+                f"repos/{self.repository}/issues/{issue}/comments?per_page={COMMENTS_PER_PAGE}",
+                "--jq",
+                ".[] | {id,created_at,updated_at,body,author_association,html_url}",
+            ]
+        )
+        all_comments = tuple(
+            self._parse_comment(value) for value in self._json_lines(raw, "issue-comment")
+        )
+        total_comments = len(all_comments)
+        # `--paginate` fetches every page in one `gh` invocation, so this can no
+        # longer stop mid-fetch at a page-count ceiling the way a per-page loop
+        # could; a total-comment ceiling is the equivalent safety net.
+        if total_comments > MAX_LEDGER_PAGES * COMMENTS_PER_PAGE:
+            raise ClaimError(
+                "claim ledger page limit reached; perform the documented ledger rollover"
+            )
+        if (
+            total_comments >= LEDGER_ROLLOVER_WARNING_PAGES * COMMENTS_PER_PAGE
+            and not self._rollover_warning_printed
+        ):
+            print(
+                f"WARNING: claim ledger has {total_comments} comments; "
+                "schedule the documented rollover",
+                file=sys.stderr,
+            )
+            self._rollover_warning_printed = True
         comments: list[IssueComment] = []
         protocol_bytes = 0
-        total_comments = 0
-        for page in range(1, MAX_LEDGER_PAGES + 1):
-            page_comments = self._comment_page(issue, page)
-            total_comments += len(page_comments)
-            for parsed in page_comments:
-                if not is_protocol_candidate(parsed):
-                    continue
-                protocol_bytes += len(parsed.body.encode("utf-8"))
-                if (
-                    len(comments) >= MAX_PROTOCOL_EVENTS
-                    or protocol_bytes > MAX_PROTOCOL_BYTES
-                ):
-                    raise ClaimError(
-                        "claim ledger protocol limit reached; perform the "
-                        "documented ledger rollover"
-                    )
-                comments.append(parsed)
-            if len(page_comments) < COMMENTS_PER_PAGE:
-                if (
-                    page >= LEDGER_ROLLOVER_WARNING_PAGES
-                    and not self._rollover_warning_printed
-                ):
-                    print(
-                        f"WARNING: claim ledger has {total_comments} comments; "
-                        "schedule the documented rollover",
-                        file=sys.stderr,
-                    )
-                    self._rollover_warning_printed = True
-                return tuple(comments)
-        raise ClaimError(
-            "claim ledger page limit reached; perform the documented ledger rollover"
-        )
+        for parsed in all_comments:
+            if not is_protocol_candidate(parsed):
+                continue
+            protocol_bytes += len(parsed.body.encode("utf-8"))
+            if len(comments) >= MAX_PROTOCOL_EVENTS or protocol_bytes > MAX_PROTOCOL_BYTES:
+                raise ClaimError(
+                    "claim ledger protocol limit reached; perform the "
+                    "documented ledger rollover"
+                )
+            comments.append(parsed)
+        return tuple(comments)
 
     def _projection_comments(self, issue: int) -> tuple[IssueComment, ...]:
         projections: list[IssueComment] = []

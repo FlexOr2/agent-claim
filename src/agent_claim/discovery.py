@@ -89,11 +89,12 @@ def _trusted_ledger_issue(issue: _LedgerIssue) -> bool:
     return issue.author_association in TRUSTED_ASSOCIATIONS
 
 
-def discover_ledger(client: GitHubIssueComments) -> int | None:
-    """Find the single open, locked protocol ledger without changing GitHub state."""
+def _select_ledger(rows: tuple[_LedgerIssue, ...]) -> int | None:
+    """Resolve the canonical ledger from an issue-row snapshot, or raise on
+    a locked-marker violation or a competing foreign coordination contract."""
     ledgers: list[int] = []
     foreign: list[int] = []
-    for issue in _ledger_issue_rows(client):
+    for issue in rows:
         if issue.is_pull_request:
             continue
         if not _trusted_ledger_issue(issue):
@@ -111,6 +112,45 @@ def discover_ledger(client: GitHubIssueComments) -> int | None:
             f"another coordination contract exists on issue(s) {foreign}; refusing to compete"
         )
     return min(ledgers) if ledgers else None
+
+
+def _open_issue_count(client: GitHubIssueComments) -> int:
+    """The repository's live open-issue-and-pull-request count, from the
+    single-request repository resource rather than a paginated listing."""
+    raw = client._run(["api", f"repos/{client.repository}", "--jq", ".open_issues_count"])
+    try:
+        count = int(raw)
+    except ValueError as error:
+        raise ClaimError("GitHub returned a malformed open-issue count") from error
+    if count < 0:
+        raise ClaimError("GitHub returned a malformed open-issue count")
+    return count
+
+
+def discover_ledger(client: GitHubIssueComments) -> int | None:
+    """Find the single open, locked protocol ledger without changing GitHub state.
+
+    A closed issue never carries ledger authority (`_select_ledger` skips it
+    either way), so a snapshot of only the open issues is a complete answer
+    whenever it finds a candidate — usually a single, atomic page, unlike a
+    full-history scan of every issue ever filed. Only when that snapshot
+    finds nothing does discovery pay for one more request, the repository's
+    live open-issue count: a mismatch means an issue opened or closed while
+    the snapshot was mid-fetch, so the snapshot cannot be trusted to have
+    seen everything, and this must fail loud rather than report "no ledger"
+    — reporting that wrongly invites `bootstrap`, which would create a
+    second, competing ledger next to one that still exists.
+    """
+    rows = _ledger_issue_rows(client, state="open")
+    ledger = _select_ledger(rows)
+    if ledger is not None:
+        return ledger
+    if len(rows) != _open_issue_count(client):
+        raise ClaimError(
+            "ledger discovery fetch was incomplete (the open-issue count changed "
+            "mid-fetch); retry rather than bootstrap"
+        )
+    return None
 
 
 def _ensure_ledger_labels(client: GitHubIssueComments, ledger: int) -> None:

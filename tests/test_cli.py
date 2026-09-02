@@ -77,10 +77,18 @@ def ledger_row(
 
 
 def ledger_client(
-    monkeypatch: pytest.MonkeyPatch, rows: list[dict[str, object]]
+    monkeypatch: pytest.MonkeyPatch,
+    rows: list[dict[str, object]],
+    *,
+    open_issue_count: int | None = None,
 ) -> tuple[GitHubIssueComments, list[list[str]]]:
+    """`open_issue_count` defaults to the open rows actually served, i.e. a
+    fetch discovery can trust; pass a different number to simulate an issue
+    opening or closing while a snapshot was mid-fetch."""
     client = GitHubIssueComments("example/agent-claim")
     observed: list[list[str]] = []
+    open_rows = [row for row in rows if row["state"] == "open"]
+    trustworthy_count = len(open_rows) if open_issue_count is None else open_issue_count
 
     def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
         observed.append(arguments)
@@ -88,7 +96,9 @@ def ledger_client(
         if arguments[:3] == ["api", "--paginate", f"{issue_path}?state=all&per_page=100"]:
             return "\n".join(json.dumps(row) for row in rows)
         if arguments[:3] == ["api", "--paginate", f"{issue_path}?state=open&per_page=100"]:
-            return "\n".join(json.dumps(row) for row in rows if row["state"] == "open")
+            return "\n".join(json.dumps(row) for row in open_rows)
+        if arguments == ["api", f"repos/{client.repository}", "--jq", ".open_issues_count"]:
+            return str(trustworthy_count)
         return ""
 
     monkeypatch.setattr(client, "_run", run)
@@ -182,6 +192,60 @@ def test_bootstrap_ignores_an_untrusted_unlocked_marker(
     assert issue_claim.discover_ledger(client) == 2
     assert issue_claim.bootstrap_ledger(client) == 2
     assert not any(arguments[-1].endswith("/issues/1/lock") for arguments in observed)
+
+
+def test_discovery_finds_the_ledger_from_open_issues_without_full_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A repository with a huge closed-issue history must not pay for it:
+    discovery must resolve straight from the open-issue snapshot and never
+    fall back to the full `state=all` scan."""
+    rows = [
+        ledger_row(2),
+        *(ledger_row(number, state="closed") for number in range(100, 120)),
+    ]
+    client, observed = ledger_client(monkeypatch, rows)
+
+    assert issue_claim.discover_ledger(client) == 2
+    assert not any(
+        "state=all" in argument for arguments in observed for argument in arguments
+    )
+
+
+def test_discovery_reports_a_genuine_absence_when_the_open_count_is_stable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _ = ledger_client(monkeypatch, [])
+
+    assert issue_claim.discover_ledger(client) is None
+
+
+def test_discovery_refuses_to_report_absence_after_an_inconsistent_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Zero markers in a snapshot whose issue count already moved on is not
+    proof of absence; it must fail loud instead of inviting `bootstrap`,
+    which would create a second, competing ledger."""
+    client, _ = ledger_client(monkeypatch, [], open_issue_count=1)
+
+    with pytest.raises(ClaimError, match="incomplete") as excinfo:
+        issue_claim.discover_ledger(client)
+    assert "run agent-claim bootstrap" not in str(excinfo.value)
+
+
+def test_discovery_fetch_failure_propagates_loudly_without_bootstrap_advice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GitHubIssueComments("example/agent-claim")
+
+    def failing_run(arguments: list[str], *, input_data: bytes | None = None) -> str:
+        raise ClaimError("GitHub issue coordination failed with exit 1")
+
+    monkeypatch.setattr(client, "_run", failing_run)
+
+    with pytest.raises(ClaimError) as excinfo:
+        issue_claim.discover_ledger(client)
+    assert "bootstrap" not in str(excinfo.value)
 
 
 def comment(
@@ -3838,18 +3902,25 @@ def test_github_comment_reader_accepts_paginated_json_lines(
     }
     client = GitHubIssueComments("example/agent-claim")
     monkeypatch.setattr(github, "COMMENTS_PER_PAGE", 2)
+    calls: list[list[str]] = []
 
-    def page(arguments: list[str]) -> str:
-        endpoint = arguments[1]
-        rows = ordinary_rows if "page=1" in endpoint else [protocol_row]
-        return "\n".join(map(json.dumps, rows))
+    def paginate(arguments: list[str]) -> str:
+        calls.append(arguments)
+        # A real `gh api --paginate` invocation concatenates every page's
+        # `--jq`-filtered output into one stdout stream from a single
+        # subprocess; the fake mirrors that instead of branching per page.
+        all_rows = [*ordinary_rows, protocol_row]
+        return "\n".join(map(json.dumps, all_rows))
 
-    monkeypatch.setattr(client, "_run", page)
+    monkeypatch.setattr(client, "_run", paginate)
 
     observed = client.list_protocol_candidates(71)
 
     assert [entry.identifier for entry in observed] == [12]
     assert observed[0].body == protocol_row["body"]
+    assert len(calls) == 1
+    assert "--paginate" in calls[0]
+    assert not any("&page=" in argument for argument in calls[0])
 
 
 def _comment_row(identifier: int, body: str = "ordinary prose") -> dict[str, object]:
