@@ -1471,6 +1471,77 @@ def test_claim_refuses_a_slice_table_header_with_extra_columns(
     assert client.comments[LEDGER_ISSUE] == []
 
 
+def test_claim_refuses_an_english_slice_header_as_malformed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """`# | Slice | Item | Hängt ab von` is a clear near-miss of the German
+    `Scheibe` header — it must fail loud, not silently read as ordinary
+    prose (delta review of fcf12b51, board.py:491)."""
+    header_line = "| # | Slice | Item | Hängt ab von |"
+    body = f"{header_line}\n|---|---|---|---|\n| 1 | First slice | — | — |\n"
+    target = board_issue(72, "Epic", body)
+    client = _configured_board_client(monkeypatch, tmp_path, open_issues=(target,))
+    monkeypatch.setattr(
+        issue_claim, "_request", lambda _arguments: request(issue=72, scope=("src/work.py",))
+    )
+
+    exit_code = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Codex Sol",
+            "--scope",
+            "src/work.py",
+        ]
+    )
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f'ERROR: malformed slice table header: "{header_line}"' in captured.err
+    assert client.comments[LEDGER_ISSUE] == []
+
+
+def test_claim_ignores_an_ordinary_hash_led_table_that_is_not_a_slice_table(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """A `#`-first header that names none of the slice table's real column
+    words is an ordinary table, not a near-miss — it must stay a
+    non-finding (delta review of fcf12b51, board.py:491)."""
+    body = "| # | Name | Value | Notes |\n|---|---|---|---|\n| 1 | Alpha | 10 | ok |\n"
+    target = board_issue(72, "Epic", body)
+    client = _configured_board_client(monkeypatch, tmp_path, open_issues=(target,))
+    monkeypatch.setattr(
+        issue_claim, "_request", lambda _arguments: request(issue=72, scope=("src/work.py",))
+    )
+
+    exit_code = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Codex Sol",
+            "--scope",
+            "src/work.py",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["checks"] == []
+    assert len(client.comments[LEDGER_ISSUE]) == 1
+
+
 def test_claim_refuses_a_slice_table_row_with_the_wrong_shape_and_keeps_scanning(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

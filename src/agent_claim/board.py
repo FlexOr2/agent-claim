@@ -488,13 +488,26 @@ def _slice_table_row(index: str, name: str, item_cell: str) -> SliceTableRow:
     return SliceTableRow(int(index), name, item_cell, int(link.group(1)) if link else None)
 
 
-def _looks_like_slice_table_header(line: str, cells: tuple[str, ...]) -> bool:
+_SLICE_TABLE_HEADER_TRIGGER_WORDS = frozenset({"scheibe", "slice", "item"})
+
+
+def _looks_like_slice_table_header(cells: tuple[str, ...]) -> bool:
     """A loose, deliberately over-eager heuristic: a `#`-first pipe row that
-    names `Scheibe` anywhere is an attempted slice table, whether or not it
-    turns out well-formed. Catching it here — rather than only the exact
-    header shape — is what makes a near-miss header fail loud instead of
-    reading as ordinary prose."""
-    return cells[0].strip() == "#" and "scheibe" in line.lower()
+    also names one of the slice table's real column words — `Scheibe`,
+    `Slice`, `Item`, or a `Hängt ab...` column — is an attempted slice
+    table, whether or not it turns out well-formed. Catching it here —
+    rather than only the exact header shape — is what makes a near-miss
+    header (including the English "Slice" spelling) fail loud instead of
+    reading as ordinary prose. `#` alone never counts: an ordinary table
+    that happens to start with a `#` column stays untouched.
+    """
+    if cells[0].strip() != "#":
+        return False
+    return any(
+        cell.strip().casefold() in _SLICE_TABLE_HEADER_TRIGGER_WORDS
+        or cell.strip().casefold().startswith("hängt ab")
+        for cell in cells[1:]
+    )
 
 
 def parse_slice_table(body: str) -> tuple[SliceTableEntry, ...]:
@@ -515,9 +528,7 @@ def parse_slice_table(body: str) -> tuple[SliceTableEntry, ...]:
     line_index = 0
     while line_index < len(lines):
         header_cells = _table_row_cells(lines[line_index])
-        if header_cells is None or not _looks_like_slice_table_header(
-            lines[line_index], header_cells
-        ):
+        if header_cells is None or not _looks_like_slice_table_header(header_cells):
             line_index += 1
             continue
         well_formed_header = len(header_cells) == len(SLICE_TABLE_HEADER_CELLS) and tuple(
