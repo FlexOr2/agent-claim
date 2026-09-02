@@ -156,6 +156,31 @@ class SliceTableRow:
 
 
 @dataclass(frozen=True)
+class MalformedSliceTable:
+    """A header line that looks like an attempted slice table but isn't one.
+
+    "Looks like" is deliberately loose (starts with `#`, names `Scheibe`
+    somewhere on the line) — the whole point is to catch a header that
+    almost, but not quite, matches `SLICE_TABLE_HEADER_CELLS`, rather than
+    silently treating it as ordinary prose and skipping the checks it was
+    meant to carry.
+    """
+
+    line: str
+
+
+@dataclass(frozen=True)
+class MalformedSliceRow:
+    """A pipe-shaped line inside a recognized slice table that isn't a
+    well-formed row: the wrong column count, or a non-integer `#` cell."""
+
+    line: str
+
+
+SliceTableEntry = SliceTableRow | MalformedSliceTable | MalformedSliceRow
+
+
+@dataclass(frozen=True)
 class BoardConfig:
     priority_labels: tuple[str, ...] = DEFAULT_PRIORITY_LABELS
 
@@ -456,49 +481,69 @@ def _is_slice_table_separator(line: str) -> bool:
     )
 
 
-def _slice_table_row(index: str, name: str, item_cell: str) -> SliceTableRow | None:
-    if _SLICE_TABLE_INDEX_PATTERN.match(index) is None:
-        return None
+def _slice_table_row(index: str, name: str, item_cell: str) -> SliceTableRow:
     if item_cell == UNDISPATCHED_SLICE_CELL:
         return SliceTableRow(int(index), name, item_cell, None)
     link = _SLICE_TABLE_ITEM_LINK_PATTERN.match(item_cell)
     return SliceTableRow(int(index), name, item_cell, int(link.group(1)) if link else None)
 
 
-def parse_slice_table(body: str) -> tuple[SliceTableRow, ...]:
-    """The rows of `body`'s first slice table (`#79`'s grammar), or `()`.
+def _looks_like_slice_table_header(line: str, cells: tuple[str, ...]) -> bool:
+    """A loose, deliberately over-eager heuristic: a `#`-first pipe row that
+    names `Scheibe` anywhere is an attempted slice table, whether or not it
+    turns out well-formed. Catching it here — rather than only the exact
+    header shape — is what makes a near-miss header fail loud instead of
+    reading as ordinary prose."""
+    return cells[0].strip() == "#" and "scheibe" in line.lower()
+
+
+def parse_slice_table(body: str) -> tuple[SliceTableEntry, ...]:
+    """Every slice table entry in `body` (`#79`'s grammar): a well-formed
+    row, or a `MalformedSliceTable`/`MalformedSliceRow` marking a near-miss.
 
     A slice table is a markdown table whose header cells are exactly `#`,
     `Scheibe`, `Item`, `Hängt ab von`, in that order, case- and
-    whitespace-insensitively — the shape atelier-2 #962 carries since
-    02.09. A table with any other header is not a slice table and is
-    ignored, along with every table after the first one found. Reads only
-    `_live_text`, so a fenced example of the grammar never counts.
+    whitespace-insensitively, followed by a separator row — the shape
+    atelier-2 #962 carries since 02.09. Any `#`-first row naming `Scheibe`
+    that doesn't match that shape exactly (wrong columns, no separator) is
+    `MalformedSliceTable` rather than silently ignored prose. Every table in
+    the body is parsed, not just the first. Reads only `_live_text`, so a
+    fenced example of the grammar never counts.
     """
     lines = _live_text(body).splitlines()
+    entries: list[SliceTableEntry] = []
     line_index = 0
     while line_index < len(lines):
         header_cells = _table_row_cells(lines[line_index])
-        line_index += 1
-        if header_cells is None or len(header_cells) != len(SLICE_TABLE_HEADER_CELLS):
+        if header_cells is None or not _looks_like_slice_table_header(
+            lines[line_index], header_cells
+        ):
+            line_index += 1
             continue
-        if tuple(cell.casefold() for cell in header_cells) != SLICE_TABLE_HEADER_CELLS:
+        well_formed_header = len(header_cells) == len(SLICE_TABLE_HEADER_CELLS) and tuple(
+            cell.casefold() for cell in header_cells
+        ) == SLICE_TABLE_HEADER_CELLS
+        has_separator = line_index + 1 < len(lines) and _is_slice_table_separator(
+            lines[line_index + 1]
+        )
+        if not well_formed_header or not has_separator:
+            entries.append(MalformedSliceTable(lines[line_index].strip()))
+            line_index += 1
             continue
-        if line_index >= len(lines) or not _is_slice_table_separator(lines[line_index]):
-            continue
-        line_index += 1
-        rows: list[SliceTableRow] = []
+        line_index += 2
         while line_index < len(lines):
             row_cells = _table_row_cells(lines[line_index])
-            if row_cells is None or len(row_cells) != len(SLICE_TABLE_HEADER_CELLS):
+            if row_cells is None:
                 break
-            row = _slice_table_row(*row_cells[:3])
-            if row is None:
-                break
-            rows.append(row)
+            if len(row_cells) != len(SLICE_TABLE_HEADER_CELLS) or _SLICE_TABLE_INDEX_PATTERN.match(
+                row_cells[0]
+            ) is None:
+                entries.append(MalformedSliceRow(lines[line_index].strip()))
+                line_index += 1
+                continue
+            entries.append(_slice_table_row(*row_cells[:3]))
             line_index += 1
-        return tuple(rows)
-    return ()
+    return tuple(entries)
 
 
 def parent_line_numbers(body: str) -> frozenset[int]:

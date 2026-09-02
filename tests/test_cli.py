@@ -1431,6 +1431,142 @@ def test_claim_checks_each_slice_table_item_cell_by_its_own_rule(
     assert client.comments[LEDGER_ISSUE] == []
 
 
+def test_claim_refuses_a_slice_table_header_with_extra_columns(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """A header that starts with `#` and names `Scheibe` but doesn't have
+    exactly the four required columns must fail loud, not silently read as
+    ordinary prose (review finding board.py:483)."""
+    header_line = "| # | Scheibe | Item | Owner | Hängt ab von |"
+    body = (
+        f"{header_line}\n"
+        "|---|---|---|---|---|\n"
+        "| 1 | First slice | — | me | — |\n"
+    )
+    target = board_issue(72, "Epic", body)
+    client = _configured_board_client(monkeypatch, tmp_path, open_issues=(target,))
+    monkeypatch.setattr(
+        issue_claim, "_request", lambda _arguments: request(issue=72, scope=("src/work.py",))
+    )
+
+    exit_code = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Codex Sol",
+            "--scope",
+            "src/work.py",
+        ]
+    )
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f'ERROR: malformed slice table header: "{header_line}"' in captured.err
+    assert client.comments[LEDGER_ISSUE] == []
+
+
+def test_claim_refuses_a_slice_table_row_with_the_wrong_shape_and_keeps_scanning(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """A row with the wrong column count or a non-integer index must fail
+    loud and not silently truncate the table — a later, well-formed row
+    (here an undispatched slice) still gets its own check (review finding
+    board.py:493/495)."""
+    bad_row = "| x | Broken index | — | — |"
+    body = (
+        "| # | Scheibe | Item | Hängt ab von |\n"
+        "|---|---|---|---|\n"
+        f"{bad_row}\n"
+        "| 2 | Second slice | — | — |\n"
+    )
+    target = board_issue(72, "Epic", body)
+    client = _configured_board_client(monkeypatch, tmp_path, open_issues=(target,))
+    monkeypatch.setattr(
+        issue_claim, "_request", lambda _arguments: request(issue=72, scope=("src/work.py",))
+    )
+
+    exit_code = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Codex Sol",
+            "--scope",
+            "src/work.py",
+        ]
+    )
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f'ERROR: malformed slice table row: "{bad_row}"' in captured.err
+    assert (
+        'WARNING: slice 2 "Second slice" is not dispatched; make it an item '
+        "before building it" in captured.err
+    )
+    assert client.comments[LEDGER_ISSUE] == []
+
+
+def test_claim_checks_every_slice_table_in_the_body_not_just_the_first(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """A second slice table later in the body must be checked too (review
+    finding board.py:500's unconditional early return)."""
+    body = (
+        slice_table(("1", "First table's slice", "#101", "—"))
+        + "\nSome prose between the two tables.\n\n"
+        + slice_table(("1", "Second table's slice", "—", "—"))
+    )
+    target = board_issue(72, "Epic", body)
+    client = _configured_board_client(monkeypatch, tmp_path, open_issues=(target,))
+    _stub_issue_reference(
+        monkeypatch, {101: (issue_claim.ReferenceState.OPEN, "Open slice item", "")}
+    )
+    monkeypatch.setattr(
+        issue_claim, "_request", lambda _arguments: request(issue=72, scope=("src/work.py",))
+    )
+
+    exit_code = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Codex Sol",
+            "--scope",
+            "src/work.py",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["checks"] == [
+        {
+            "level": "warning",
+            "check": "undispatched-slice",
+            "text": 'slice 1 "Second table\'s slice" is not dispatched; make it an item '
+            "before building it",
+            "slice": 1,
+            "issue": None,
+        }
+    ]
+    assert len(client.comments[LEDGER_ISSUE]) == 1
+
+
 @pytest.mark.parametrize(
     ("body", "expect_warning"),
     [
@@ -7169,6 +7305,54 @@ def test_cli_claim_share_at_a_quarter_does_not_need_allow_directory(
     assert capsys.readouterr().out.endswith(
         "1 of 4 versioned files (25%); overlaps no other open claims\n"
     )
+
+
+def test_claim_reports_the_claim_id_when_the_post_mutation_ledger_read_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A failure reading standing claims for the overlap note must never
+    read as a refusal once the claim itself is already posted — the
+    operator must see the claim id and an explicit "the claim exists"
+    message, never a silent partial state (review finding cli.py:1194)."""
+    client = FakeComments()
+
+    def failing_conflicting_claims(
+        claims: tuple[ActiveClaim, ...], candidate: object
+    ) -> tuple[ActiveClaim, ...]:
+        raise ClaimError("ledger fetch failed")
+
+    monkeypatch.setattr(issue_claim.protocol, "conflicting_claims", failing_conflicting_claims)
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+
+    exit_code = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Codex Sol",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "src/work.py",
+            "--claim-id",
+            "flaky-ledger",
+        ]
+    )
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "CLAIMED issue #72: flaky-ledger" in captured.out
+    assert "ERROR: the claim above exists" in captured.err
+    posted = active_claims(tuple(client.comments[LEDGER_ISSUE]))
+    assert any(claim.claim_id == "flaky-ledger" for claim in posted)
 
 
 def test_cli_claim_touches_stay_empty_beside_a_disjoint_standing_claim(

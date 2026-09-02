@@ -843,6 +843,28 @@ def _out_of_order_check(projected: board.Board, issue: int | None) -> SliceCheck
     )
 
 
+def _slice_table_entry_checks(
+    repository: str, open_by_number: dict[int, board.Issue], entry: board.SliceTableEntry
+) -> tuple[SliceCheck, ...]:
+    if isinstance(entry, board.MalformedSliceTable):
+        return (
+            SliceCheck(
+                "error",
+                "malformed-slice-table",
+                f'malformed slice table header: "{entry.line}"',
+            ),
+        )
+    if isinstance(entry, board.MalformedSliceRow):
+        return (
+            SliceCheck(
+                "error",
+                "malformed-slice-cell",
+                f'malformed slice table row: "{entry.line}"',
+            ),
+        )
+    return _slice_row_checks(repository, open_by_number, entry)
+
+
 def _slice_row_checks(
     repository: str, open_by_number: dict[int, board.Issue], row: board.SliceTableRow
 ) -> tuple[SliceCheck, ...]:
@@ -931,8 +953,8 @@ def _slice_rule_checks(
             )
         )
     if body is not None:
-        for row in board.parse_slice_table(body):
-            checks.extend(_slice_row_checks(repository, open_by_number, row))
+        for entry in board.parse_slice_table(body):
+            checks.extend(_slice_table_entry_checks(repository, open_by_number, entry))
     if title is not None and body is not None:
         checks.extend(_parent_line_checks(title, body))
     return tuple(checks)
@@ -1191,7 +1213,23 @@ def main(arguments: list[str] | None = None) -> int:
             for check in checks:
                 print(check.render(), file=sys.stderr if parsed.json else sys.stdout)
             claimed = protocol.acquire_claim(client, requested)
-            touches = protocol.conflicting_claims(protocol._ledger_claims(client), claimed)
+            try:
+                touches = protocol.conflicting_claims(protocol._ledger_claims(client), claimed)
+            except protocol.ClaimError as error:
+                # The claim above is already posted; a failure reading the
+                # ledger for the advisory "touches" note must never read as
+                # a refusal — that would leave the operator believing
+                # nothing happened while a live claim sits on the ledger.
+                print(
+                    f"CLAIMED {_claim_subject(claimed)}: "
+                    f"{claimed.claim_id} {claimed.comment.url}"
+                )
+                print(
+                    f"ERROR: the claim above exists, but reading standing claims "
+                    f"for the overlap note failed: {error}",
+                    file=sys.stderr,
+                )
+                return 2
             if parsed.json:
                 return _claim_json(
                     claimed,
