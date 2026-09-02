@@ -5,7 +5,7 @@ import json
 import subprocess
 import sys
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -627,13 +627,18 @@ def test_board_projects_fixture_json_without_github_writes(
         observed.append(arguments)
         endpoint = next((argument for argument in arguments if argument.startswith("repos/")), "")
         if "/comments?" in endpoint:
-            rows = [ledger_comment]
+            # Comment pages are fetched in parallel: only the first page
+            # carries the fixture row, every later page ends the fetch by
+            # coming back short, exactly like a page past the real last one.
+            page = int(endpoint.rsplit("page=", 1)[1])
+            rows = [ledger_comment] if page == 1 else []
         elif "/issues?" in endpoint:
             rows = issues_json
         elif arguments[:2] == ["pr", "list"] and "open" in arguments:
             rows = open_prs_json
         elif arguments[:2] == ["pr", "list"] and "merged" in arguments:
-            rows = merged_prs_json
+            day = arguments[arguments.index("--search") + 1].removeprefix("merged:")
+            rows = [row for row in merged_prs_json if row["mergedAt"].startswith(day)]
         else:
             pytest.fail(f"unexpected board request: {arguments}")
         return "\n".join(json.dumps(row) for row in rows)
@@ -647,6 +652,7 @@ def test_board_projects_fixture_json_without_github_writes(
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(issue_claim, "datetime", FixedDateTime)
+    monkeypatch.setattr(github, "datetime", FixedDateTime)
 
     assert issue_claim.main(["--repo", "example/agent-claim", "board"]) == 0
     rendered = capsys.readouterr().out
@@ -655,11 +661,18 @@ def test_board_projects_fixture_json_without_github_writes(
     assert "no: claimed" in rendered
     assert all("--method" not in arguments for arguments in observed)
     assert all("--jq" in arguments for arguments in observed)
-    merged_request = next(arguments for arguments in observed if "merged" in arguments)
+    merged_days = {
+        arguments[arguments.index("--search") + 1].removeprefix("merged:")
+        for arguments in observed
+        if arguments[:2] == ["pr", "list"] and "merged" in arguments
+    }
     # The floor is the oldest open issue's creation (#12, 2026-08-01), not a
     # fixed 14 days back — nothing merged before #12 existed could touch any
-    # currently open issue.
-    assert "merged:>=2026-08-01" in merged_request
+    # currently open issue. Each day between that floor and "now" is its own
+    # query shard (`github._query_days`), fetched in parallel.
+    assert merged_days == {
+        day.isoformat() for day in github._query_days(date(2026, 8, 1), date(2026, 8, 21))
+    }
 
     assert issue_claim.main(["--repo", "example/agent-claim", "board", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
@@ -4446,7 +4459,7 @@ def test_status_notes_a_scope_that_is_claimed_after_its_descendant(
     assert "CONFLICT" not in rendered
 
 
-def test_github_comment_reader_accepts_paginated_json_lines(
+def test_github_comment_reader_fetches_pages_concurrently_until_a_short_page(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ordinary_rows = [
@@ -4479,23 +4492,24 @@ def test_github_comment_reader_accepts_paginated_json_lines(
     monkeypatch.setattr(github, "COMMENTS_PER_PAGE", 2)
     calls: list[list[str]] = []
 
-    def paginate(arguments: list[str]) -> str:
+    def by_page(arguments: list[str]) -> str:
         calls.append(arguments)
-        # A real `gh api --paginate` invocation concatenates every page's
-        # `--jq`-filtered output into one stdout stream from a single
-        # subprocess; the fake mirrors that instead of branching per page.
-        all_rows = [*ordinary_rows, protocol_row]
-        return "\n".join(map(json.dumps, all_rows))
+        # Page 1 fills the (monkeypatched) 2-row page exactly, so a real
+        # fetch would keep going; page 2 comes back short, which is what
+        # ends it; every later page in the same concurrent batch is past
+        # the end, exactly like a real page past GitHub's last one.
+        page = int(arguments[1].rsplit("page=", 1)[1])
+        rows = ordinary_rows if page == 1 else [protocol_row] if page == 2 else []
+        return "\n".join(map(json.dumps, rows))
 
-    monkeypatch.setattr(client, "_run", paginate)
+    monkeypatch.setattr(client, "_run", by_page)
 
     observed = client.list_protocol_candidates(71)
 
     assert [entry.identifier for entry in observed] == [12]
     assert observed[0].body == protocol_row["body"]
-    assert len(calls) == 1
-    assert "--paginate" in calls[0]
-    assert not any("&page=" in argument for argument in calls[0])
+    assert not any("--paginate" in call for call in calls)
+    assert any("page=2" in call[1] for call in calls)
 
 
 def _comment_row(identifier: int, body: str = "ordinary prose") -> dict[str, object]:
@@ -4638,20 +4652,27 @@ def test_github_comment_body_uses_stdin_instead_of_process_argument(
 def test_merged_pull_request_history_warns_when_it_reaches_the_result_cap(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A full result page from GitHub means more merged pull requests could
-    exist beyond the cap; `build_board`'s durable floor (the oldest open
-    issue's creation) can legitimately ask this far back on a busy repository,
-    so the board must say the history may be incomplete rather than silently
-    compute stages from a truncated query.
+    """A full result page for a day's shard means more merged pull requests
+    could exist that day beyond the cap, so the board must say that day's
+    history may be incomplete rather than silently compute stages from a
+    truncated query. `since` and "now" are pinned to the same day so the
+    fetch is exactly one shard, matching the fixture below.
     """
     since = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return since
+
+    monkeypatch.setattr(github, "datetime", FixedDateTime)
     saturated_rows = [
         {
             "number": index,
             "title": f"Fixes #{index}",
             "body": "",
             "headRefName": f"codex/issue-{index}",
-            "mergedAt": "2026-08-20T00:00:00Z",
+            "mergedAt": "2026-08-01T00:00:00Z",
         }
         for index in range(1, github.MAX_RECENT_MERGED_PULL_REQUESTS + 1)
     ]
@@ -4666,18 +4687,26 @@ def test_merged_pull_request_history_warns_when_it_reaches_the_result_cap(
     error = capsys.readouterr().err
     assert "WARNING" in error
     assert str(github.MAX_RECENT_MERGED_PULL_REQUESTS) in error
+    assert since.date().isoformat() in error
 
 
 def test_merged_pull_request_history_below_the_cap_warns_of_nothing(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     since = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return since
+
+    monkeypatch.setattr(github, "datetime", FixedDateTime)
     row = {
         "number": 1,
         "title": "Fixes #1",
         "body": "",
         "headRefName": "codex/issue-1",
-        "mergedAt": "2026-08-20T00:00:00Z",
+        "mergedAt": "2026-08-01T00:00:00Z",
     }
     client = GitHubIssueComments("example/agent-claim")
     monkeypatch.setattr(client, "_run", lambda arguments: json.dumps(row))
@@ -7376,54 +7405,6 @@ def test_cli_claim_share_at_a_quarter_does_not_need_allow_directory(
     assert capsys.readouterr().out.endswith(
         "1 of 4 versioned files (25%); overlaps no other open claims\n"
     )
-
-
-def test_claim_reports_the_claim_id_when_the_post_mutation_ledger_read_fails(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """A failure reading standing claims for the overlap note must never
-    read as a refusal once the claim itself is already posted — the
-    operator must see the claim id and an explicit "the claim exists"
-    message, never a silent partial state (review finding cli.py:1194)."""
-    client = FakeComments()
-
-    def failing_conflicting_claims(
-        claims: tuple[ActiveClaim, ...], candidate: object
-    ) -> tuple[ActiveClaim, ...]:
-        raise ClaimError("ledger fetch failed")
-
-    monkeypatch.setattr(issue_claim.protocol, "conflicting_claims", failing_conflicting_claims)
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
-    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
-    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
-    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
-
-    exit_code = issue_claim.main(
-        [
-            "--repo",
-            "example/agent-claim",
-            "claim",
-            "72",
-            "--agent",
-            "Codex Sol",
-            "--base",
-            BASE,
-            "--branch",
-            "codex/issue-72",
-            "--scope",
-            "src/work.py",
-            "--claim-id",
-            "flaky-ledger",
-        ]
-    )
-
-    assert exit_code == 2
-    captured = capsys.readouterr()
-    assert "CLAIMED issue #72: flaky-ledger" in captured.out
-    assert "ERROR: the claim above exists" in captured.err
-    posted = active_claims(tuple(client.comments[LEDGER_ISSUE]))
-    assert any(claim.claim_id == "flaky-ledger" for claim in posted)
 
 
 def test_cli_claim_touches_stay_empty_beside_a_disjoint_standing_claim(

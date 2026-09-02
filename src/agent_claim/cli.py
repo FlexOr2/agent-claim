@@ -6,6 +6,7 @@ import argparse
 import json
 import sys
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -661,10 +662,18 @@ def _board(
     if issues is None:
         issues = client.list_open_board_issues()
     since = _merged_pull_request_floor(issues, now)
+    # Open and recently-merged pull requests are independent reads once
+    # `since` is known, so fetching them on separate threads instead of one
+    # after another overlaps their `gh` subprocess wait time.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        open_pull_requests = pool.submit(client.list_open_board_pull_requests)
+        merged_pull_requests = pool.submit(
+            client.list_recent_merged_board_pull_requests, since
+        )
+        pull_requests = (open_pull_requests.result(), merged_pull_requests.result())
     return board.build_board(
         issues,
-        client.list_open_board_pull_requests(),
-        client.list_recent_merged_board_pull_requests(since),
+        *pull_requests,
         claims,
         board.load_config(toplevel / ".agent-claim" / "board.toml"),
         now=now,
@@ -1212,24 +1221,14 @@ def main(arguments: list[str] | None = None) -> int:
                 return _refuse_claim(parsed.json, target_issue, checks)
             for check in checks:
                 print(check.render(), file=sys.stderr if parsed.json else sys.stdout)
-            claimed = protocol.acquire_claim(client, requested)
-            try:
-                touches = protocol.conflicting_claims(protocol._ledger_claims(client), claimed)
-            except protocol.ClaimError as error:
-                # The claim above is already posted; a failure reading the
-                # ledger for the advisory "touches" note must never read as
-                # a refusal — that would leave the operator believing
-                # nothing happened while a live claim sits on the ledger.
-                print(
-                    f"CLAIMED {_claim_subject(claimed)}: "
-                    f"{claimed.claim_id} {claimed.comment.url}"
-                )
-                print(
-                    f"ERROR: the claim above exists, but reading standing claims "
-                    f"for the overlap note failed: {error}",
-                    file=sys.stderr,
-                )
-                return 2
+            # `_acquire_claim_with_observed` already reads the ledger once,
+            # right after posting, to detect a claim race; that same snapshot
+            # is what the "touches" note below needs, so reusing it (instead
+            # of a fresh `protocol._ledger_claims(client)` call) removes the
+            # slowest step of `claim` — the wait was reported as a hang that
+            # landed after the mutation was already visible on the ledger.
+            claimed, observed = protocol._acquire_claim_with_observed(client, requested)
+            touches = protocol.conflicting_claims(observed, claimed)
             if parsed.json:
                 return _claim_json(
                     claimed,

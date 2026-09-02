@@ -1545,6 +1545,21 @@ def _assigned_request(request: ClaimRequest) -> ClaimRequest:
 
 
 def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
+    claimed, _observed = _acquire_claim_with_observed(client, request)
+    return claimed
+
+
+def _acquire_claim_with_observed(
+    client: IssueComments, request: ClaimRequest
+) -> tuple[ActiveClaim, tuple[ActiveClaim, ...]]:
+    """`acquire_claim`, plus the active claims its own post-mutation race check already read.
+
+    The caller's advisory "touches" note (`conflicting_claims`) needs exactly
+    that same post-mutation ledger snapshot; returning it here lets the CLI
+    reuse it instead of paying for another full ledger-comments fetch right
+    after this one (the wait `claim` was reported hanging on, since it landed
+    after the mutating post was already visible on the ledger).
+    """
     aggregate = _aggregate_claim_events(client.list_protocol_candidates(LEDGER_ISSUE))
     if request.claim_id in aggregate.seen_claim_ids:
         raise ClaimUnavailable(
@@ -1637,7 +1652,7 @@ def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
             )
 
     _reconcile_identity(client, request.identity)
-    return own
+    return own, observed
 
 
 def _combined_scope(
