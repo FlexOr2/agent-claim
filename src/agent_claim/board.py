@@ -91,6 +91,32 @@ CLAIM_OLD_AFTER = timedelta(hours=1)
 CUT_HEADING_PATTERN = re.compile(r"(?m)^##[ \t]+Schnitt")
 CUT_SECTION_HEADING_PATTERN = re.compile(r"(?m)^##[ \t]+")
 SLICE_LINE_PATTERN = re.compile(r"(?m)^\*\*Scheibe [1-9][0-9]*:[ \t]*\S.*?\*\*\s*$")
+# The slice table's header cells, in order, compared case- and
+# whitespace-insensitively (`_table_row_cells` already strips each cell).
+SLICE_TABLE_HEADER_CELLS = ("#", "scheibe", "item", "hängt ab von")
+_SLICE_TABLE_SEPARATOR_CELL_PATTERN = re.compile(r"^:?-+:?$")
+_SLICE_TABLE_INDEX_PATTERN = re.compile(r"^[1-9][0-9]*$")
+_SLICE_TABLE_ITEM_LINK_PATTERN = re.compile(r"^#([1-9][0-9]*)$")
+UNDISPATCHED_SLICE_CELL = "—"
+# A stricter sibling of `TOUCHES_WITHOUT_CLOSING_LINE_PATTERN`, deliberately
+# not reused: that pattern accepts several markers and arbitrary trailing
+# text because a PR may carry more than one reference in one line; an issue
+# has exactly one parent, so this line-anchored form accepts only `Part of
+# #<n>` (optionally followed by a period) and nothing else on the line — a
+# second number, or trailing prose, means the line isn't read as a parent
+# relation at all.
+PART_OF_LINE_PATTERN = re.compile(r"(?im)^Part of #([1-9][0-9]*)\.?[ \t]*$")
+# The three slice-title forms seen in atelier-2 (`#79`): a parenthetical
+# after the real title (`(#962 Scheibe 4)`, `(#962 slice 4)`) or a leading
+# German phrase (`Scheibe 4 von #962`).
+_SLICE_TITLE_PARENTHETICAL_PATTERN = re.compile(
+    r"\(#(?P<parent>[1-9][0-9]*)[ \t]+(?:Scheibe|slice)[ \t]+(?P<slice>[1-9][0-9]*)\)",
+    re.IGNORECASE,
+)
+_SLICE_TITLE_VON_PATTERN = re.compile(
+    r"Scheibe[ \t]+(?P<slice>[1-9][0-9]*)[ \t]+von[ \t]+#(?P<parent>[1-9][0-9]*)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -110,6 +136,48 @@ class PullRequest:
     body: str
     head_ref_name: str
     merged_at: str | None = None
+
+
+@dataclass(frozen=True)
+class SliceTableRow:
+    """One row of a body's slice table (`#79`'s grammar).
+
+    `item_issue` is the parsed `#n` when `item_cell` is a well-formed link;
+    `None` covers both the undispatched marker (`item_cell ==
+    UNDISPATCHED_SLICE_CELL`) and a malformed cell — `item_cell` itself is
+    the one source of truth for telling those two apart, so this row never
+    needs a separate status field to go stale against it.
+    """
+
+    index: int
+    name: str
+    item_cell: str
+    item_issue: int | None
+
+
+@dataclass(frozen=True)
+class MalformedSliceTable:
+    """A header line that looks like an attempted slice table but isn't one.
+
+    "Looks like" is deliberately loose (starts with `#`, names `Scheibe`
+    somewhere on the line) — the whole point is to catch a header that
+    almost, but not quite, matches `SLICE_TABLE_HEADER_CELLS`, rather than
+    silently treating it as ordinary prose and skipping the checks it was
+    meant to carry.
+    """
+
+    line: str
+
+
+@dataclass(frozen=True)
+class MalformedSliceRow:
+    """A pipe-shaped line inside a recognized slice table that isn't a
+    well-formed row: the wrong column count, or a non-integer `#` cell."""
+
+    line: str
+
+
+SliceTableEntry = SliceTableRow | MalformedSliceTable | MalformedSliceRow
 
 
 @dataclass(frozen=True)
@@ -386,6 +454,129 @@ def _live_text(body: str) -> str:
             fence_char, fence_length = None, 0
         # Still inside the fence (or just closed it): never scanned for a marker.
     return "\n".join(live_lines)
+
+
+def _table_row_cells(line: str) -> tuple[str, ...] | None:
+    """A markdown table row's cells, or None when `line` isn't table-shaped.
+
+    Leading/trailing `|` are optional, matching both the pipe-fenced style
+    every slice table in this repository uses and the bare form CommonMark
+    also allows.
+    """
+    stripped = line.strip()
+    if "|" not in stripped:
+        return None
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    cells = tuple(cell.strip() for cell in stripped.split("|"))
+    return cells if cells else None
+
+
+def _is_slice_table_separator(line: str) -> bool:
+    cells = _table_row_cells(line)
+    return cells is not None and len(cells) == len(SLICE_TABLE_HEADER_CELLS) and all(
+        _SLICE_TABLE_SEPARATOR_CELL_PATTERN.match(cell) is not None for cell in cells
+    )
+
+
+def _slice_table_row(index: str, name: str, item_cell: str) -> SliceTableRow:
+    if item_cell == UNDISPATCHED_SLICE_CELL:
+        return SliceTableRow(int(index), name, item_cell, None)
+    link = _SLICE_TABLE_ITEM_LINK_PATTERN.match(item_cell)
+    return SliceTableRow(int(index), name, item_cell, int(link.group(1)) if link else None)
+
+
+_SLICE_TABLE_HEADER_TRIGGER_WORDS = frozenset({"scheibe", "slice", "item"})
+
+
+def _looks_like_slice_table_header(cells: tuple[str, ...]) -> bool:
+    """A loose, deliberately over-eager heuristic: a `#`-first pipe row that
+    also names one of the slice table's real column words — `Scheibe`,
+    `Slice`, `Item`, or a `Hängt ab...` column — is an attempted slice
+    table, whether or not it turns out well-formed. Catching it here —
+    rather than only the exact header shape — is what makes a near-miss
+    header (including the English "Slice" spelling) fail loud instead of
+    reading as ordinary prose. `#` alone never counts: an ordinary table
+    that happens to start with a `#` column stays untouched.
+    """
+    if cells[0].strip() != "#":
+        return False
+    return any(
+        cell.strip().casefold() in _SLICE_TABLE_HEADER_TRIGGER_WORDS
+        or cell.strip().casefold().startswith("hängt ab")
+        for cell in cells[1:]
+    )
+
+
+def parse_slice_table(body: str) -> tuple[SliceTableEntry, ...]:
+    """Every slice table entry in `body` (`#79`'s grammar): a well-formed
+    row, or a `MalformedSliceTable`/`MalformedSliceRow` marking a near-miss.
+
+    A slice table is a markdown table whose header cells are exactly `#`,
+    `Scheibe`, `Item`, `Hängt ab von`, in that order, case- and
+    whitespace-insensitively, followed by a separator row — the shape
+    atelier-2 #962 carries since 02.09. Any `#`-first row naming `Scheibe`
+    that doesn't match that shape exactly (wrong columns, no separator) is
+    `MalformedSliceTable` rather than silently ignored prose. Every table in
+    the body is parsed, not just the first. Reads only `_live_text`, so a
+    fenced example of the grammar never counts.
+    """
+    lines = _live_text(body).splitlines()
+    entries: list[SliceTableEntry] = []
+    line_index = 0
+    while line_index < len(lines):
+        header_cells = _table_row_cells(lines[line_index])
+        if header_cells is None or not _looks_like_slice_table_header(header_cells):
+            line_index += 1
+            continue
+        well_formed_header = len(header_cells) == len(SLICE_TABLE_HEADER_CELLS) and tuple(
+            cell.casefold() for cell in header_cells
+        ) == SLICE_TABLE_HEADER_CELLS
+        has_separator = line_index + 1 < len(lines) and _is_slice_table_separator(
+            lines[line_index + 1]
+        )
+        if not well_formed_header or not has_separator:
+            entries.append(MalformedSliceTable(lines[line_index].strip()))
+            line_index += 1
+            continue
+        line_index += 2
+        while line_index < len(lines):
+            row_cells = _table_row_cells(lines[line_index])
+            if row_cells is None:
+                break
+            if len(row_cells) != len(SLICE_TABLE_HEADER_CELLS) or _SLICE_TABLE_INDEX_PATTERN.match(
+                row_cells[0]
+            ) is None:
+                entries.append(MalformedSliceRow(lines[line_index].strip()))
+                line_index += 1
+                continue
+            entries.append(_slice_table_row(*row_cells[:3]))
+            line_index += 1
+    return tuple(entries)
+
+
+def parent_line_numbers(body: str) -> frozenset[int]:
+    """Every issue number named on its own `Part of #<n>` line."""
+    return frozenset(
+        int(match.group(1)) for match in PART_OF_LINE_PATTERN.finditer(_live_text(body))
+    )
+
+
+def slice_title_match(title: str) -> tuple[int, int] | None:
+    """`(slice number, parent issue)` when `title` looks like a dispatched slice.
+
+    Matches the three forms `#79` names: `(#<n> Scheibe <k>)`, `(#<n> slice
+    <k>)`, and `Scheibe <k> von #<n>`. A title carrying none of them returns
+    None — the heuristic simply has nothing to check.
+    """
+    match = _SLICE_TITLE_PARENTHETICAL_PATTERN.search(title) or _SLICE_TITLE_VON_PATTERN.search(
+        title
+    )
+    if match is None:
+        return None
+    return int(match.group("slice")), int(match.group("parent"))
 
 
 def frozen_trigger(body: str) -> str | None:
