@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import tomllib
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -131,6 +131,20 @@ class Issue:
     updated_at: str
 
 
+class BlockerState(StrEnum):
+    OPEN = "open"
+    CLOSED = "closed"
+    MISSING = "missing"
+
+
+@dataclass(frozen=True)
+class BlockerReference:
+    number: int
+    state: BlockerState
+    is_pull_request: bool
+    closed_at: datetime | None = None
+
+
 @dataclass(frozen=True)
 class PullRequest:
     number: int
@@ -254,6 +268,7 @@ class BoardItem:
     ruling_old: bool | None
     frozen_trigger: str | None
     open_blockers: tuple[int, ...]
+    freed_on: datetime | None
     stage: Stage
     age_days: int
     idle_days: int
@@ -279,6 +294,7 @@ class Board:
     items: tuple[BoardItem, ...]
     ready_now: tuple[BoardItem, ...]
     stale: tuple[BoardItem, ...]
+    blocker_references: tuple[BlockerReference, ...]
 
 
 def load_config(path: Path = CONFIG_PATH) -> BoardConfig:
@@ -709,6 +725,63 @@ def _blocker_references(text: str | None) -> frozenset[int]:
     return _references(text)
 
 
+def blocker_references(issues: tuple[Issue, ...]) -> frozenset[int]:
+    return frozenset(
+        blocker
+        for issue in issues
+        for blocker in parse_contract(issue.body).blocker_issues
+    )
+
+
+def _with_blocker_defects(
+    contract: Contract, blockers: dict[int, BlockerReference]
+) -> Contract:
+    pull_requests = tuple(
+        blocker
+        for blocker in sorted(contract.blocker_issues)
+        if blockers[blocker].is_pull_request
+    )
+    if not pull_requests:
+        return contract
+    return replace(
+        contract,
+        defects=(
+            *contract.defects,
+            *(
+                ContractDefect("Blocked by", f"blocker #{blocker} is a pull request")
+                for blocker in pull_requests
+            ),
+        ),
+    )
+
+
+def _open_blockers(contract: Contract, blockers: dict[int, BlockerReference]) -> tuple[int, ...]:
+    return tuple(
+        blocker
+        for blocker in sorted(contract.blocker_issues)
+        if (
+            not blockers[blocker].is_pull_request
+            and blockers[blocker].state is BlockerState.OPEN
+        )
+    )
+
+
+def _freed_on(contract: Contract, blockers: dict[int, BlockerReference]) -> datetime | None:
+    issue_blockers = tuple(
+        blockers[blocker]
+        for blocker in contract.blocker_issues
+        if not blockers[blocker].is_pull_request
+    )
+    if not issue_blockers or any(
+        blocker.state is not BlockerState.CLOSED for blocker in issue_blockers
+    ):
+        return None
+    return max(
+        (blocker.closed_at for blocker in issue_blockers if blocker.closed_at is not None),
+        default=None,
+    )
+
+
 def has_cut(body: str) -> bool:
     heading = CUT_HEADING_PATTERN.search(body)
     if heading is None:
@@ -862,17 +935,52 @@ def build_board(
     claims: tuple[protocol.ActiveClaim, ...],
     config: BoardConfig,
     *,
+    blocker_references: tuple[BlockerReference, ...] | None = None,
     now: datetime | None = None,
     trunk_landings: tuple[datetime, ...] = (),
 ) -> Board:
     observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    issue_numbers = frozenset(issue.number for issue in issues)
-    open_references = issue_numbers | frozenset(pr.number for pr in open_pull_requests)
     contracts = {issue.number: parse_contract(issue.body) for issue in issues}
-    blockers = {
-        issue.number: tuple(
-            sorted(contracts[issue.number].blocker_issues & open_references)
+    referenced_blockers = frozenset(
+        blocker
+        for contract in contracts.values()
+        for blocker in contract.blocker_issues
+    )
+    if blocker_references is None:
+        blocker_references = (
+            *(
+                BlockerReference(issue.number, BlockerState.OPEN, False)
+                for issue in issues
+            ),
+            *(
+                BlockerReference(pull_request.number, BlockerState.OPEN, True)
+                for pull_request in open_pull_requests
+            ),
         )
+    blocker_by_number = {reference.number: reference for reference in blocker_references}
+    missing_blockers = referenced_blockers - blocker_by_number.keys()
+    if missing_blockers:
+        missing = min(missing_blockers)
+        raise protocol.ClaimError(f"GitHub did not return blocker #{missing}")
+    invalid_closed_blockers = tuple(
+        reference.number
+        for reference in blocker_by_number.values()
+        if reference.state is BlockerState.CLOSED and reference.closed_at is None
+    )
+    if invalid_closed_blockers:
+        raise protocol.ClaimError(
+            f"GitHub did not return closed_at for blocker #{min(invalid_closed_blockers)}"
+        )
+    contracts = {
+        issue.number: _with_blocker_defects(contracts[issue.number], blocker_by_number)
+        for issue in issues
+    }
+    blockers = {
+        issue.number: _open_blockers(contracts[issue.number], blocker_by_number)
+        for issue in issues
+    }
+    freed_on = {
+        issue.number: _freed_on(contracts[issue.number], blocker_by_number)
         for issue in issues
     }
     unblocks = {
@@ -951,6 +1059,7 @@ def build_board(
                 ruling_old=ruling_old,
                 frozen_trigger=frozen,
                 open_blockers=blockers[issue.number],
+                freed_on=freed_on[issue.number],
                 stage=stage,
                 age_days=age_days,
                 idle_days=idle_days,
@@ -977,6 +1086,7 @@ def build_board(
             for item in ordered
             if item.idle_days > 7 and item.stage is Stage.TEXT_ONLY
         ),
+        blocker_references=blocker_references,
     )
 
 
@@ -994,7 +1104,13 @@ def highest_scored_actionable(board: Board) -> BoardItem | None:
 
 
 def board_json(board: Board) -> str:
-    return json.dumps(asdict(board), default=lambda value: value.value)
+    payload = asdict(board)
+    # S2b owns FREED; claim checks consume blocker details only inside this process.
+    payload.pop("blocker_references")
+    for group in ("items", "ready_now", "stale"):
+        for item in payload[group]:
+            item.pop("freed_on")
+    return json.dumps(payload, default=lambda value: value.value)
 
 
 def render(board: Board) -> str:
