@@ -138,6 +138,11 @@ stage and Next bonuses sort only within a bucket. The same file may set one
 projection ranks normally, and `next` tells the head `Problem neu prüfen und
 Item verfeinern`. Once it has a complete contract, its own Next takes over;
 without the configured label, a projectionless item remains `body incomplete`.
+The board table's `FREED` column shows `YYYY-MM-DD (N d)` when every listed
+issue blocker has closed, using the latest such UTC closing date and whole days
+since then; it otherwise shows `-`. Every item in `board --json` carries the
+same values as `freed_on` (`YYYY-MM-DD` or `null`) and `freed_days` (a
+nonnegative integer or `null`).
 
 `agent-claim rulings` lists only open board items with open expectation lines
 as `#NUMBER OPEN/TOTAL: TITLE`; `rulings --json` returns the same `number`,
