@@ -297,7 +297,7 @@ def _parser() -> argparse.ArgumentParser:
     claim.add_argument(
         "--out-of-order",
         metavar="REASON",
-        help="record why this claim proceeds ahead of a higher-priority actionable item",
+        help="required to claim ahead of a higher-priority actionable item; records why",
     )
     claim.add_argument(
         "--allow-directory",
@@ -836,7 +836,9 @@ def _issue_reference_state(
     return reference.state, reference.title, reference.body
 
 
-def _out_of_order_check(projected: board.Board, issue: int | None) -> SliceCheck | None:
+def _out_of_order_check(
+    projected: board.Board, issue: int | None, out_of_order_reason: str | None
+) -> SliceCheck | None:
     highest = board.highest_scored_actionable(projected)
     if highest is None or issue is None:
         return None
@@ -844,10 +846,11 @@ def _out_of_order_check(projected: board.Board, issue: int | None) -> SliceCheck
     if claimed_item is None or board.board_rank(highest) >= board.board_rank(claimed_item):
         return None
     return SliceCheck(
-        "warning",
+        "warning" if out_of_order_reason is not None else "error",
         "out-of-order",
         f"higher-priority actionable item #{highest.number} "
-        f"(score {highest.score}) is free: {highest.title}",
+        f"(score {highest.score}) is free: {highest.title}; "
+        "use --out-of-order REASON to proceed",
         issue=highest.number,
     )
 
@@ -945,9 +948,10 @@ def _slice_rule_checks(
     open_by_number: dict[int, board.Issue],
     issue: int,
     projected: board.Board,
+    out_of_order_reason: str | None,
 ) -> tuple[SliceCheck, ...]:
     checks: list[SliceCheck] = []
-    out_of_order = _out_of_order_check(projected, issue)
+    out_of_order = _out_of_order_check(projected, issue, out_of_order_reason)
     if out_of_order is not None:
         checks.append(out_of_order)
     state, title, body = _issue_reference_state(repository, open_by_number, issue)
@@ -1216,7 +1220,13 @@ def main(arguments: list[str] | None = None) -> int:
                 projected = _board(
                     client, protocol._ledger_claims(client), issues=open_issues
                 )
-                checks = _slice_rule_checks(repository, open_by_number, target_issue, projected)
+                checks = _slice_rule_checks(
+                    repository,
+                    open_by_number,
+                    target_issue,
+                    projected,
+                    requested.out_of_order_reason,
+                )
             if any(check.level == "error" for check in checks):
                 return _refuse_claim(parsed.json, target_issue, checks)
             for check in checks:

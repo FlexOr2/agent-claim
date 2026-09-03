@@ -1060,7 +1060,7 @@ def test_next_pulls_an_unruled_item_and_names_only_unworkable_ones_as_skipped(
     }
 
 
-def test_claim_warns_that_a_higher_scored_unruled_item_is_free(
+def test_claim_refuses_when_the_higher_priority_item_needs_refining(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     client = _claims_client()
@@ -1098,35 +1098,19 @@ def test_claim_warns_that_a_higher_scored_unruled_item_is_free(
                 "src/work.py",
             ]
         )
-        == 0
+        == 2
     )
-    assert (
-        "WARNING: higher-priority actionable item #11 (score 10) is free: Needs rulings"
-        in capsys.readouterr().out
-    )
+    captured = capsys.readouterr()
+    assert "ERROR: higher-priority actionable item #11" in captured.err
+    assert "Needs rulings" in captured.err
+    assert "--out-of-order REASON" in captured.err
+    assert client.comments[LEDGER_ISSUE] == []
 
 
-@pytest.mark.parametrize(
-    ("out_of_order_reason", "expected_comment_reason"),
-    [
-        pytest.param(
-            None,
-            None,
-            id="warns_without_a_reason",
-        ),
-        pytest.param(
-            "Urgent customer incident.",
-            "Out-of-order reason: Urgent customer incident.",
-            id="records_an_explicit_reason",
-        ),
-    ],
-)
-def test_claim_warns_about_a_higher_scored_actionable_item(
+def test_claim_refuses_out_of_order_without_a_reason_before_mutating(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     tmp_path: Path,
-    out_of_order_reason: str | None,
-    expected_comment_reason: str | None,
 ) -> None:
     client = _claims_client()
     issues = (
@@ -1134,10 +1118,7 @@ def test_claim_warns_about_a_higher_scored_actionable_item(
         board_issue(11, "Top work", complete_contract("Claim #11.")),
         board_issue(12, "Depends on top", "## Blocked by\n#11"),
     )
-    claimed_request = replace(
-        request("out-of-order", issue=10, scope=("src/lower.py",)),
-        out_of_order_reason=out_of_order_reason,
-    )
+    claimed_request = request("out-of-order", issue=10, scope=("src/lower.py",))
     monkeypatch.setattr(client, "list_open_board_issues", lambda: issues)
     monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
     monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
@@ -1157,22 +1138,66 @@ def test_claim_warns_about_a_higher_scored_actionable_item(
         "--scope",
         "src/lower.py",
     ]
-    if out_of_order_reason is not None:
-        arguments.extend(("--out-of-order", out_of_order_reason))
+    assert issue_claim.main(arguments) == 2
+    captured = capsys.readouterr()
 
-    assert issue_claim.main(arguments) == 0
+    assert "ERROR: higher-priority actionable item #11" in captured.err
+    assert "Top work" in captured.err
+    assert "--out-of-order REASON" in captured.err
+    assert client.comments[LEDGER_ISSUE] == []
+
+
+def test_claim_allows_out_of_order_with_a_reason_and_records_it(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    client = _claims_client()
+    issues = (
+        board_issue(10, "Lower work", complete_contract("Claim #10.")),
+        board_issue(11, "Top work", complete_contract("Claim #11.")),
+        board_issue(12, "Depends on top", "## Blocked by\n#11"),
+    )
+    reason = "Urgent customer incident."
+    claimed_request = replace(
+        request("out-of-order", issue=10, scope=("src/lower.py",)),
+        out_of_order_reason=reason,
+    )
+    monkeypatch.setattr(client, "list_open_board_issues", lambda: issues)
+    monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
+    monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+    monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
+    monkeypatch.setattr(issue_claim, "_request", lambda _arguments: claimed_request)
+
+    assert (
+        issue_claim.main(
+            [
+                "--repo",
+                "example/agent-claim",
+                "claim",
+                "10",
+                "--agent",
+                "Codex Sol",
+                "--scope",
+                "src/lower.py",
+                "--out-of-order",
+                reason,
+            ]
+        )
+        == 0
+    )
     output = capsys.readouterr().out
 
     assert "WARNING" in output
     assert "#11" in output
     comment_body = client.comments[LEDGER_ISSUE][-1].body
-    if expected_comment_reason is None:
-        assert "Out-of-order reason:" not in comment_body
-    else:
-        assert expected_comment_reason in comment_body
+    assert "Out-of-order reason: Urgent customer incident." in comment_body
 
 
-def test_claim_warns_about_a_higher_priority_item_even_at_a_lower_score(
+def test_claim_refuses_for_a_higher_priority_item_even_at_a_lower_score(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     """`board`/`next` rank a labelled blocker ahead of an unlabelled item even
@@ -1212,21 +1237,21 @@ def test_claim_warns_about_a_higher_priority_item_even_at_a_lower_score(
                 "src/lower.py",
             ]
         )
-        == 0
+        == 2
     )
-    output = capsys.readouterr().out
+    captured = capsys.readouterr()
 
     # #51 (score 40: in-flight + single next) outscores #50 (score 10: it
     # unblocks #52, text-only, single next), but #50 leads on the board
     # because it carries the higher-priority "blocker" bucket.
-    assert "WARNING" in output
-    assert "#50" in output
+    assert "ERROR" in captured.err
+    assert "#50" in captured.err
+    assert client.comments[LEDGER_ISSUE] == []
 
 
-def test_claim_out_of_order_warning_appears_in_the_checks_list(
+def test_claim_json_refusal_reports_out_of_order_without_mutating(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    """The pre-existing out-of-order warning now folds into `checks` (`#79`)."""
     lower = board_issue(10, "Lower work", complete_contract("Claim #10."))
     top = board_issue(11, "Top work", complete_contract("Claim #11."))
     dependent = board_issue(12, "Depends on top", "## Blocked by\n#11")
@@ -1249,16 +1274,48 @@ def test_claim_out_of_order_warning_appears_in_the_checks_list(
         ]
     )
 
-    assert exit_code == 0
+    assert exit_code == 2
     payload = json.loads(capsys.readouterr().out)
+    assert payload["refused"] is True
+    assert payload["issue"] == 10
     checks = payload["checks"]
     assert len(checks) == 1
     check = checks[0]
-    assert check["level"] == "warning"
+    assert check["level"] == "error"
     assert check["check"] == "out-of-order"
     assert check["issue"] == 11
     assert check["slice"] is None
     assert "#11" in check["text"] and "Top work" in check["text"]
+    assert "--out-of-order REASON" in check["text"]
+    assert client.comments[LEDGER_ISSUE] == []
+
+
+def test_claim_does_not_require_out_of_order_for_the_top_ranked_item(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    top = board_issue(10, "Top work", complete_contract("Claim #10."))
+    lower = board_issue(11, "Lower work", complete_contract("Claim #11."))
+    client = _configured_board_client(monkeypatch, tmp_path, open_issues=(top, lower))
+    monkeypatch.setattr(
+        issue_claim, "_request", lambda _arguments: request(issue=10, scope=("src/top.py",))
+    )
+
+    assert (
+        issue_claim.main(
+            [
+                "--repo",
+                "example/agent-claim",
+                "claim",
+                "10",
+                "--agent",
+                "Codex Sol",
+                "--scope",
+                "src/top.py",
+            ]
+        )
+        == 0
+    )
+    assert "WARNING: higher-priority actionable item" not in capsys.readouterr().out
     assert len(client.comments[LEDGER_ISSUE]) == 1
 
 
