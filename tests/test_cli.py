@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_claim import board, checkout, discovery, github, protocol
+from agent_claim import __version__, board, checkout, discovery, github, protocol
 from agent_claim import cli as issue_claim
 from agent_claim.cli import (  # noqa: E402
     MAX_COMMENT_BYTES,
@@ -5890,7 +5890,7 @@ def test_cli_version_exits_before_requiring_a_command(
         issue_claim.main(["--version"])
 
     assert exited.value.code == 0
-    assert capsys.readouterr().out == "agent-claim 0.7.0\n"
+    assert capsys.readouterr().out == f"agent-claim {__version__}\n"
 
 
 @pytest.mark.parametrize(
