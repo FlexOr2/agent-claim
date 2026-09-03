@@ -31,7 +31,10 @@ Omitted `--agent` on `claim` and `release` is filled from non-empty
 `AGENT_CLAIM_AGENT`, else non-empty `GROK_SESSION_ID` as `Grok {session}`, else
 non-empty `CLAUDE_SESSION_ID` as `Claude {session}`. `GROK_AGENT` is not a name.
 Missing or present-invalid identity fails closed before GitHub work. Omitted
-`--role` on `claim` is `builder`; an explicit `--role` wins. Omitted `--claim-id`
+`--role` on `claim` is `builder`; an explicit `--role` wins. Repeating an
+interrupted `claim` for the same active item, agent, role, branch, and scope
+returns that active claim's existing ID without posting a second claim. A
+different live claim still fails; a released claim ID remains terminal. Omitted `--claim-id`
 on `release` selects the unique active claim on that issue or lane whose agent
 is this session and whose branch is the current checkout; otherwise it fails
 closed.

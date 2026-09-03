@@ -1000,6 +1000,30 @@ def blocking_claims(
     )
 
 
+def matching_claim_retry(
+    claims: tuple[ActiveClaim, ...], request: ClaimRequest
+) -> ActiveClaim | None:
+    """Return the live item claim an interrupted identical request may replay.
+
+    Issueless lanes retain their existing one-claim-per-branch behavior: only
+    numbered work items have the interrupted-response retry contract.
+    """
+    if not isinstance(request.identity, IssueIdentity):
+        return None
+    return next(
+        (
+            claim
+            for claim in claims
+            if claim.identity == request.identity
+            and claim.agent == request.agent
+            and claim.role == request.role
+            and claim.branch == request.branch
+            and claim.scope == request.scope
+        ),
+        None,
+    )
+
+
 def overlapping_claims(
     claims: tuple[ActiveClaim, ...], candidate: ActiveClaim | ClaimRequest
 ) -> tuple[ActiveClaim, ...]:
@@ -1578,13 +1602,16 @@ def _acquire_claim_with_observed(
     after the mutating post was already visible on the ledger).
     """
     aggregate = _aggregate_claim_events(client.list_protocol_candidates(LEDGER_ISSUE))
+    _reject_duplicate_claim_ids(aggregate)
+    request = _assigned_request(request)
+    replayed = matching_claim_retry(aggregate.active, request)
+    if replayed is not None:
+        return replayed, aggregate.active
     if request.claim_id in aggregate.seen_claim_ids:
         raise ClaimUnavailable(
             f"claim id {request.claim_id!r} is already on this ledger, active or "
             "released; release it, then claim again with a fresh --claim-id"
         )
-    _reject_duplicate_claim_ids(aggregate)
-    request = _assigned_request(request)
     standing = aggregate.active
     blocked_by = blocking_claims(standing, request)
     if blocked_by:
