@@ -142,12 +142,13 @@ carries `vor N Landungen geregelt, beim Ziehen neu refinen` (both as the JSON
 open issue, frozen, or without a complete contract — are named with that
 reason under `SKIPPED` (also in the JSON `skipped` list), and `next` exits 3
 when none qualifies.
-`claim` still allows work out of order, but warns when a higher-priority
-actionable item — the same order `board` and `next` use — is free; pass
-`--out-of-order REASON` to preserve why in the claim comment.
+`claim` refuses work out of order when a higher-priority actionable item — the
+same order `board` and `next` use — is free. Pass `--out-of-order REASON` to
+proceed deliberately; it remains visible as a warning and preserves the reason
+in the claim comment.
 
 A body line `Eingefroren bis: <trigger in one sentence> (Operator, DD.MM.YYYY)`
-freezes an issue: it drops out of `next` and out of the out-of-order warning
+freezes an issue: it drops out of `next` and the higher-priority refusal check
 even though its score keeps showing on `board`, and deleting the line thaws it
 again. The tool only checks the line's form, never who wrote it — that
 authority is the coordination contract's. It reads the body the way GitHub
