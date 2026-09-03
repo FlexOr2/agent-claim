@@ -670,20 +670,23 @@ def _board(
     if issues is None:
         issues = client.list_open_board_issues()
     since = _merged_pull_request_floor(issues, now)
+    blockers = board.blocker_references(issues)
     # Open and recently-merged pull requests are independent reads once
     # `since` is known, so fetching them on separate threads instead of one
     # after another overlaps their `gh` subprocess wait time.
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=3) as pool:
         open_pull_requests = pool.submit(client.list_open_board_pull_requests)
         merged_pull_requests = pool.submit(
             client.list_recent_merged_board_pull_requests, since
         )
+        blocker_references = pool.submit(client.list_board_blockers, blockers)
         pull_requests = (open_pull_requests.result(), merged_pull_requests.result())
     return board.build_board(
         issues,
         *pull_requests,
         claims,
         board.load_config(toplevel / ".agent-claim" / "board.toml"),
+        blocker_references=blocker_references.result(),
         now=now,
         trunk_landings=checkout.trunk_landing_times(),
     )
@@ -999,18 +1002,21 @@ def _parent_line_checks(title: str, body: str) -> tuple[SliceCheck, ...]:
 
 
 def _body_contract_checks(
-    repository: str, open_by_number: dict[int, board.Issue], contract: board.Contract
+    contract: board.Contract, blocker_references: tuple[board.BlockerReference, ...]
 ) -> tuple[SliceCheck, ...]:
     checks = [SliceCheck("error", "body-contract", defect.message) for defect in contract.defects]
+    blocker_by_number = {reference.number: reference for reference in blocker_references}
     for blocker in contract.blocker_issues:
-        state, _title, _body = _issue_reference_state(repository, open_by_number, blocker)
-        if state is ReferenceState.CLOSED:
+        reference = blocker_by_number[blocker]
+        if reference.is_pull_request:
+            continue
+        if reference.state is board.BlockerState.CLOSED:
             checks.append(
                 SliceCheck(
                     "error", "closed-blocker", f"blocker #{blocker} is closed", issue=blocker
                 )
             )
-        elif state is ReferenceState.MISSING:
+        elif reference.state is board.BlockerState.MISSING:
             checks.append(
                 SliceCheck(
                     "error",
@@ -1044,8 +1050,10 @@ def _slice_rule_checks(
                 "error", "missing-issue", f"issue #{issue} does not exist here", issue=issue
             )
         )
+    item = next((item for item in projected.items if item.number == issue), None)
+    if item is not None:
+        checks.extend(_body_contract_checks(item.contract, projected.blocker_references))
     if body is not None:
-        checks.extend(_body_contract_checks(repository, open_by_number, board.parse_contract(body)))
         for entry in board.parse_slice_table(body):
             checks.extend(_slice_table_entry_checks(repository, open_by_number, entry))
     if title is not None and body is not None:

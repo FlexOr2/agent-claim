@@ -64,6 +64,10 @@ GH_QUIET_ENVIRONMENT = {
     "NO_COLOR": "1",
     "GH_NO_UPDATE_NOTIFIER": "1",
 }
+API_BLOCKER_STATES: dict[str, board.BlockerState] = {
+    "open": board.BlockerState.OPEN,
+    "closed": board.BlockerState.CLOSED,
+}
 
 
 def github_command_environment() -> dict[str, str]:
@@ -427,6 +431,68 @@ class GitHubIssueComments:
             for value in values
             if not (isinstance(value, dict) and value.get("isPullRequest"))
         )
+
+    def _board_blocker(self, number: int) -> board.BlockerReference:
+        try:
+            raw = self._run(
+                [
+                    "api",
+                    f"repos/{self.repository}/issues/{number}",
+                    "--jq",
+                    '{number,state,closedAt:.closed_at,isPullRequest:has("pull_request")}',
+                ]
+            )
+        except ClaimError as error:
+            if "HTTP 404" in str(error):
+                return board.BlockerReference(number, board.BlockerState.MISSING, False)
+            raise
+        values = self._json_lines(raw, "board blocker")
+        if len(values) != 1 or not isinstance(values[0], dict):
+            raise ClaimError("GitHub returned a malformed board blocker")
+        value = values[0]
+        returned_number = value.get("number")
+        state = value.get("state")
+        closed_at = value.get("closedAt")
+        is_pull_request = value.get("isPullRequest")
+        blocker_state = API_BLOCKER_STATES.get(state) if isinstance(state, str) else None
+        if (
+            isinstance(returned_number, bool)
+            or returned_number != number
+            or blocker_state is None
+            or not isinstance(is_pull_request, bool)
+            or (closed_at is not None and not isinstance(closed_at, str))
+            or (
+                isinstance(closed_at, str)
+                and TIMESTAMP_PATTERN.fullmatch(closed_at) is None
+            )
+            or (blocker_state is board.BlockerState.CLOSED and closed_at is None)
+        ):
+            raise ClaimError("GitHub returned a malformed board blocker")
+        parsed_closed_at = None
+        if closed_at is not None:
+            try:
+                parsed_closed_at = datetime.fromisoformat(closed_at.replace("Z", "+00:00"))
+            except ValueError as error:
+                raise ClaimError("GitHub returned a malformed board blocker") from error
+            if parsed_closed_at.tzinfo is None:
+                raise ClaimError("GitHub returned a malformed board blocker")
+            parsed_closed_at = parsed_closed_at.astimezone(timezone.utc)
+        return board.BlockerReference(
+            number,
+            blocker_state,
+            is_pull_request,
+            parsed_closed_at,
+        )
+
+    def list_board_blockers(
+        self, numbers: frozenset[int]
+    ) -> tuple[board.BlockerReference, ...]:
+        if not numbers:
+            return ()
+        with ThreadPoolExecutor(
+            max_workers=min(len(numbers), PARALLEL_FETCH_CONCURRENCY)
+        ) as pool:
+            return tuple(pool.map(self._board_blocker, sorted(numbers)))
 
     def list_open_board_pull_requests(self) -> tuple[board.PullRequest, ...]:
         raw = self._run(
