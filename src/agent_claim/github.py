@@ -64,6 +64,10 @@ GH_QUIET_ENVIRONMENT = {
     "NO_COLOR": "1",
     "GH_NO_UPDATE_NOTIFIER": "1",
 }
+API_BLOCKER_STATES: dict[str, board.BlockerState] = {
+    "open": board.BlockerState.OPEN,
+    "closed": board.BlockerState.CLOSED,
+}
 
 
 def github_command_environment() -> dict[str, str]:
@@ -450,17 +454,18 @@ class GitHubIssueComments:
         state = value.get("state")
         closed_at = value.get("closedAt")
         is_pull_request = value.get("isPullRequest")
+        blocker_state = API_BLOCKER_STATES.get(state) if isinstance(state, str) else None
         if (
             isinstance(returned_number, bool)
             or returned_number != number
-            or state not in {member.value for member in board.BlockerState}
+            or blocker_state is None
             or not isinstance(is_pull_request, bool)
             or (closed_at is not None and not isinstance(closed_at, str))
             or (
                 isinstance(closed_at, str)
                 and TIMESTAMP_PATTERN.fullmatch(closed_at) is None
             )
-            or (state == board.BlockerState.CLOSED.value and closed_at is None)
+            or (blocker_state is board.BlockerState.CLOSED and closed_at is None)
         ):
             raise ClaimError("GitHub returned a malformed board blocker")
         parsed_closed_at = None
@@ -474,7 +479,7 @@ class GitHubIssueComments:
             parsed_closed_at = parsed_closed_at.astimezone(timezone.utc)
         return board.BlockerReference(
             number,
-            board.BlockerState(state),
+            blocker_state,
             is_pull_request,
             parsed_closed_at,
         )

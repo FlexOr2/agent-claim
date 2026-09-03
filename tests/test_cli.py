@@ -4,6 +4,7 @@ import io
 import json
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -451,7 +452,7 @@ class FakeComments:
         if self.board_blocker_references is not None:
             return self.board_blocker_references
         pull_request_numbers = {
-            pull_request.number for pull_request in self.board_open_pull_requests
+            pull_request.number for pull_request in self.list_open_board_pull_requests()
         }
         return tuple(
             board.BlockerReference(
@@ -703,6 +704,7 @@ def test_board_projects_fixture_json_without_github_writes(
 
     assert issue_claim.main(["--repo", "example/agent-claim", "board", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
+    assert set(payload) == {"items", "ready_now", "stale"}
     first = payload["items"][0]
     ten = next(item for item in payload["items"] if item["number"] == 10)
     eleven = next(item for item in payload["items"] if item["number"] == 11)
@@ -962,6 +964,17 @@ def _configured_board_client(
     return client
 
 
+@pytest.fixture
+def open_blocker_references() -> Callable[[frozenset[int]], tuple[board.BlockerReference, ...]]:
+    def references(numbers: frozenset[int]) -> tuple[board.BlockerReference, ...]:
+        return tuple(
+            board.BlockerReference(number, board.BlockerState.OPEN, False)
+            for number in sorted(numbers)
+        )
+
+    return references
+
+
 def _stub_issue_reference(
     monkeypatch: pytest.MonkeyPatch,
     states: dict[int, tuple["issue_claim.ReferenceState", str, str]],
@@ -1213,13 +1226,13 @@ def test_next_pulls_an_unruled_item_and_names_only_unworkable_ones_as_skipped(
 
 
 @pytest.mark.parametrize(
-    ("blocked_by", "blocker_references"),
+    ("blocked_by", "blocker_references", "open_pull_requests"),
     [
-        pytest.param("#62 holds the files", (), id="prose"),
-        pytest.param("70705e98f9f34fdf9a88fc758b4f3f74", (), id="claim-id"),
-        pytest.param("codex/issue-90-claim-gate", (), id="branch"),
-        pytest.param("PR #62", (), id="pull-request"),
-        pytest.param("None", (), id="none"),
+        pytest.param("#62 holds the files", (), (), id="prose"),
+        pytest.param("70705e98f9f34fdf9a88fc758b4f3f74", (), (), id="claim-id"),
+        pytest.param("codex/issue-90-claim-gate", (), (), id="branch"),
+        pytest.param("PR #62", (), (), id="pull-request"),
+        pytest.param("None", (), (), id="none"),
         pytest.param(
             "#9",
             (
@@ -1230,7 +1243,14 @@ def test_next_pulls_an_unruled_item_and_names_only_unworkable_ones_as_skipped(
                     datetime(2026, 8, 20, tzinfo=timezone.utc),
                 ),
             ),
+            (),
             id="closed-issue",
+        ),
+        pytest.param(
+            "#62",
+            (),
+            (board.PullRequest(62, "Open pull request", "", "branch"),),
+            id="open-pull-request",
         ),
     ],
 )
@@ -1240,6 +1260,7 @@ def test_claim_refuses_non_issue_or_closed_blockers_before_mutation(
     tmp_path: Path,
     blocked_by: str,
     blocker_references: tuple[board.BlockerReference, ...],
+    open_pull_requests: tuple[board.PullRequest, ...],
 ) -> None:
     issue = board_issue(
         10,
@@ -1247,9 +1268,14 @@ def test_claim_refuses_non_issue_or_closed_blockers_before_mutation(
         complete_contract("Claim #10.", blocked_by=blocked_by),
         labels=("security",),
     )
-    client = _configured_board_client(monkeypatch, tmp_path, open_issues=(issue,))
+    client = _configured_board_client(
+        monkeypatch,
+        tmp_path,
+        open_issues=(issue,),
+        open_pull_requests=open_pull_requests,
+    )
     client.board_blocker_references = blocker_references or None
-    if blocker_references:
+    if blocker_references or open_pull_requests:
         monkeypatch.setattr(
             issue_claim,
             "_fetch_issue_reference",
@@ -1276,45 +1302,6 @@ def test_claim_refuses_non_issue_or_closed_blockers_before_mutation(
     )
 
     assert "ERROR:" in capsys.readouterr().err
-    assert client.comments[LEDGER_ISSUE] == []
-
-
-def test_claim_refuses_an_open_pull_request_blocker_before_mutation(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
-) -> None:
-    issue = board_issue(
-        10,
-        "Work",
-        complete_contract("Claim #10.", blocked_by="#62"),
-        labels=("security",),
-    )
-    client = _configured_board_client(monkeypatch, tmp_path, open_issues=(issue,))
-    client.board_blocker_references = (
-        board.BlockerReference(62, board.BlockerState.OPEN, True),
-    )
-    monkeypatch.setattr(
-        issue_claim,
-        "_fetch_issue_reference",
-        lambda _repository, _number: pytest.fail("claim must reuse board blocker state"),
-    )
-    monkeypatch.setattr(
-        issue_claim, "_request", lambda _arguments: request(issue=10, scope=("src/work.py",))
-    )
-
-    assert issue_claim.main(
-        [
-            "--repo",
-            "example/agent-claim",
-            "claim",
-            "10",
-            "--agent",
-            "Codex Sol",
-            "--scope",
-            "src/work.py",
-        ]
-    ) == 2
-
-    assert "blocker #62 is a pull request" in capsys.readouterr().err
     assert client.comments[LEDGER_ISSUE] == []
 
 
@@ -2662,7 +2649,9 @@ def test_board_ignores_fenced_projection_examples() -> None:
 
 
 def test_board_reads_priority_configuration_from_the_checkout_root(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    open_blocker_references: Callable[[frozenset[int]], tuple[board.BlockerReference, ...]],
 ) -> None:
     toplevel = tmp_path / "checkout"
     configuration_directory = toplevel / ".agent-claim"
@@ -2703,10 +2692,7 @@ def test_board_reads_priority_configuration_from_the_checkout_root(
         def list_board_blockers(
             self, numbers: frozenset[int]
         ) -> tuple[board.BlockerReference, ...]:
-            return tuple(
-                board.BlockerReference(number, board.BlockerState.OPEN, False)
-                for number in sorted(numbers)
-            )
+            return open_blocker_references(numbers)
 
         def list_open_board_pull_requests(self) -> tuple[board.PullRequest, ...]:
             return ()
@@ -2796,7 +2782,45 @@ def test_board_never_counts_an_open_pull_request_as_a_blocker() -> None:
     )
 
 
-def test_board_records_the_latest_closed_issue_blocker() -> None:
+@pytest.mark.parametrize(
+    ("blocker_references", "expected_freed_on"),
+    [
+        pytest.param(
+            (
+                board.BlockerReference(
+                    10,
+                    board.BlockerState.CLOSED,
+                    False,
+                    datetime(2026, 9, 1, tzinfo=timezone.utc),
+                ),
+                board.BlockerReference(11, board.BlockerState.OPEN, False),
+            ),
+            None,
+            id="one-blocker-remains-open",
+        ),
+        pytest.param(
+            (
+                board.BlockerReference(
+                    10,
+                    board.BlockerState.CLOSED,
+                    False,
+                    datetime(2026, 9, 1, tzinfo=timezone.utc),
+                ),
+                board.BlockerReference(
+                    11,
+                    board.BlockerState.CLOSED,
+                    False,
+                    datetime(2026, 9, 3, tzinfo=timezone.utc),
+                ),
+            ),
+            datetime(2026, 9, 3, tzinfo=timezone.utc),
+            id="all-blockers-closed",
+        ),
+    ],
+)
+def test_board_records_the_latest_closed_issue_blocker(
+    blocker_references: tuple[board.BlockerReference, ...], expected_freed_on: datetime | None
+) -> None:
     freed = board_issue(
         20, "Freed", complete_contract("Ship it.", blocked_by="#10, #11")
     )
@@ -2808,19 +2832,12 @@ def test_board_records_the_latest_closed_issue_blocker() -> None:
         (),
         (),
         board.BoardConfig(),
-        blocker_references=(
-            board.BlockerReference(
-                10, board.BlockerState.CLOSED, False, datetime(2026, 9, 1, tzinfo=timezone.utc)
-            ),
-            board.BlockerReference(
-                11, board.BlockerState.CLOSED, False, datetime(2026, 9, 3, tzinfo=timezone.utc)
-            ),
-        ),
+        blocker_references=blocker_references,
         now=datetime(2026, 9, 5, tzinfo=timezone.utc),
     )
     by_number = {item.number: item for item in projected.items}
 
-    assert by_number[20].freed_on == datetime(2026, 9, 3, tzinfo=timezone.utc)
+    assert by_number[20].freed_on == expected_freed_on
     assert by_number[21].freed_on is None
 
 
@@ -3007,7 +3024,9 @@ def test_a_fenced_closing_keyword_confers_no_stage() -> None:
 
 
 def test_board_queries_merged_pull_requests_back_to_the_oldest_open_issue(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    open_blocker_references: Callable[[frozenset[int]], tuple[board.BlockerReference, ...]],
 ) -> None:
     old_epic = replace(
         board_issue(70, "Epic open for months", complete_contract("Cut the next slice.")),
@@ -3023,10 +3042,7 @@ def test_board_queries_merged_pull_requests_back_to_the_oldest_open_issue(
         def list_board_blockers(
             self, numbers: frozenset[int]
         ) -> tuple[board.BlockerReference, ...]:
-            return tuple(
-                board.BlockerReference(number, board.BlockerState.OPEN, False)
-                for number in sorted(numbers)
-            )
+            return open_blocker_references(numbers)
 
         def list_open_board_pull_requests(self) -> tuple[board.PullRequest, ...]:
             return ()
@@ -3048,7 +3064,9 @@ def test_board_queries_merged_pull_requests_back_to_the_oldest_open_issue(
 
 
 def test_board_loads_each_distinct_blocker_once(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    open_blocker_references: Callable[[frozenset[int]], tuple[board.BlockerReference, ...]],
 ) -> None:
     first = board_issue(80, "First", complete_contract("Ship it.", blocked_by="#90, #91"))
     second = board_issue(81, "Second", complete_contract("Ship it.", blocked_by="#90"))
@@ -3062,10 +3080,7 @@ def test_board_loads_each_distinct_blocker_once(
             self, numbers: frozenset[int]
         ) -> tuple[board.BlockerReference, ...]:
             observed.append(numbers)
-            return tuple(
-                board.BlockerReference(number, board.BlockerState.OPEN, False)
-                for number in sorted(numbers)
-            )
+            return open_blocker_references(numbers)
 
         def list_open_board_pull_requests(self) -> tuple[board.PullRequest, ...]:
             return ()
@@ -5314,8 +5329,34 @@ def test_github_comment_reader_fetches_pages_concurrently_until_a_short_page(
     assert any("page=2" in call[1] for call in calls)
 
 
-def test_github_reads_closed_blocker_closed_at(
+@pytest.mark.parametrize(
+    ("state", "closed_at", "is_pull_request", "expected_state", "expected_closed_at"),
+    [
+        pytest.param(
+            "closed",
+            "2026-09-03T12:00:00Z",
+            False,
+            board.BlockerState.CLOSED,
+            datetime(2026, 9, 3, 12, tzinfo=timezone.utc),
+            id="closed-issue",
+        ),
+        pytest.param(
+            "open",
+            None,
+            True,
+            board.BlockerState.OPEN,
+            None,
+            id="open-pull-request",
+        ),
+    ],
+)
+def test_github_reads_blocker_state_and_pull_request_kind(
     monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    closed_at: str | None,
+    is_pull_request: bool,
+    expected_state: board.BlockerState,
+    expected_closed_at: datetime | None,
 ) -> None:
     client = GitHubIssueComments("example/agent-claim")
     observed: list[list[str]] = []
@@ -5325,9 +5366,9 @@ def test_github_reads_closed_blocker_closed_at(
         return json.dumps(
             {
                 "number": 86,
-                "state": "closed",
-                "closedAt": "2026-09-03T12:00:00Z",
-                "isPullRequest": False,
+                "state": state,
+                "closedAt": closed_at,
+                "isPullRequest": is_pull_request,
             }
         )
 
@@ -5336,9 +5377,9 @@ def test_github_reads_closed_blocker_closed_at(
     assert client.list_board_blockers(frozenset({86})) == (
         board.BlockerReference(
             86,
-            board.BlockerState.CLOSED,
-            False,
-            datetime(2026, 9, 3, 12, tzinfo=timezone.utc),
+            expected_state,
+            is_pull_request,
+            expected_closed_at,
         ),
     )
     assert observed == [
@@ -5349,6 +5390,36 @@ def test_github_reads_closed_blocker_closed_at(
             "{number,state,closedAt:.closed_at,isPullRequest:has(\"pull_request\")}",
         ]
     ]
+
+
+@pytest.mark.parametrize("state", ["missing", "unknown"])
+def test_github_rejects_blocker_states_the_api_cannot_return(
+    monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    client = GitHubIssueComments("example/agent-claim")
+    monkeypatch.setattr(
+        client,
+        "_run",
+        lambda _arguments: json.dumps(
+            {"number": 86, "state": state, "closedAt": None, "isPullRequest": False}
+        ),
+    )
+
+    with pytest.raises(ClaimError, match="malformed board blocker"):
+        client.list_board_blockers(frozenset({86}))
+
+
+def test_github_marks_a_missing_blocker_only_after_a_404(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = GitHubIssueComments("example/agent-claim")
+    monkeypatch.setattr(
+        client,
+        "_run",
+        lambda _arguments: (_ for _ in ()).throw(ClaimError("GitHub API failed: HTTP 404")),
+    )
+
+    assert client.list_board_blockers(frozenset({86})) == (
+        board.BlockerReference(86, board.BlockerState.MISSING, False),
+    )
 
 
 def _comment_row(identifier: int, body: str = "ordinary prose") -> dict[str, object]:
