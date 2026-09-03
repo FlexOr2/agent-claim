@@ -1218,18 +1218,22 @@ def main(arguments: list[str] | None = None) -> int:
             target_issue: int | None = None
             if isinstance(requested.identity, protocol.IssueIdentity):
                 target_issue = requested.identity.issue
-                open_issues = client.list_open_board_issues()
-                open_by_number = {issue.number: issue for issue in open_issues}
-                projected = _board(
-                    client, protocol._ledger_claims(client), issues=open_issues
+                replayed = protocol.matching_claim_retry(
+                    protocol._ledger_claims(client), requested
                 )
-                checks = _slice_rule_checks(
-                    repository,
-                    open_by_number,
-                    target_issue,
-                    projected,
-                    requested.out_of_order_reason,
-                )
+                if replayed is None:
+                    open_issues = client.list_open_board_issues()
+                    open_by_number = {issue.number: issue for issue in open_issues}
+                    projected = _board(
+                        client, protocol._ledger_claims(client), issues=open_issues
+                    )
+                    checks = _slice_rule_checks(
+                        repository,
+                        open_by_number,
+                        target_issue,
+                        projected,
+                        requested.out_of_order_reason,
+                    )
             if any(check.level == "error" for check in checks):
                 return _refuse_claim(parsed.json, target_issue, checks)
             for check in checks:
