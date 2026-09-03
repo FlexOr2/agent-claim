@@ -6981,9 +6981,23 @@ def test_cli_claim_replay_reports_the_matching_live_claim_after_an_interrupted_r
     assert len(client.comments[LEDGER_ISSUE]) == 1
 
 
-def test_cli_claim_replay_refuses_a_non_matching_live_claim(
+@pytest.mark.parametrize(
+    ("agent", "role", "branch", "scope"),
+    [
+        ("Grok 4.6", "builder", "codex/issue-72", ("src",)),
+        ("Ada", "reviewer", "codex/issue-72", ("src",)),
+        ("Ada", "builder", "codex/issue-72-retry", ("src",)),
+        ("Ada", "builder", "codex/issue-72", ("src", "tests")),
+    ],
+    ids=["agent", "role", "branch", "scope"],
+)
+def test_cli_claim_replay_refuses_a_live_claim_with_different_retry_fields(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    agent: str,
+    role: str,
+    branch: str,
+    scope: tuple[str, ...],
 ) -> None:
     client = _claims_client(
         request("live-claim", "Ada", issue=72, branch="codex/issue-72", scope=("src",))
@@ -7000,13 +7014,104 @@ def test_cli_claim_replay_refuses_a_non_matching_live_claim(
                 "claim",
                 "72",
                 "--agent",
+                agent,
+                "--role",
+                role,
+                "--base",
+                BASE,
+                "--branch",
+                branch,
+                *(part for path in scope for part in ("--scope", path)),
+            ]
+        )
+        == 2
+    )
+
+    assert "ERROR: issue #72 is claimed by Ada (builder)" in capsys.readouterr().err
+    assert len(client.comments[LEDGER_ISSUE]) == 1
+
+
+def test_cli_claim_replay_skips_out_of_order_for_the_matching_lower_priority_item(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    existing = request(
+        "live-claim", "Ada", issue=10, branch="codex/issue-10", scope=("src",)
+    )
+    client = _claims_client(existing)
+    client.board_issues = (
+        board_issue(10, "Lower work", complete_contract("Claim #10.")),
+        board_issue(11, "Top work", complete_contract("Claim #11.")),
+        board_issue(12, "Depends on top", "## Blocked by\n#11"),
+    )
+    _patch_status_cli(monkeypatch, client)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+    monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+    monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
+
+    assert (
+        issue_claim.main(
+            [
+                "--repo",
+                "example/agent-claim",
+                "claim",
+                "10",
+                "--agent",
+                "Ada",
+                "--role",
+                "builder",
+                "--base",
+                BASE,
+                "--branch",
+                "codex/issue-10",
+                "--scope",
+                "src",
+            ]
+        )
+        == 0
+    )
+
+    assert "out-of-order" not in capsys.readouterr().out
+    assert len(client.comments[LEDGER_ISSUE]) == 1
+
+
+def test_cli_claim_replay_does_not_bypass_out_of_order_for_another_agent(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    existing = request(
+        "live-claim", "Ada", issue=10, branch="codex/issue-10", scope=("src",)
+    )
+    client = _claims_client(existing)
+    client.board_issues = (
+        board_issue(10, "Lower work", complete_contract("Claim #10.")),
+        board_issue(11, "Top work", complete_contract("Claim #11.")),
+        board_issue(12, "Depends on top", "## Blocked by\n#11"),
+    )
+    _patch_status_cli(monkeypatch, client)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+    monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
+    monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
+
+    assert (
+        issue_claim.main(
+            [
+                "--repo",
+                "example/agent-claim",
+                "claim",
+                "10",
+                "--agent",
                 "Grok 4.6",
                 "--role",
                 "builder",
                 "--base",
                 BASE,
                 "--branch",
-                "codex/issue-72",
+                "codex/issue-10",
                 "--scope",
                 "src",
             ]
@@ -7014,7 +7119,7 @@ def test_cli_claim_replay_refuses_a_non_matching_live_claim(
         == 2
     )
 
-    assert "ERROR: issue #72 is claimed by Ada (builder)" in capsys.readouterr().err
+    assert "ERROR: higher-priority actionable item #11" in capsys.readouterr().err
     assert len(client.comments[LEDGER_ISSUE]) == 1
 
 

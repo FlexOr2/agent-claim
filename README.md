@@ -34,10 +34,11 @@ Missing or present-invalid identity fails closed before GitHub work. Omitted
 `--role` on `claim` is `builder`; an explicit `--role` wins. Repeating an
 interrupted `claim` for the same active item, agent, role, branch, and scope
 returns that active claim's existing ID without posting a second claim. A
-different live claim still fails; a released claim ID remains terminal. Omitted `--claim-id`
-on `release` selects the unique active claim on that issue or lane whose agent
-is this session and whose branch is the current checkout; otherwise it fails
-closed.
+different live claim still fails; a released claim ID remains terminal.
+
+Omitted `--claim-id` on `release` selects the unique active claim on that issue
+or lane whose agent is this session and whose branch is the current checkout;
+otherwise it fails closed.
 Omitted `--role` on `release` uses that selected claim's role; an explicit
 `--role` must still match unless `--coordinator-override`. Omitted `--reason` on
 `release` is `landed`. `--coordinator-override` still requires `--role coordinator` and
