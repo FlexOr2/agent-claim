@@ -237,6 +237,7 @@ class BoardItem:
     next_step: str | None
     contract_complete: bool
     expectation_state: ExpectationState
+    expectation_progress: ExpectationProgress
     ruling_landings: int | None
     ruling_old: bool | None
     frozen_trigger: str | None
@@ -865,6 +866,7 @@ def build_board(
     for issue in issues:
         contract = contracts[issue.number]
         expectations = expectation_state(issue.body)
+        progress = expectation_progress(issue.body)
         ruling_landings, ruling_old = ruling_freshness(issue.body, trunk_landings)
         frozen = frozen_trigger(issue.body)
         claim = claims_by_issue.get(issue.number)
@@ -918,6 +920,7 @@ def build_board(
                 next_step=next_step,
                 contract_complete=contract.complete,
                 expectation_state=expectations,
+                expectation_progress=progress,
                 ruling_landings=ruling_landings,
                 ruling_old=ruling_old,
                 frozen_trigger=frozen,
@@ -1053,7 +1056,7 @@ def _expectation_cell(item: BoardItem) -> str:
     if item.expectation_state is ExpectationState.NONE:
         return "-"
     if item.expectation_state is ExpectationState.PROPOSED:
-        return item.expectation_state.value
+        return f"{item.expectation_progress.open}/{item.expectation_progress.total}"
     count = 0 if item.ruling_landings is None else item.ruling_landings
     suffix = " old" if item.ruling_old else ""
     return f"ruled {count}{suffix}"

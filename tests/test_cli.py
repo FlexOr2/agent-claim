@@ -702,7 +702,7 @@ def test_board_projects_fixture_json_without_github_writes(
     assert 11 not in [item["number"] for item in payload["ready_now"]]
 
 
-def test_board_exposes_all_expectation_states(
+def test_board_shows_open_and_total_instead_of_proposed(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     issues = (
@@ -712,7 +712,10 @@ def test_board_exposes_all_expectation_states(
             "Proposed expectations",
             complete_contract("Claim #11.")
             + "\n\n"
-            + expectation_block("- Name it. *(Default: no)*"),
+            + expectation_block(
+                "- Name it. *(geregelt: ja)*",
+                "- Settle it. *(Default: no)*",
+            ),
         ),
         board_issue(
             12,
@@ -734,22 +737,23 @@ def test_board_exposes_all_expectation_states(
     assert issue_claim.main(["--repo", "example/agent-claim", "board"]) == 0
     rendered = capsys.readouterr().out
     assert "EXPECT" in rendered
-    assert "-         Claim #10." in next(
-        line for line in rendered.splitlines() if "No expectations" in line
-    )
-    assert "proposed  Claim #11." in next(
+    no_expectations = next(line for line in rendered.splitlines() if "No expectations" in line)
+    proposed_expectations = next(
         line for line in rendered.splitlines() if "Proposed expectations" in line
     )
-    assert "ruled 0   Claim #12." in next(
+    ruled_expectations = next(
         line for line in rendered.splitlines() if "Ruled expectations" in line
     )
+    assert "-" in no_expectations
+    assert "1/2" in proposed_expectations
+    assert "proposed" not in proposed_expectations
+    assert "ruled 0" in ruled_expectations
 
     assert issue_claim.main(["--repo", "example/agent-claim", "board", "--json"]) == 0
-    expectation_states = {
-        item["number"]: item["expectation_state"]
-        for item in json.loads(capsys.readouterr().out)["items"]
-    }
+    items = {item["number"]: item for item in json.loads(capsys.readouterr().out)["items"]}
+    expectation_states = {number: item["expectation_state"] for number, item in items.items()}
     assert expectation_states == {10: "-", 11: "proposed", 12: "ruled"}
+    assert items[11]["expectation_progress"] == {"open": 1, "total": 2}
 
 
 def test_rulings_lists_open_expectations_by_board_priority_then_open_count(
