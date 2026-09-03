@@ -215,6 +215,12 @@ class ExpectationState(StrEnum):
 
 
 @dataclass(frozen=True)
+class ExpectationProgress:
+    open: int
+    total: int
+
+
+@dataclass(frozen=True)
 class BoardItem:
     number: int
     title: str
@@ -314,6 +320,14 @@ def _expectation_block_text(body: str, heading: re.Match[str]) -> str:
     return body[heading.end() : next_heading.start() if next_heading is not None else len(body)]
 
 
+def _expectation_lines(body: str, heading: re.Match[str]) -> tuple[str, ...]:
+    return tuple(
+        line.strip()
+        for line in _expectation_block_text(body, heading).splitlines()
+        if EXPECTATION_LINE_SHAPE_PATTERN.match(line.strip())
+    )
+
+
 def _expectation_block_state(body: str, heading: re.Match[str]) -> ExpectationState:
     """The state of one expectation block.
 
@@ -361,6 +375,17 @@ def expectation_state(body: str) -> ExpectationState:
     if any(state is ExpectationState.PROPOSED for state in block_states):
         return ExpectationState.PROPOSED
     return ExpectationState.RULED
+
+
+def expectation_progress(body: str) -> ExpectationProgress:
+    lines = tuple(
+        line
+        for heading in EXPECTATION_HEADING_PATTERN.finditer(body)
+        for line in _expectation_lines(body, heading)
+    )
+    return ExpectationProgress(
+        open=sum(not RULED_EXPECTATION_PATTERN.search(line) for line in lines), total=len(lines)
+    )
 
 
 def _parse_dotted_date(day: str, month: str, year: str) -> date:

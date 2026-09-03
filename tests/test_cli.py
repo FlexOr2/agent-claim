@@ -9583,6 +9583,27 @@ def test_one_unruled_block_among_ruled_ones_keeps_the_item_proposed() -> None:
     assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
 
 
+def test_expectation_progress_counts_open_and_total_lines_across_blocks() -> None:
+    body = (
+        expectation_block(
+            "- Create it. *(geregelt: ja)*",
+            "- Change it without a ruling.",
+            "Explanation prose is not an expectation line.",
+            heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
+        )
+        + "\n\n"
+        + expectation_block(
+            "1. Remove it. *(geregelt: NEIN)*",
+            "2. Keep it. *(geregelt: maybe)*",
+            "3. Scale it. *(geregelt: ja)*",
+            heading="Erwartungen aus echter Benutzung",
+        )
+    )
+
+    assert board.expectation_state(body) is board.ExpectationState.PROPOSED
+    assert board.expectation_progress(body) == board.ExpectationProgress(open=2, total=5)
+
+
 def test_a_new_line_without_its_own_marker_stays_proposed_under_a_ruled_heading() -> None:
     """Codex review of #78 (finding 1): a ruled heading only excuses prose, tables,
     examples and sub-headings — not a list item shaped like an expectation
