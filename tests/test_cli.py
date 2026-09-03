@@ -773,8 +773,8 @@ def test_rulings_lists_open_expectations_by_board_priority_then_open_count(
         rulings_issue(
             10,
             "Earlier security tie",
-            open_lines=1,
-            total_lines=2,
+            open_lines=2,
+            total_lines=3,
             labels=("security",),
         ),
         rulings_issue(
@@ -809,8 +809,8 @@ def test_rulings_lists_open_expectations_by_board_priority_then_open_count(
     assert issue_claim.main(["--repo", "example/agent-claim", "rulings"]) == 0
     assert capsys.readouterr().out.splitlines() == [
         "#50 2/3: In-flight security work",
-        "#10 1/2: Earlier security tie",
         "#30 1/2: Later security tie",
+        "#10 2/3: Earlier security tie",
         "#40 2/3: More open security work",
         "#60 1/1: Lower-priority product work",
     ]
