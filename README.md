@@ -153,9 +153,9 @@ expectations never withhold an item; the pulled item carries `Erwartungen
 ungeregelt, beim Ziehen zuerst refinen` instead, and an item ruled long ago
 carries `vor N Landungen geregelt, beim Ziehen neu refinen` (both as the JSON
 `ruling_hint`). Items that genuinely cannot be worked — claimed, blocked by an
-open issue, frozen, or without a complete contract or configured projectionless
-idea — are named with that reason under `SKIPPED` (also in the JSON `skipped`
-list), and `next` exits 3 when none qualifies.
+open issue, frozen, or without a complete contract when they are not a
+configured projectionless idea — are named with that reason under `SKIPPED`
+(also in the JSON `skipped` list), and `next` exits 3 when none qualifies.
 `claim` refuses work out of order when a higher-priority actionable item — the
 same order `board` and `next` use — is free. Pass `--out-of-order REASON` to
 proceed deliberately; it remains visible as a warning and preserves the reason
