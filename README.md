@@ -113,9 +113,10 @@ verified relation, so an unrelated pull request naming the same issue twice
 by coincidence would still credit it.
 
 The table exposes which exact contract headings were found, an
-`EXPECT` state (`-`, `proposed`, or `ruled N` / `ruled N old`), a concise `Next`, and a CLAIM
+`EXPECT` cell (`-`, `OPEN/TOTAL`, or `ruled N` / `ruled N old`), a concise `Next`, and a CLAIM
 cell with `-` or the agent, role, claim age, and `old` when the claim comment
-is older than one hour; JSON includes the complete derived contract state. An `Erwartung`, `Erwartungen`, or
+is older than one hour; JSON includes the complete derived contract state and
+the same open/total expectation progress. An `Erwartung`, `Erwartungen`, or
 `Erwartungsliste` heading makes the following block an expectation list: a line
 with `*(Default: yes|no|later)*` is proposed. A block is ruled only when every
 expectation line carries a `*(geregelt: ja)*` or `*(geregelt: NEIN ...)*`
