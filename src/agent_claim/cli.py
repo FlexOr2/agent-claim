@@ -297,7 +297,10 @@ def _parser() -> argparse.ArgumentParser:
     claim.add_argument(
         "--out-of-order",
         metavar="REASON",
-        help="required to claim ahead of a higher-priority actionable item; records why",
+        help=(
+            "refuses a claim without a reason when a higher-priority actionable item is "
+            "free; records why"
+        ),
     )
     claim.add_argument(
         "--allow-directory",

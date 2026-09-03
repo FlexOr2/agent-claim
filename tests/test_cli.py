@@ -1107,6 +1107,19 @@ def test_claim_refuses_when_the_higher_priority_item_needs_refining(
     assert client.comments[LEDGER_ISSUE] == []
 
 
+def test_claim_help_names_the_out_of_order_refusal(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exited:
+        issue_claim.main(["claim", "--help"])
+
+    assert exited.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "refuse" in help_text
+    assert "without a reason" in help_text
+    assert "priority actionable item is free" in help_text
+
+
 def test_claim_refuses_out_of_order_without_a_reason_before_mutating(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1201,7 +1214,7 @@ def test_claim_refuses_for_a_higher_priority_item_even_at_a_lower_score(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     """`board`/`next` rank a labelled blocker ahead of an unlabelled item even
-    when the blocker scores lower; the out-of-order warning must agree, or
+    when the blocker scores lower; the out-of-order refusal must agree, or
     claiming the unlabelled item would silently skip past the very item
     `next` would have named.
     """
