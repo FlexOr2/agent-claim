@@ -2841,6 +2841,69 @@ def test_board_records_the_latest_closed_issue_blocker(
     assert by_number[21].freed_on is None
 
 
+def test_board_reports_when_the_last_stale_blocker_closed() -> None:
+    dependent = board_issue(
+        20, "Freed", complete_contract("Ship it.", blocked_by="#10, #11")
+    )
+    blockers = (
+        board.BlockerReference(
+            10, board.BlockerState.CLOSED, False, datetime(2026, 9, 1, tzinfo=timezone.utc)
+        ),
+        board.BlockerReference(
+            11, board.BlockerState.CLOSED, False, datetime(2026, 9, 3, tzinfo=timezone.utc)
+        ),
+    )
+
+    projected = board.build_board(
+        (dependent,), (), (), (), board.BoardConfig(),
+        blocker_references=blockers,
+        now=datetime(2026, 9, 5, tzinfo=timezone.utc),
+    )
+
+    item = json.loads(board.board_json(projected))["items"][0]
+    assert item["freed_on"] == "2026-09-03"
+    assert item["freed_days"] == 2
+
+
+def test_board_text_and_json_show_freed_on_and_freed_days() -> None:
+    freed = board_issue(20, "Freed", complete_contract("Ship it.", blocked_by="#10"))
+    blocked = board_issue(21, "Blocked", complete_contract("Ship it.", blocked_by="#11"))
+    unblocked = board_issue(22, "Never blocked", complete_contract("Ship it."))
+    blockers = (
+        board.BlockerReference(
+            10, board.BlockerState.CLOSED, False, datetime(2026, 9, 3, tzinfo=timezone.utc)
+        ),
+        board.BlockerReference(11, board.BlockerState.OPEN, False),
+    )
+
+    projected = board.build_board(
+        (freed, blocked, unblocked), (), (), (), board.BoardConfig(),
+        blocker_references=blockers,
+        now=datetime(2026, 9, 5, tzinfo=timezone.utc),
+    )
+
+    rendered = board.render(projected)
+    header, *rows = rendered.splitlines()
+    freed_start = header.index("FREED")
+    claim_start = header.index("CLAIM")
+
+    def freed_cell(title: str) -> str:
+        row = next(line for line in rows if line.endswith(title))
+        return row[freed_start:claim_start].strip()
+
+    assert freed_cell("Freed") == "2026-09-03 (2 d)"
+    assert freed_cell("Blocked") == "-"
+    assert freed_cell("Never blocked") == "-"
+
+    items = {item["number"]: item for item in json.loads(board.board_json(projected))["items"]}
+    assert items[20]["freed_on"] == "2026-09-03"
+    assert items[20]["freed_days"] == 2
+    assert items[21]["freed_on"] is None
+    assert items[21]["freed_days"] is None
+    assert items[22]["freed_on"] is None
+    assert items[22]["freed_days"] is None
+
+
 def test_board_category_order_keeps_ci_ahead_of_a_high_scoring_blocker() -> None:
     now = datetime(2026, 8, 21, tzinfo=timezone.utc)
     ci = board.Issue(30, "CI", ("ci",), "", "2026-08-20T00:00:00Z", "2026-08-20T00:00:00Z")

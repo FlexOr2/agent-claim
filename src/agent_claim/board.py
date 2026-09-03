@@ -269,6 +269,7 @@ class BoardItem:
     frozen_trigger: str | None
     open_blockers: tuple[int, ...]
     freed_on: datetime | None
+    freed_days: int | None
     stage: Stage
     age_days: int
     idle_days: int
@@ -999,6 +1000,7 @@ def build_board(
     items: list[BoardItem] = []
     for issue in issues:
         contract = contracts[issue.number]
+        freed_at = freed_on[issue.number]
         expectations = expectation_state(issue.body)
         progress = expectation_progress(issue.body)
         ruling_landings, ruling_old = ruling_freshness(issue.body, trunk_landings)
@@ -1059,7 +1061,12 @@ def build_board(
                 ruling_old=ruling_old,
                 frozen_trigger=frozen,
                 open_blockers=blockers[issue.number],
-                freed_on=freed_on[issue.number],
+                freed_on=freed_at,
+                freed_days=(
+                    None
+                    if freed_at is None
+                    else max(0, (observed_at - freed_at).days)
+                ),
                 stage=stage,
                 age_days=age_days,
                 idle_days=idle_days,
@@ -1105,11 +1112,13 @@ def highest_scored_actionable(board: Board) -> BoardItem | None:
 
 def board_json(board: Board) -> str:
     payload = asdict(board)
-    # S2b owns FREED; claim checks consume blocker details only inside this process.
     payload.pop("blocker_references")
     for group in ("items", "ready_now", "stale"):
         for item in payload[group]:
-            item.pop("freed_on")
+            freed_on = item["freed_on"]
+            item["freed_on"] = (
+                None if freed_on is None else freed_on.astimezone(timezone.utc).date().isoformat()
+            )
     return json.dumps(payload, default=lambda value: value.value)
 
 
@@ -1125,6 +1134,7 @@ def render(board: Board) -> str:
             "NEXT",
             "AGE",
             "IDLE",
+            "FREED",
             "CLAIM",
             "ACTIONABLE",
             "BLOCKERS",
@@ -1142,6 +1152,7 @@ def render(board: Board) -> str:
                 _brief(item.next_step),
                 str(item.age_days),
                 str(item.idle_days),
+                _freed_cell(item),
                 _claim_cell(item),
                 "yes" if item.actionable else f"no: {item.actionable_reason}",
                 ",".join(f"#{number}" for number in item.open_blockers) or "-",
@@ -1209,6 +1220,13 @@ def _claim_cell(item: BoardItem) -> str:
         return "-"
     suffix = " old" if item.claim_old else ""
     return f"{item.active_claim} {item.claim_age}{suffix}"
+
+
+def _freed_cell(item: BoardItem) -> str:
+    if item.freed_on is None or item.freed_days is None:
+        return "-"
+    freed_date = item.freed_on.astimezone(timezone.utc).date().isoformat()
+    return f"{freed_date} ({item.freed_days} d)"
 
 
 def _brief(value: str | None, *, maximum: int = 48) -> str:
