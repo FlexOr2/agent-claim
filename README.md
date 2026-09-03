@@ -132,7 +132,11 @@ The current checkout may set `priority_labels` as an ordered non-empty list in
 `.agent-claim/board.toml`; absent configuration uses `security`, `data`, `ci`,
 `product`, `ux`, then `cleanup`. The first three configured labels are primary
 buckets, followed by items that unblock other work, then the remaining labels;
-stage and Next bonuses sort only within a bucket.
+stage and Next bonuses sort only within a bucket. The same file may set one
+`idea_label`; an item carrying that label with no Now/Next/Blocked by/Done when
+projection ranks normally, and `next` tells the head `Problem neu prüfen und
+Item verfeinern`. Once it has a complete contract, its own Next takes over;
+without the configured label, a projectionless item remains `body incomplete`.
 
 `agent-claim rulings` lists only open board items with open expectation lines
 as `#NUMBER OPEN/TOTAL: TITLE`; `rulings --json` returns the same `number`,
@@ -143,15 +147,15 @@ issue number. An empty list succeeds.
 Use `agent-claim next` (or `agent-claim next --json`) to name the board's
 top-ranked actionable item — the same bucket-then-score-then-number order
 `board` shows, read from its first row: it is open, free, unblocked, not
-frozen, and has a complete Now/Next/Blocked by/Done when contract. Pulling is
-not dispatching, so unruled expectations never withhold an item; the pulled
-item carries `Erwartungen
+frozen, and has a complete Now/Next/Blocked by/Done when contract, or is a
+configured projectionless idea. Pulling is not dispatching, so unruled
+expectations never withhold an item; the pulled item carries `Erwartungen
 ungeregelt, beim Ziehen zuerst refinen` instead, and an item ruled long ago
 carries `vor N Landungen geregelt, beim Ziehen neu refinen` (both as the JSON
 `ruling_hint`). Items that genuinely cannot be worked — claimed, blocked by an
-open issue, frozen, or without a complete contract — are named with that
-reason under `SKIPPED` (also in the JSON `skipped` list), and `next` exits 3
-when none qualifies.
+open issue, frozen, or without a complete contract when they are not a
+configured projectionless idea — are named with that reason under `SKIPPED`
+(also in the JSON `skipped` list), and `next` exits 3 when none qualifies.
 `claim` refuses work out of order when a higher-priority actionable item — the
 same order `board` and `next` use — is free. Pass `--out-of-order REASON` to
 proceed deliberately; it remains visible as a warning and preserves the reason
