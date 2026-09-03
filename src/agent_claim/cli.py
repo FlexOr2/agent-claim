@@ -998,6 +998,30 @@ def _parent_line_checks(title: str, body: str) -> tuple[SliceCheck, ...]:
     )
 
 
+def _body_contract_checks(
+    repository: str, open_by_number: dict[int, board.Issue], contract: board.Contract
+) -> tuple[SliceCheck, ...]:
+    checks = [SliceCheck("error", "body-contract", defect.message) for defect in contract.defects]
+    for blocker in contract.blocker_issues:
+        state, _title, _body = _issue_reference_state(repository, open_by_number, blocker)
+        if state is ReferenceState.CLOSED:
+            checks.append(
+                SliceCheck(
+                    "error", "closed-blocker", f"blocker #{blocker} is closed", issue=blocker
+                )
+            )
+        elif state is ReferenceState.MISSING:
+            checks.append(
+                SliceCheck(
+                    "error",
+                    "missing-blocker",
+                    f"blocker #{blocker} does not exist here",
+                    issue=blocker,
+                )
+            )
+    return tuple(checks)
+
+
 def _slice_rule_checks(
     repository: str,
     open_by_number: dict[int, board.Issue],
@@ -1021,6 +1045,7 @@ def _slice_rule_checks(
             )
         )
     if body is not None:
+        checks.extend(_body_contract_checks(repository, open_by_number, board.parse_contract(body)))
         for entry in board.parse_slice_table(body):
             checks.extend(_slice_table_entry_checks(repository, open_by_number, entry))
     if title is not None and body is not None:

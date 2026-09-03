@@ -22,6 +22,8 @@ CONTRACT_FIELD_PATTERN = re.compile(
     r"(?m)^(?:\*\*(?P<bold_name>Now|Next|Blocked by|Done when):\*\*|"
     r"(?P<plain_name>Now|Next|Blocked by|Done when):)[ \t]*(?P<value>[^\r\n]*)$"
 )
+BLOCKER_LIST_PATTERN = re.compile(r"#([1-9][0-9]*)(?:[ \t]*,[ \t]*#([1-9][0-9]*))*")
+NO_BLOCKERS = "nichts"
 MARKDOWN_HEADING_PATTERN = re.compile(r"(?m)^#{1,6} .*$")
 EXPECTATION_HEADING_PATTERN = re.compile(
     r"(?im)^#{1,6}[ \t]+(?:Erwartung|Erwartungen|Erwartungsliste)\b[^\n]*$"
@@ -87,7 +89,6 @@ CLOSING_REFERENCE_PATTERN = re.compile(
 TOUCHES_WITHOUT_CLOSING_LINE_PATTERN = re.compile(
     r"(?im)^(?:Refs?|References?|Part of|Teil von)\b[:\s].*$"
 )
-NOTHING_BLOCKER_VALUES = frozenset({"nichts", "none", "keine", "-"})
 CLAIM_OLD_AFTER = timedelta(hours=1)
 CUT_HEADING_PATTERN = re.compile(r"(?m)^##[ \t]+Schnitt")
 CUT_SECTION_HEADING_PATTERN = re.compile(r"(?m)^##[ \t]+")
@@ -188,11 +189,18 @@ class BoardConfig:
 
 
 @dataclass(frozen=True)
+class ContractDefect:
+    field: str
+    message: str
+
+
+@dataclass(frozen=True)
 class Contract:
     now: str | None
     next: str | None
     blocked_by: str | None
     done_when: str | None
+    defects: tuple[ContractDefect, ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -206,6 +214,10 @@ class Contract:
     @property
     def projectionless(self) -> bool:
         return not any((self.now, self.next, self.blocked_by, self.done_when))
+
+    @property
+    def blocker_issues(self) -> frozenset[int]:
+        return _blocker_references(self.blocked_by)
 
 
 class Stage(StrEnum):
@@ -302,29 +314,51 @@ def load_config(path: Path = CONFIG_PATH) -> BoardConfig:
 
 
 def parse_contract(body: str) -> Contract:
+    live_body = _live_text(body)
     sections: dict[str, str] = {}
+    defects: list[ContractDefect] = []
     matches = sorted(
         (
-            *CONTRACT_HEADING_PATTERN.finditer(body),
-            *CONTRACT_FIELD_PATTERN.finditer(body),
+            *CONTRACT_HEADING_PATTERN.finditer(live_body),
+            *CONTRACT_FIELD_PATTERN.finditer(live_body),
         ),
         key=re.Match.start,
     )
-    for match in matches:
+    for index, match in enumerate(matches):
         if match.re is CONTRACT_HEADING_PATTERN:
             name = match.group("name")
-            next_heading = MARKDOWN_HEADING_PATTERN.search(body, match.end())
-            end = next_heading.start() if next_heading is not None else len(body)
-            value = body[match.end() : end].strip()
+            next_heading = MARKDOWN_HEADING_PATTERN.search(live_body, match.end())
+            next_field = matches[index + 1] if index + 1 < len(matches) else None
+            end = min(
+                next_heading.start() if next_heading is not None else len(live_body),
+                next_field.start() if next_field is not None else len(live_body),
+            )
+            value = live_body[match.end() : end].strip()
         else:
             name = match.group("bold_name") or match.group("plain_name")
             value = match.group("value").strip()
+        if name in sections:
+            defects.append(ContractDefect(name, f"duplicate {name} projection field"))
+            continue
         sections[name] = value
+    blocked_by = sections.get("Blocked by")
+    if (
+        blocked_by is not None
+        and blocked_by != NO_BLOCKERS
+        and BLOCKER_LIST_PATTERN.fullmatch(blocked_by) is None
+    ):
+        defects.append(
+            ContractDefect(
+                "Blocked by",
+                "Blocked by must be exactly nichts or a comma-separated #N list",
+            )
+        )
     return Contract(
         now=sections.get("Now") or None,
         next=sections.get("Next") or None,
-        blocked_by=sections.get("Blocked by"),
+        blocked_by=blocked_by,
         done_when=sections.get("Done when") or None,
+        defects=tuple(defects),
     )
 
 
@@ -669,16 +703,8 @@ def _references(text: str | None) -> frozenset[int]:
     return frozenset(int(number) for number in REFERENCE_PATTERN.findall(text))
 
 
-def _nothing_blocker_line(line: str) -> bool:
-    cleaned = line.strip().rstrip(".-").casefold()
-    return not cleaned or cleaned in NOTHING_BLOCKER_VALUES
-
-
 def _blocker_references(text: str | None) -> frozenset[int]:
-    if text is None:
-        return frozenset()
-    lines = tuple(line.strip() for line in text.splitlines() if line.strip())
-    if not lines or all(_nothing_blocker_line(line) for line in lines):
+    if text is None or text == NO_BLOCKERS or BLOCKER_LIST_PATTERN.fullmatch(text) is None:
         return frozenset()
     return _references(text)
 
@@ -845,7 +871,7 @@ def build_board(
     contracts = {issue.number: parse_contract(issue.body) for issue in issues}
     blockers = {
         issue.number: tuple(
-            sorted(_blocker_references(contracts[issue.number].blocked_by) & open_references)
+            sorted(contracts[issue.number].blocker_issues & open_references)
         )
         for issue in issues
     }

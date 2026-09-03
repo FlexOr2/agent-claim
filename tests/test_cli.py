@@ -876,7 +876,7 @@ def board_issue(
     )
 
 
-def complete_contract(next_step: str, *, blocked_by: str = "") -> str:
+def complete_contract(next_step: str, *, blocked_by: str = "nichts") -> str:
     return (
         "## Now\nWork is ready.\n\n"
         f"## Next\n{next_step}\n\n"
@@ -1183,6 +1183,222 @@ def test_next_pulls_an_unruled_item_and_names_only_unworkable_ones_as_skipped(
             {"number": 13, "reason": "claimed"},
         ],
     }
+
+
+@pytest.mark.parametrize(
+    ("blocked_by", "closed_references"),
+    [
+        pytest.param("#62 holds the files", {}, id="prose"),
+        pytest.param("70705e98f9f34fdf9a88fc758b4f3f74", {}, id="claim-id"),
+        pytest.param("codex/issue-90-claim-gate", {}, id="branch"),
+        pytest.param("PR #62", {}, id="pull-request"),
+        pytest.param("None", {}, id="none"),
+        pytest.param(
+            "#9",
+            {9: (issue_claim.ReferenceState.CLOSED, "Closed blocker", "")},
+            id="closed-issue",
+        ),
+    ],
+)
+def test_claim_refuses_non_issue_or_closed_blockers_before_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    blocked_by: str,
+    closed_references: dict[int, tuple["issue_claim.ReferenceState", str, str]],
+) -> None:
+    issue = board_issue(
+        10,
+        "Work",
+        complete_contract("Claim #10.", blocked_by=blocked_by),
+        labels=("security",),
+    )
+    client = _configured_board_client(monkeypatch, tmp_path, open_issues=(issue,))
+    if closed_references:
+        _stub_issue_reference(monkeypatch, closed_references)
+    monkeypatch.setattr(
+        issue_claim, "_request", lambda _arguments: request(issue=10, scope=("src/work.py",))
+    )
+
+    assert (
+        issue_claim.main(
+            [
+                "--repo",
+                "example/agent-claim",
+                "claim",
+                "10",
+                "--agent",
+                "Codex Sol",
+                "--scope",
+                "src/work.py",
+            ]
+        )
+        == 2
+    )
+
+    assert "ERROR:" in capsys.readouterr().err
+    assert client.comments[LEDGER_ISSUE] == []
+
+
+@pytest.mark.parametrize("blocked_by", ["nichts", "#9", "#9, #11"])
+def test_claim_accepts_nothing_or_open_issue_blockers(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    blocked_by: str,
+) -> None:
+    blockers = tuple(
+        board_issue(number, f"Blocker {number}", complete_contract(f"Claim #{number}."))
+        for number in (9, 11)
+        if f"#{number}" in blocked_by
+    )
+    issue = board_issue(
+        10,
+        "Work",
+        complete_contract("Claim #10.", blocked_by=blocked_by),
+        labels=("security",),
+    )
+    client = _configured_board_client(monkeypatch, tmp_path, open_issues=(issue, *blockers))
+    monkeypatch.setattr(
+        issue_claim, "_request", lambda _arguments: request(issue=10, scope=("src/work.py",))
+    )
+
+    assert (
+        issue_claim.main(
+            [
+                "--repo",
+                "example/agent-claim",
+                "claim",
+                "10",
+                "--agent",
+                "Codex Sol",
+                "--scope",
+                "src/work.py",
+            ]
+        )
+        == 0
+    )
+
+    assert len(client.comments[LEDGER_ISSUE]) == 1
+    assert "ERROR:" not in capsys.readouterr().err
+
+
+def test_claim_refuses_duplicate_contract_fields_before_mutation(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    issue = board_issue(
+        10,
+        "Work",
+        complete_contract("Claim #10.") + "\n\n**Done when:** The old projection remains.",
+    )
+    client = _configured_board_client(monkeypatch, tmp_path, open_issues=(issue,))
+    monkeypatch.setattr(
+        issue_claim, "_request", lambda _arguments: request(issue=10, scope=("src/work.py",))
+    )
+
+    assert (
+        issue_claim.main(
+            [
+                "--repo",
+                "example/agent-claim",
+                "claim",
+                "10",
+                "--agent",
+                "Codex Sol",
+                "--scope",
+                "src/work.py",
+                "--json",
+            ]
+        )
+        == 2
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["refused"] is True
+    assert payload["checks"] == [
+        {
+            "level": "error",
+            "check": "body-contract",
+            "text": "duplicate Done when projection field",
+            "slice": None,
+            "issue": None,
+        }
+    ]
+    assert client.comments[LEDGER_ISSUE] == []
+
+
+def test_claim_ignores_body_size_and_closed_next_references(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    issue = board_issue(
+        10,
+        "Work",
+        complete_contract("#9 follow up.") + "\n\n" + "x" * 50_000,
+    )
+    client = _configured_board_client(monkeypatch, tmp_path, open_issues=(issue,))
+    monkeypatch.setattr(
+        issue_claim,
+        "_fetch_issue_reference",
+        lambda _repository, _number: pytest.fail("claim must not inspect Next references"),
+    )
+    monkeypatch.setattr(
+        issue_claim, "_request", lambda _arguments: request(issue=10, scope=("src/work.py",))
+    )
+
+    assert (
+        issue_claim.main(
+            [
+                "--repo",
+                "example/agent-claim",
+                "claim",
+                "10",
+                "--agent",
+                "Codex Sol",
+                "--scope",
+                "src/work.py",
+            ]
+        )
+        == 0
+    )
+
+    assert len(client.comments[LEDGER_ISSUE]) == 1
+    assert "ERROR:" not in capsys.readouterr().err
+
+
+def test_release_ignores_body_contract_defects(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    client = _claims_client(request("held", issue=10, scope=("src/work.py",)))
+    client.board_issues = (
+        board_issue(
+            10,
+            "Work",
+            complete_contract("Claim #10.") + "\n\n**Done when:** Duplicate.",
+        ),
+    )
+    monkeypatch.setattr(
+        client, "list_open_board_issues", lambda: pytest.fail("release checks no body")
+    )
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+
+    assert (
+        issue_claim.main(
+            [
+                "--repo",
+                "example/agent-claim",
+                "release",
+                "10",
+                "--agent",
+                "Codex Sol",
+                "--claim-id",
+                "held",
+            ]
+        )
+        == 0
+    )
+
+    assert "RELEASED issue #10: held" in capsys.readouterr().out
 
 
 def test_claim_refuses_when_the_higher_priority_item_needs_refining(
@@ -1979,13 +2195,13 @@ def test_board_reports_each_item_actionability_reason(
     assert (item.actionable, item.actionable_reason) == expected
 
 
-def test_board_collects_every_open_blocker_from_prose() -> None:
+def test_board_collects_every_open_blocker_from_issue_list() -> None:
     blocked = board_issue(
         10,
         "Blocked",
         complete_contract(
             "Claim #10.",
-            blocked_by="#790 Reparaturrunde (review) und #642 P3",
+            blocked_by="#790, #642",
         ),
     )
     projected = board.build_board(
@@ -2007,9 +2223,8 @@ def test_board_collects_every_open_blocker_from_prose() -> None:
     assert item.actionable_reason == "blocked by #642, #790"
 
 
-@pytest.mark.parametrize("blocked_by", ["nichts", "none", "None.", "keine", "-"])
-def test_board_treats_nothing_blocker_values_as_unblocked(blocked_by: str) -> None:
-    issue = board_issue(10, "Ready", complete_contract("Claim #10.", blocked_by=blocked_by))
+def test_board_treats_nichts_as_unblocked() -> None:
+    issue = board_issue(10, "Ready", complete_contract("Claim #10.", blocked_by="nichts"))
     projected = board.build_board(
         (issue,),
         (),
@@ -2316,7 +2531,7 @@ def test_claim_does_not_warn_about_a_frozen_higher_scored_item(
     assert "WARNING" not in capsys.readouterr().out
 
 
-def test_board_parses_the_last_atelier_contract_projection() -> None:
+def test_board_keeps_the_first_projection_and_reports_duplicates() -> None:
     contract = board.parse_contract(
         "## Earlier section\n"
         "**Now:** An earlier section-local status.\n"
@@ -2331,11 +2546,29 @@ def test_board_parses_the_last_atelier_contract_projection() -> None:
     )
 
     assert contract == board.Contract(
-        now="Fix the board parser.",
-        next="Add a regression test.",
-        blocked_by="#47",
-        done_when="The review findings are resolved.",
+        now="An earlier section-local status.",
+        next="An earlier section-local next step.",
+        blocked_by="#99",
+        done_when="The earlier section is complete.",
+        defects=(
+            board.ContractDefect("Now", "duplicate Now projection field"),
+            board.ContractDefect("Next", "duplicate Next projection field"),
+            board.ContractDefect("Blocked by", "duplicate Blocked by projection field"),
+            board.ContractDefect("Done when", "duplicate Done when projection field"),
+        ),
     )
+
+
+def test_board_ignores_fenced_projection_examples() -> None:
+    contract = board.parse_contract(
+        complete_contract("Claim #10.")
+        + "\n\n```markdown\n"
+        + "## Done when\n"
+        + "This is only an example.\n"
+        + "```"
+    )
+
+    assert contract.defects == ()
 
 
 def test_board_reads_priority_configuration_from_the_checkout_root(
