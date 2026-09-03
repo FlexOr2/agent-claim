@@ -759,7 +759,7 @@ def _next_json(item: board.BoardItem | None, skipped: tuple[board.BoardItem, ...
                 "number": item.number,
                 "score": item.score,
                 "title": item.title,
-                "next": item.contract.next,
+                "next": item.next_step,
                 "ruling_landings": item.ruling_landings,
                 "ruling_old": item.ruling_old,
             }
@@ -773,7 +773,7 @@ def _next_json(item: board.BoardItem | None, skipped: tuple[board.BoardItem, ...
 
 def _next(item: board.BoardItem | None, skipped: tuple[board.BoardItem, ...]) -> int:
     lines = (
-        [f"#{item.number} score {item.score}: {item.title}", f"Next: {item.contract.next}"]
+        [f"#{item.number} score {item.score}: {item.title}", f"Next: {item.next_step}"]
         if item is not None
         else ["No actionable item."]
     )

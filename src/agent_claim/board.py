@@ -14,6 +14,7 @@ from . import protocol
 
 DEFAULT_PRIORITY_LABELS = ("security", "data", "ci", "product", "ux", "cleanup")
 CONFIG_PATH = Path(".agent-claim/board.toml")
+IDEA_REFINEMENT_STEP = "Problem neu prüfen und Item verfeinern"
 CONTRACT_HEADING_PATTERN = re.compile(
     r"(?m)^#{1,6}[ \t]+(?P<name>Now|Next|Blocked by|Done when)[ \t]*$"
 )
@@ -183,6 +184,7 @@ SliceTableEntry = SliceTableRow | MalformedSliceTable | MalformedSliceRow
 @dataclass(frozen=True)
 class BoardConfig:
     priority_labels: tuple[str, ...] = DEFAULT_PRIORITY_LABELS
+    idea_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -200,6 +202,10 @@ class Contract:
             and self.blocked_by is not None
             and self.done_when is not None
         )
+
+    @property
+    def projectionless(self) -> bool:
+        return not any((self.now, self.next, self.blocked_by, self.done_when))
 
 
 class Stage(StrEnum):
@@ -228,6 +234,7 @@ class BoardItem:
     priority_category: int
     priority_bucket: str
     contract: Contract
+    next_step: str | None
     contract_complete: bool
     expectation_state: ExpectationState
     ruling_landings: int | None
@@ -271,17 +278,26 @@ def load_config(path: Path = CONFIG_PATH) -> BoardConfig:
         raise protocol.ClaimError(f"cannot read board configuration {path}: {error}") from error
     labels = raw.get("priority_labels")
     if labels is None:
-        return BoardConfig()
-    if (
-        not isinstance(labels, list)
-        or not labels
-        or not all(isinstance(label, str) and label.strip() == label and label for label in labels)
-        or len(set(labels)) != len(labels)
+        priority_labels = DEFAULT_PRIORITY_LABELS
+    else:
+        if (
+            not isinstance(labels, list)
+            or not labels
+            or not all(
+                isinstance(label, str) and label.strip() == label and label for label in labels
+            )
+            or len(set(labels)) != len(labels)
+        ):
+            raise protocol.ClaimError(
+                "board configuration priority_labels must be a non-empty list of unique labels"
+            )
+        priority_labels = tuple(labels)
+    idea_label = raw.get("idea_label")
+    if idea_label is not None and (
+        not isinstance(idea_label, str) or idea_label.strip() != idea_label or not idea_label
     ):
-        raise protocol.ClaimError(
-            "board configuration priority_labels must be a non-empty list of unique labels"
-        )
-    return BoardConfig(tuple(labels))
+        raise protocol.ClaimError("board configuration idea_label must be a non-empty label")
+    return BoardConfig(priority_labels, idea_label)
 
 
 def parse_contract(body: str) -> Contract:
@@ -722,6 +738,10 @@ def _priority_index(labels: tuple[str, ...], config: BoardConfig) -> int | None:
     return min(matches, default=None)
 
 
+def _has_label(labels: tuple[str, ...], label: str | None) -> bool:
+    return label is not None and any(item.casefold() == label.casefold() for item in labels)
+
+
 def _priority_bucket(
     labels: tuple[str, ...], config: BoardConfig, unblocks_count: int
 ) -> tuple[int, str]:
@@ -860,6 +880,10 @@ def build_board(
         age_days = max(0, (observed_at - _timestamp(issue.created_at)).days)
         idle_days = max(0, (observed_at - _timestamp(issue.updated_at)).days)
         single_next = _single_concrete_next(contract.next)
+        projectionless_idea = contract.projectionless and _has_label(
+            issue.labels, config.idea_label
+        )
+        next_step = IDEA_REFINEMENT_STEP if projectionless_idea else contract.next
         priority_category, priority_bucket = _priority_bucket(
             issue.labels, config, unblocks[issue.number]
         )
@@ -881,6 +905,7 @@ def build_board(
             active_claim=active_claim,
             open_blockers=blockers[issue.number],
             contract_complete=contract.complete,
+            projectionless_idea=projectionless_idea,
         )
         items.append(
             BoardItem(
@@ -890,6 +915,7 @@ def build_board(
                 priority_category=priority_category,
                 priority_bucket=priority_bucket,
                 contract=contract,
+                next_step=next_step,
                 contract_complete=contract.complete,
                 expectation_state=expectations,
                 ruling_landings=ruling_landings,
@@ -968,7 +994,7 @@ def render(board: Board) -> str:
                 item.stage.value,
                 _contract_summary(item.contract),
                 _expectation_cell(item),
-                _brief(item.contract.next),
+                _brief(item.next_step),
                 str(item.age_days),
                 str(item.idle_days),
                 _claim_cell(item),
@@ -1010,6 +1036,7 @@ def _actionable_reason(
     active_claim: str | None,
     open_blockers: tuple[int, ...],
     contract_complete: bool,
+    projectionless_idea: bool,
 ) -> str | None:
     if frozen_trigger is not None:
         return f"frozen: {frozen_trigger}"
@@ -1017,7 +1044,7 @@ def _actionable_reason(
         return "claimed"
     if open_blockers:
         return "blocked by " + ", ".join(f"#{number}" for number in open_blockers)
-    if not contract_complete:
+    if not contract_complete and not projectionless_idea:
         return "body incomplete"
     return None
 

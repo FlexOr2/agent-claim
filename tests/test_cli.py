@@ -2662,6 +2662,92 @@ def test_board_configuration_requires_unique_ordered_labels(tmp_path: Path) -> N
         board.load_config(config_path)
 
 
+def test_board_configuration_reads_and_validates_the_idea_label(tmp_path: Path) -> None:
+    config_path = tmp_path / "board.toml"
+    config_path.write_text('priority_labels = ["ux", "security"]\nidea_label = "vision"\n')
+
+    assert board.load_config(config_path) == board.BoardConfig(("ux", "security"), "vision")
+
+    config_path.write_text('idea_label = ""\n')
+    with pytest.raises(ClaimError, match="idea_label"):
+        board.load_config(config_path)
+
+
+def test_next_pulls_a_configured_projectionless_idea_with_refinement_step(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    (tmp_path / ".agent-claim").mkdir()
+    (tmp_path / ".agent-claim" / "board.toml").write_text('idea_label = "vision"\n')
+    idea = board_issue(
+        10, "Operator vision", "## Wunsch\nMake the board clearer.", labels=("vision",)
+    )
+    client = _configured_board_client(monkeypatch, tmp_path, open_issues=(idea,))
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "next"]) == 0
+    assert capsys.readouterr().out == (
+        "#10 score -20: Operator vision\n"
+        "Next: Problem neu prüfen und Item verfeinern\n"
+    )
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "next", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "number": 10,
+        "score": -20,
+        "title": "Operator vision",
+        "next": "Problem neu prüfen und Item verfeinern",
+        "ruling_landings": None,
+        "ruling_old": None,
+        "skipped": [],
+    }
+    assert client.comments[LEDGER_ISSUE] == []
+
+
+def test_next_keeps_an_unlabelled_incomplete_work_item_skipped(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    incomplete = board_issue(10, "Incomplete work", "## Now\nInvestigate.")
+    _configured_board_client(monkeypatch, tmp_path, open_issues=(incomplete,))
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "next"]) == 3
+    assert capsys.readouterr().out == "No actionable item.\n\nSKIPPED\n#10: body incomplete\n"
+
+
+def test_claim_treats_a_higher_ranked_configured_idea_as_out_of_order(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    (tmp_path / ".agent-claim").mkdir()
+    (tmp_path / ".agent-claim" / "board.toml").write_text('idea_label = "vision"\n')
+    lower = board_issue(10, "Lower work", complete_contract("Claim #10."))
+    idea = board_issue(
+        11,
+        "Higher-ranked vision",
+        "## Wunsch\nImprove claims.",
+        labels=("vision", "security"),
+    )
+    client = _configured_board_client(monkeypatch, tmp_path, open_issues=(lower, idea))
+    monkeypatch.setattr(
+        issue_claim, "_request", lambda _arguments: request(issue=10, scope=("src/lower.py",))
+    )
+
+    assert (
+        issue_claim.main(
+            [
+                "--repo",
+                "example/agent-claim",
+                "claim",
+                "10",
+                "--agent",
+                "Codex Sol",
+                "--scope",
+                "src/lower.py",
+            ]
+        )
+        == 2
+    )
+    assert "ERROR: higher-priority actionable item #11" in capsys.readouterr().err
+    assert client.comments[LEDGER_ISSUE] == []
+
+
 def marker(
     payload: dict[str, object], *, legacy: bool = False, attributed: bool = True
 ) -> str:
