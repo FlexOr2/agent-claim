@@ -162,6 +162,13 @@ same order `board` and `next` use — is free. Pass `--out-of-order REASON` to
 proceed deliberately; it remains visible as a warning and preserves the reason
 in the claim comment.
 
+Before it writes a claim, `claim` also reads the pulled issue's live contract:
+`Now`, `Next`, `Blocked by`, and `Done when` each appear at most once outside
+fenced code examples. `Blocked by` is exactly `nichts` or a comma-separated
+`#N` list such as `#62, #75`; every listed issue must be open. The check does
+not limit body size or inspect references in `Next`, and `release` stays
+available even when the body's contract has since become invalid.
+
 A body line `Eingefroren bis: <trigger in one sentence> (Operator, DD.MM.YYYY)`
 freezes an issue: it drops out of `next` and the higher-priority refusal check
 even though its score keeps showing on `board`, and deleting the line thaws it
