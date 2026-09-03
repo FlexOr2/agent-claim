@@ -269,6 +269,11 @@ def _parser() -> argparse.ArgumentParser:
     board_command = commands.add_parser("board", help="project the open work board without writes")
     board_command.add_argument("--json", action="store_true")
 
+    rulings_command = commands.add_parser(
+        "rulings", help="list open expectation lines without writes"
+    )
+    rulings_command.add_argument("--json", action="store_true")
+
     next_command = commands.add_parser(
         "next",
         help="name the board's top-priority item to pull",
@@ -682,6 +687,53 @@ def _board(
         now=now,
         trunk_landings=checkout.trunk_landing_times(),
     )
+
+
+def _rulings(
+    projected: board.Board, issues: tuple[board.Issue, ...], *, as_json: bool
+) -> int:
+    progress_by_issue = {
+        issue.number: board.expectation_progress(issue.body) for issue in issues
+    }
+    items = tuple(
+        sorted(
+            (
+                (item, progress_by_issue[item.number])
+                for item in projected.items
+                if progress_by_issue[item.number].open > 0
+            ),
+            key=lambda entry: (
+                *board.board_rank(entry[0])[:2],
+                entry[1].open,
+                entry[0].number,
+            ),
+        )
+    )
+    if as_json:
+        print(
+            json.dumps(
+                [
+                    {
+                        "number": item.number,
+                        "title": item.title,
+                        "open": progress.open,
+                        "total": progress.total,
+                    }
+                    for item, progress in items
+                ]
+            )
+        )
+        return 0
+    if not items:
+        print("No open expectation lines.")
+        return 0
+    print(
+        "\n".join(
+            f"#{item.number} {progress.open}/{progress.total}: {item.title}"
+            for item, progress in items
+        )
+    )
+    return 0
 
 
 def _ruling_pull_hint(item: board.BoardItem) -> str | None:
@@ -1136,6 +1188,11 @@ def main(arguments: list[str] | None = None) -> int:
             projected = _board(client, protocol.active_claims(comments))
             print(board.board_json(projected) if parsed.json else board.render(projected))
             return 0
+        if parsed.command == "rulings":
+            comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
+            issues = client.list_open_board_issues()
+            projected = _board(client, protocol.active_claims(comments), issues=issues)
+            return _rulings(projected, issues, as_json=parsed.json)
         if parsed.command == "next":
             comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
             projected = _board(client, protocol.active_claims(comments))
