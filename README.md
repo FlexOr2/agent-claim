@@ -134,6 +134,12 @@ The current checkout may set `priority_labels` as an ordered non-empty list in
 buckets, followed by items that unblock other work, then the remaining labels;
 stage and Next bonuses sort only within a bucket.
 
+`agent-claim rulings` lists only open board items with open expectation lines
+as `#NUMBER OPEN/TOTAL: TITLE`; `rulings --json` returns the same `number`,
+`title`, `open`, and `total` values. It is read-only and uses the board's
+priority category and score first, then fewer open expectation lines and the
+issue number. An empty list succeeds.
+
 Use `agent-claim next` (or `agent-claim next --json`) to name the board's
 top-ranked actionable item — the same bucket-then-score-then-number order
 `board` shows, read from its first row: it is open, free, unblocked, not

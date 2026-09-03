@@ -752,6 +752,109 @@ def test_board_exposes_all_expectation_states(
     assert expectation_states == {10: "-", 11: "proposed", 12: "ruled"}
 
 
+def test_rulings_lists_open_expectations_by_board_priority_then_open_count(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    issues = (
+        rulings_issue(
+            50,
+            "In-flight security work",
+            open_lines=2,
+            total_lines=3,
+            labels=("security",),
+        ),
+        rulings_issue(
+            30,
+            "Later security tie",
+            open_lines=1,
+            total_lines=2,
+            labels=("security",),
+        ),
+        rulings_issue(
+            10,
+            "Earlier security tie",
+            open_lines=1,
+            total_lines=2,
+            labels=("security",),
+        ),
+        rulings_issue(
+            40,
+            "More open security work",
+            open_lines=2,
+            total_lines=3,
+            labels=("security",),
+        ),
+        rulings_issue(
+            60,
+            "Lower-priority product work",
+            open_lines=1,
+            total_lines=1,
+            labels=("product",),
+        ),
+        rulings_issue(
+            70,
+            "Fully ruled security work",
+            open_lines=0,
+            total_lines=1,
+            labels=("security",),
+        ),
+    )
+    _configured_board_client(
+        monkeypatch,
+        tmp_path,
+        open_issues=issues,
+        open_pull_requests=(board.PullRequest(200, "Fixes #50", "", "branch"),),
+    )
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "rulings"]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "#50 2/3: In-flight security work",
+        "#10 1/2: Earlier security tie",
+        "#30 1/2: Later security tie",
+        "#40 2/3: More open security work",
+        "#60 1/1: Lower-priority product work",
+    ]
+
+
+def test_rulings_renders_text_json_and_empty_success(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    open_issue = rulings_issue(
+        10,
+        "Open expectation",
+        open_lines=1,
+        total_lines=2,
+    )
+    client = _configured_board_client(monkeypatch, tmp_path, open_issues=(open_issue,))
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "rulings"]) == 0
+    assert capsys.readouterr().out == "#10 1/2: Open expectation\n"
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "rulings", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == [
+        {"number": 10, "title": "Open expectation", "open": 1, "total": 2}
+    ]
+
+    monkeypatch.setattr(
+        client,
+        "list_open_board_issues",
+        lambda: (
+            rulings_issue(
+                11,
+                "Fully ruled",
+                open_lines=0,
+                total_lines=1,
+            ),
+        ),
+    )
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "rulings"]) == 0
+    assert capsys.readouterr().out == "No open expectation lines.\n"
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "rulings", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+
+
 def board_issue(
     number: int,
     title: str,
@@ -782,6 +885,24 @@ def expectation_block(
     *lines: str, heading: str = "Erwartung (refine-Lauf 28.08.2026)"
 ) -> str:
     return f"## {heading}\n" + "\n".join(lines)
+
+
+def rulings_issue(
+    number: int, title: str, *, open_lines: int, total_lines: int, labels: tuple[str, ...] = ()
+) -> board.Issue:
+    lines = (
+        *(f"- Open decision {index}. *(Default: later)*" for index in range(open_lines)),
+        *(
+            f"- Settled decision {index}. *(geregelt: ja)*"
+            for index in range(total_lines - open_lines)
+        ),
+    )
+    return board_issue(
+        number,
+        title,
+        complete_contract(f"Ship #{number}.") + "\n\n" + expectation_block(*lines),
+        labels=labels,
+    )
 
 
 def slice_table(*rows: tuple[str, str, str, str]) -> str:
