@@ -211,8 +211,11 @@ def test_bootstrap_refuses_other_machine_coordination_contract(
     client, observed = ledger_client(
         monkeypatch, [ledger_row(4, body="<!-- another-claim-ledger:v1 -->")]
     )
-    with pytest.raises(ClaimError, match="refusing to compete"):
+    with pytest.raises(ClaimError) as excinfo:
         issue_claim.bootstrap_ledger(client)
+    assert str(excinfo.value) == (
+        "another coordination contract exists on issue(s) [4]; refusing to compete"
+    )
     assert not any(
         arguments[:4] == ["api", "--method", "POST", f"repos/{client.repository}/issues"]
         for arguments in observed
