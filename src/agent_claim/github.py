@@ -218,7 +218,7 @@ def _bounded_command(
 
 class GitHubIssueComments:
     def __init__(self, repository: str):
-        if re.fullmatch(REPOSITORY_PATTERN, repository) is None:
+        if REPOSITORY_PATTERN.fullmatch(repository) is None:
             raise ClaimError("repository must be OWNER/REPO")
         self.repository = repository
         self._rollover_warning_printed = False

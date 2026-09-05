@@ -104,7 +104,7 @@ LANDING_CLAIM_PATTERN = re.compile(
 )
 WORK_ITEM_KIND = "work-item"
 CLASSIFICATION_LINE_PATTERN = re.compile(
-    r"(?im)^(?P<kind>Work-Item|No-Item):[ \t]*(?P<value>[^\r\n]*?)[ \t]*$"
+    r"(?im)^(?P<kind>Work-Item|No-Item):[ \t]*(?P<value>[^\r\n]*)$"
 )
 WORK_ITEM_VALUE_PATTERN = re.compile(QUALIFIED_REFERENCE)
 RECOVERY_STEP = "close or re-project"
@@ -782,13 +782,13 @@ def parse_pull_request_classification(
         match for match in matches if match.group("kind").lower() == WORK_ITEM_KIND
     )
     if len(work_items) > 1:
-        named = " and ".join(match.group("value") for match in work_items[:2])
+        named = " and ".join(match.group("value").rstrip(" \t") for match in work_items[:2])
         return ClassificationDefect(f"names two work items, {named}; split it")
     if len(matches) > 1:
         return ClassificationDefect(
             f"carries {len(matches)} classification lines; exactly one is required"
         )
-    value = matches[0].group("value")
+    value = matches[0].group("value").rstrip(" \t")
     if work_items:
         reference = WORK_ITEM_VALUE_PATTERN.fullmatch(value)
         if reference is None:
@@ -905,7 +905,7 @@ def _with_blocker_defects(
     )
     if not pull_requests:
         return contract
-    with_pull_request_defects: Contract = replace(
+    return replace(
         contract,
         defects=(
             *contract.defects,
@@ -915,7 +915,6 @@ def _with_blocker_defects(
             ),
         ),
     )
-    return with_pull_request_defects
 
 
 def _open_blockers(contract: Contract, blockers: dict[int, BlockerReference]) -> tuple[int, ...]:

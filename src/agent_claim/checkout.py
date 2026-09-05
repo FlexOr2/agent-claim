@@ -43,7 +43,7 @@ def _repository(explicit: str | None) -> str:
             if match is None:
                 raise ClaimError("cannot resolve GitHub repository; pass --repo OWNER/REPO")
             repository = f"{match.group(1)}/{match.group(2)}"
-    if re.fullmatch(REPOSITORY_PATTERN, repository) is None:
+    if REPOSITORY_PATTERN.fullmatch(repository) is None:
         raise ClaimError("repository must be OWNER/REPO")
     return repository
 
