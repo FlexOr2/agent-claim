@@ -388,6 +388,8 @@ class FakeComments:
     repository: str = REPOSITORY
     default_branch_name: str = "main"
     pull_requests: dict[int, board.PullRequestDetail] = field(default_factory=dict)
+    parents: dict[int, board.ParentIssue] = field(default_factory=dict)
+    open_children: dict[int, tuple[board.IssueReference, ...]] = field(default_factory=dict)
 
     def list_protocol_candidates(self, issue: int) -> tuple[IssueComment, ...]:
         return tuple(
@@ -464,6 +466,12 @@ class FakeComments:
 
     def default_branch(self) -> str:
         return self.default_branch_name
+
+    def parent_issue(self, number: int) -> board.ParentIssue | None:
+        return self.parents.get(number)
+
+    def open_sub_issues(self, number: int) -> tuple[board.IssueReference, ...]:
+        return self.open_children.get(number, ())
 
     def list_board_blockers(
         self, numbers: frozenset[int]
@@ -723,7 +731,7 @@ def test_board_projects_fixture_json_without_github_writes(
 
     assert issue_claim.main(["--repo", "example/agent-claim", "board", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert set(payload) == {"items", "ready_now", "stale"}
+    assert set(payload) == {"items", "ready_now", "stale", "recovery"}
     first = payload["items"][0]
     ten = next(item for item in payload["items"] if item["number"] == 10)
     eleven = next(item for item in payload["items"] if item["number"] == 11)
@@ -1037,6 +1045,7 @@ def _stub_issue_reference(
                 "score": 10,
                 "title": "Top work",
                 "next": "Claim #11.",
+                "recovery": [],
                 "skipped": [{"number": 12, "reason": "blocked by #11"}],
                 "ruling_landings": None,
                 "ruling_old": None,
@@ -1237,6 +1246,7 @@ def test_next_pulls_an_unruled_item_and_names_only_unworkable_ones_as_skipped(
         "ruling_landings": None,
         "ruling_old": None,
         "ruling_hint": "Erwartungen ungeregelt, beim Ziehen zuerst refinen",
+        "recovery": [],
         "skipped": [
             {"number": 12, "reason": "blocked by #11"},
             {"number": 13, "reason": "claimed"},
@@ -2149,21 +2159,26 @@ def test_claim_checks_every_slice_table_in_the_body_not_just_the_first(
 
 
 @pytest.mark.parametrize(
-    ("body", "expect_warning"),
+    ("parents", "expect_warning"),
     [
-        pytest.param("## Now\nWork.", True, id="without_parent_line"),
-        pytest.param("## Now\nWork.\n\nPart of #79.\n", False, id="with_parent_line"),
+        pytest.param({}, True, id="without_sub_issue_relation"),
+        pytest.param(
+            {1017: board.ParentIssue(board.IssueReference(REPOSITORY, 79), "## Now\nCut.")},
+            False,
+            id="with_sub_issue_relation",
+        ),
     ],
 )
-def test_claim_checks_a_slice_shaped_title_for_its_parent_line(
+def test_claim_checks_a_slice_shaped_title_for_its_recorded_parent(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     tmp_path: Path,
-    body: str,
+    parents: dict[int, board.ParentIssue],
     expect_warning: bool,
 ) -> None:
-    target = board_issue(1017, "Schema traegt den Titel (#79 Scheibe 21)", body)
+    target = board_issue(1017, "Schema traegt den Titel (#79 Scheibe 21)", "## Now\nWork.")
     client = _configured_board_client(monkeypatch, tmp_path, open_issues=(target,))
+    client.parents.update(parents)
     monkeypatch.setattr(
         issue_claim, "_request", lambda _arguments: request(issue=1017, scope=("src/work.py",))
     )
@@ -2184,7 +2199,7 @@ def test_claim_checks_a_slice_shaped_title_for_its_parent_line(
     assert exit_code == 0
     output = capsys.readouterr().out
     expected = (
-        'WARNING: looks like slice 21 of #79 but carries no "Part of #79" line; '
+        "WARNING: looks like slice 21 of #79 but is no sub-issue of #79; "
         "the parent inherits nothing"
     )
     assert (expected in output) is expect_warning
@@ -3233,6 +3248,7 @@ def test_next_pulls_a_configured_projectionless_idea_with_refinement_step(
         "next": "Problem neu prüfen und Item verfeinern",
         "ruling_landings": None,
         "ruling_old": None,
+        "recovery": [],
         "skipped": [],
     }
     assert client.comments[LEDGER_ISSUE] == []
@@ -11656,3 +11672,229 @@ def test_release_requires_exactly_one_landing_outcome(arguments: list[str]) -> N
         issue_claim._parser().parse_args(arguments)
 
     assert exited.value.code == 2
+
+
+PARENT_ISSUE = 79
+
+
+def parented_pr_check_client(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    body: str,
+    parent_body: str,
+    open_children: tuple[board.IssueReference, ...],
+    parent_repository: str = REPOSITORY,
+) -> FakeComments:
+    client = pr_check_client(monkeypatch, landing_pull_request(body=body))
+    client.parents[WORK_ITEM_ISSUE] = board.ParentIssue(
+        board.IssueReference(parent_repository, PARENT_ISSUE), parent_body
+    )
+    client.open_children[PARENT_ISSUE] = open_children
+    return client
+
+
+def test_pr_check_requires_the_parent_to_close_with_its_last_open_child(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    parented_pr_check_client(
+        monkeypatch,
+        body="Work-Item: #72\n\nCloses #72",
+        parent_body=complete_contract("Cut the next slice."),
+        open_children=(board.IssueReference(REPOSITORY, WORK_ITEM_ISSUE),),
+    )
+
+    assert run_pr_check() == 1
+    assert capsys.readouterr().err == (
+        f"REFUSED: pull request #12 closes the last open child of parent "
+        f"{REPOSITORY}#{PARENT_ISSUE}; close the parent too\n"
+    )
+
+
+def test_pr_check_accepts_a_landing_that_closes_its_completed_parent(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    parented_pr_check_client(
+        monkeypatch,
+        body="Work-Item: #72\n\nCloses #72\nCloses #79",
+        parent_body="## Now\nEpic.",
+        open_children=(board.IssueReference(REPOSITORY, WORK_ITEM_ISSUE),),
+    )
+
+    assert run_pr_check() == 0
+    assert capsys.readouterr().out == (
+        f"PR #12 by ada declares Work-Item: {REPOSITORY}#{WORK_ITEM_ISSUE}\n"
+    )
+
+
+def test_pr_check_requires_a_next_line_on_a_parent_that_keeps_other_children(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    parented_pr_check_client(
+        monkeypatch,
+        body="Work-Item: #72\n\nCloses #72",
+        parent_body="## Now\nEpic without a next step.",
+        open_children=(
+            board.IssueReference(REPOSITORY, WORK_ITEM_ISSUE),
+            board.IssueReference(REPOSITORY, 73),
+        ),
+    )
+
+    assert run_pr_check() == 1
+    assert capsys.readouterr().err == (
+        f"REFUSED: pull request #12 leaves parent {REPOSITORY}#{PARENT_ISSUE} open with "
+        "1 other open child, whose body carries no Next line\n"
+    )
+
+
+def test_pr_check_accepts_a_landing_whose_parent_says_what_comes_next(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    parented_pr_check_client(
+        monkeypatch,
+        body="Work-Item: #72\n\nCloses #72",
+        parent_body=complete_contract("Dispatch slice 4."),
+        open_children=(
+            board.IssueReference(REPOSITORY, WORK_ITEM_ISSUE),
+            board.IssueReference(REPOSITORY, 73),
+        ),
+    )
+
+    assert run_pr_check() == 0
+    assert capsys.readouterr().out == (
+        f"PR #12 by ada declares Work-Item: {REPOSITORY}#{WORK_ITEM_ISSUE}\n"
+    )
+
+
+def test_pr_check_refuses_to_close_a_parent_that_keeps_other_children(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    parented_pr_check_client(
+        monkeypatch,
+        body="Work-Item: #72\n\nCloses #72\nCloses #79",
+        parent_body=complete_contract("Dispatch slice 4."),
+        open_children=(
+            board.IssueReference(REPOSITORY, WORK_ITEM_ISSUE),
+            board.IssueReference(REPOSITORY, 73),
+        ),
+    )
+
+    assert run_pr_check() == 1
+    assert capsys.readouterr().err == (
+        f"REFUSED: pull request #12 closes {REPOSITORY}#{PARENT_ISSUE} besides its work "
+        f"item {REPOSITORY}#{WORK_ITEM_ISSUE}; a pull request lands one item\n"
+    )
+
+
+def test_pr_check_refuses_a_parent_recorded_in_another_repository(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    parented_pr_check_client(
+        monkeypatch,
+        body="Work-Item: #72\n\nCloses #72",
+        parent_body=complete_contract("Cut the next slice."),
+        open_children=(),
+        parent_repository="other/repo",
+    )
+
+    assert run_pr_check() == 1
+    assert capsys.readouterr().err == (
+        f"REFUSED: pull request #12 has parent other/repo#{PARENT_ISSUE} in another "
+        "repository, whose children this check cannot read\n"
+    )
+
+
+def test_github_adapter_reads_a_recorded_parent_and_its_open_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GitHubIssueComments(REPOSITORY)
+    repository_url = f"https://api.github.com/repos/{REPOSITORY}"
+
+    def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
+        if arguments[1].endswith("/parent"):
+            return json.dumps(
+                {"number": 79, "repository": repository_url, "body": "## Next\nCut."}
+            )
+        return "\n".join(
+            json.dumps({"number": number, "repository": repository_url})
+            for number in (72, 73)
+        )
+
+    monkeypatch.setattr(client, "_run", run)
+
+    assert client.parent_issue(72) == board.ParentIssue(
+        board.IssueReference(REPOSITORY, 79), "## Next\nCut."
+    )
+    assert client.open_sub_issues(79) == (
+        board.IssueReference(REPOSITORY, 72),
+        board.IssueReference(REPOSITORY, 73),
+    )
+
+
+def test_github_adapter_reads_an_issue_without_a_parent_as_parentless(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GitHubIssueComments(REPOSITORY)
+
+    def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
+        raise ClaimError("gh: No parent issue found (HTTP 404)")
+
+    monkeypatch.setattr(client, "_run", run)
+
+    assert client.parent_issue(72) is None
+
+
+def test_board_recovers_an_open_item_a_merged_pull_request_already_landed() -> None:
+    landed = board_issue(90, "Landed but open", complete_contract("Close it."))
+    ledger = board_issue(LEDGER_ISSUE, "Claim ledger", "")
+    merged = board.PullRequest(
+        140,
+        "Lands the slice",
+        "Work-Item: #90\n\nCloses #90",
+        "branch",
+        "2026-08-20T00:00:00Z",
+    )
+    ledger_pull_request = board.PullRequest(
+        141,
+        "Ledger housekeeping",
+        f"Work-Item: #{LEDGER_ISSUE}\n\nCloses #{LEDGER_ISSUE}",
+        "branch",
+        "2026-08-20T00:00:00Z",
+    )
+
+    projected = projected_board(
+        (landed, ledger),
+        (),
+        (merged, ledger_pull_request),
+        (),
+        board.BoardConfig(),
+        now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+    )
+
+    assert [item.number for item in projected.recovery] == [90]
+    assert f"RECOVERY ({board.RECOVERY_STEP})\n#90" in board.render(projected)
+
+
+def test_next_names_a_recovery_item_before_the_item_it_recommends(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    landed = board_issue(90, "Landed but open", complete_contract("Close it."))
+    ready = board_issue(91, "Waiting work", complete_contract("Claim #91."))
+    client = _configured_board_client(monkeypatch, tmp_path, open_issues=(landed, ready))
+    monkeypatch.setattr(
+        client,
+        "list_recent_merged_board_pull_requests",
+        lambda _since: (
+            board.PullRequest(
+                140,
+                "Lands it",
+                "Work-Item: #90\n\nCloses #90",
+                "branch",
+                "2026-08-20T00:00:00Z",
+            ),
+        ),
+    )
+
+    assert issue_claim.main(["--repo", REPOSITORY, "next"]) == 0
+    assert capsys.readouterr().out.startswith(
+        f"RECOVERY\n#90: {board.RECOVERY_STEP}\n\n"
+    )

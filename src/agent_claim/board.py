@@ -87,6 +87,7 @@ CLASSIFICATION_LINE_PATTERN = re.compile(
     r"(?im)^(?P<kind>Work-Item|No-Item):[ \t]*(?P<value>[^\r\n]*?)[ \t]*$"
 )
 WORK_ITEM_VALUE_PATTERN = re.compile(QUALIFIED_REFERENCE)
+RECOVERY_STEP = "close or re-project"
 # A slice's pull request must never close its still-open epic — that would
 # retire the epic before its remaining slices exist. This repository's
 # established substitute is a whole line opening with one of these markers
@@ -112,14 +113,6 @@ _SLICE_TABLE_SEPARATOR_CELL_PATTERN = re.compile(r"^:?-+:?$")
 _SLICE_TABLE_INDEX_PATTERN = re.compile(r"^[1-9][0-9]*$")
 _SLICE_TABLE_ITEM_LINK_PATTERN = re.compile(r"^#([1-9][0-9]*)$")
 UNDISPATCHED_SLICE_CELL = "—"
-# A stricter sibling of `TOUCHES_WITHOUT_CLOSING_LINE_PATTERN`, deliberately
-# not reused: that pattern accepts several markers and arbitrary trailing
-# text because a PR may carry more than one reference in one line; an issue
-# has exactly one parent, so this line-anchored form accepts only `Part of
-# #<n>` (optionally followed by a period) and nothing else on the line — a
-# second number, or trailing prose, means the line isn't read as a parent
-# relation at all.
-PART_OF_LINE_PATTERN = re.compile(r"(?im)^Part of #([1-9][0-9]*)\.?[ \t]*$")
 # The three slice-title forms seen in atelier-2 (`#79`): a parenthetical
 # after the real title (`(#962 Scheibe 4)`, `(#962 slice 4)`) or a leading
 # German phrase (`Scheibe 4 von #962`).
@@ -187,6 +180,14 @@ class IssueReference:
 
     def __str__(self) -> str:
         return f"{self.repository}#{self.number}"
+
+
+@dataclass(frozen=True)
+class ParentIssue:
+    """The issue GitHub records as an item's parent through its sub-issue relation."""
+
+    reference: IssueReference
+    body: str
 
 
 class NoItemKind(StrEnum):
@@ -353,14 +354,19 @@ class BoardItem:
 class Board:
     """`items`, and therefore `ready_now`, are ordered `(priority_category, -score, number)`.
 
-    `ready_now` and `stale` are filters over `items`; filtering never
-    reorders, so `ready_now[0]` is always `items`' first actionable row —
-    the same row a human reading `board` sees first. `next` relies on this.
+    `ready_now`, `stale`, and `recovery` are filters over `items`; filtering
+    never reorders, so `ready_now[0]` is always `items`' first actionable row
+    — the same row a human reading `board` sees first. `next` relies on this.
+
+    `recovery` holds the items a merged pull request declared as its work
+    item while they stayed open: the landing happened, the bookkeeping did
+    not.
     """
 
     items: tuple[BoardItem, ...]
     ready_now: tuple[BoardItem, ...]
     stale: tuple[BoardItem, ...]
+    recovery: tuple[BoardItem, ...]
     blocker_references: tuple[BlockerReference, ...]
 
 
@@ -716,13 +722,6 @@ def parse_slice_table(body: str) -> tuple[SliceTableEntry, ...]:
     return tuple(entries)
 
 
-def parent_line_numbers(body: str) -> frozenset[int]:
-    """Every issue number named on its own `Part of #<n>` line."""
-    return frozenset(
-        int(match.group(1)) for match in PART_OF_LINE_PATTERN.finditer(_live_text(body))
-    )
-
-
 def _issue_reference(match: re.Match[str], repository: str) -> IssueReference:
     return IssueReference(match.group("repository") or repository, int(match.group("number")))
 
@@ -776,6 +775,21 @@ def parse_pull_request_classification(
             f"carries `No-Item: {value}`; an issue-less pull request is docs or fix"
         )
     return NoItemClassification(NoItemKind(value.lower()))
+
+
+def declared_work_items(
+    pull_requests: tuple[PullRequest, ...], repository: str
+) -> frozenset[int]:
+    """The issues of `repository` that these pull requests declare as their work item."""
+    declared: set[int] = set()
+    for pull_request in pull_requests:
+        classification = parse_pull_request_classification(pull_request.body, repository)
+        if (
+            isinstance(classification, WorkItemClassification)
+            and classification.item.repository == repository
+        ):
+            declared.add(classification.item.number)
+    return frozenset(declared)
 
 
 def slice_title_match(title: str) -> tuple[int, int] | None:
@@ -1111,6 +1125,7 @@ def build_board(
     landed_references = _associated_issues(
         recent_merged_pull_requests, repository
     ) | _touched_without_closing(recent_merged_pull_requests)
+    landed_work_items = declared_work_items(recent_merged_pull_requests, repository)
     open_branches = frozenset(pr.head_ref_name for pr in open_pull_requests)
 
     items: list[BoardItem] = []
@@ -1209,6 +1224,11 @@ def build_board(
             for item in ordered
             if item.idle_days > 7 and item.stage is Stage.TEXT_ONLY
         ),
+        recovery=tuple(
+            item
+            for item in ordered
+            if item.number in landed_work_items and item.number != protocol.LEDGER_ISSUE
+        ),
         blocker_references=blocker_references,
     )
 
@@ -1229,7 +1249,7 @@ def highest_scored_actionable(board: Board) -> BoardItem | None:
 def board_json(board: Board) -> str:
     payload = asdict(board)
     payload.pop("blocker_references")
-    for group in ("items", "ready_now", "stale"):
+    for group in ("items", "ready_now", "stale", "recovery"):
         for item in payload[group]:
             freed_on = item["freed_on"]
             item["freed_on"] = (
@@ -1285,7 +1305,11 @@ def render(board: Board) -> str:
     )
     ready = ", ".join(f"#{item.number}" for item in board.ready_now) or "none"
     stale = ", ".join(f"#{item.number}" for item in board.stale) or "none"
-    return f"{table}\n\nREADY NOW\n{ready}\n\nSTALE\n{stale}"
+    recovery = ", ".join(f"#{item.number}" for item in board.recovery) or "none"
+    return (
+        f"{table}\n\nREADY NOW\n{ready}\n\nSTALE\n{stale}\n\n"
+        f"RECOVERY ({RECOVERY_STEP})\n{recovery}"
+    )
 
 
 def _contract_summary(contract: Contract) -> str:

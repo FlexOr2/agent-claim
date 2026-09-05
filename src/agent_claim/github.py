@@ -452,6 +452,65 @@ class GitHubIssueComments:
             raise ClaimError("GitHub returned a malformed pull request")
         return self._pull_request_detail(values[0])
 
+    def _issue_reference(self, value: object, description: str) -> board.IssueReference:
+        if not isinstance(value, dict):
+            raise ClaimError(f"GitHub returned a malformed {description}")
+        number = value.get("number")
+        repository_url = value.get("repository")
+        repository = (
+            repository_url.rpartition("/repos/")[2] if isinstance(repository_url, str) else None
+        )
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, int)
+            or number < 1
+            or repository is None
+            or REPOSITORY_PATTERN.fullmatch(repository) is None
+        ):
+            raise ClaimError(f"GitHub returned a malformed {description}")
+        return board.IssueReference(repository, number)
+
+    def parent_issue(self, number: int) -> board.ParentIssue | None:
+        """The issue GitHub records as `number`'s parent, or None when it has none."""
+        try:
+            raw = self._run(
+                [
+                    "api",
+                    f"repos/{self.repository}/issues/{number}/parent",
+                    "--jq",
+                    '{number,repository:.repository_url,body:(.body // "")}',
+                ]
+            )
+        except ClaimError as error:
+            # The sub-issue endpoint answers "no parent" with an HTTP 404, which
+            # `gh api` reports in its combined output; that is an answer, not a
+            # failure.
+            if "HTTP 404" in str(error):
+                return None
+            raise
+        values = self._json_lines(raw, "parent issue")
+        if len(values) != 1 or not isinstance(values[0], dict):
+            raise ClaimError("GitHub returned a malformed parent issue")
+        body = values[0].get("body")
+        if not isinstance(body, str):
+            raise ClaimError("GitHub returned a malformed parent issue")
+        return board.ParentIssue(self._issue_reference(values[0], "parent issue"), body)
+
+    def open_sub_issues(self, number: int) -> tuple[board.IssueReference, ...]:
+        raw = self._run(
+            [
+                "api",
+                "--paginate",
+                f"repos/{self.repository}/issues/{number}/sub_issues?per_page=100",
+                "--jq",
+                '.[] | select(.state == "open") | {number,repository:.repository_url}',
+            ]
+        )
+        return tuple(
+            self._issue_reference(value, "sub-issue")
+            for value in self._json_lines(raw, "sub-issue")
+        )
+
     def default_branch(self) -> str:
         branch = self._run(
             ["api", f"repos/{self.repository}", "--jq", ".default_branch"]

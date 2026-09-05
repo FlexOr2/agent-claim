@@ -770,12 +770,24 @@ def _ruling_pull_hint(item: board.BoardItem) -> str | None:
     )
 
 
-def _next_json(item: board.BoardItem | None, skipped: tuple[board.BoardItem, ...]) -> int:
+def _next_json(
+    item: board.BoardItem | None,
+    skipped: tuple[board.BoardItem, ...],
+    recovery: tuple[board.BoardItem, ...],
+) -> int:
     payload: dict[str, object] = {
+        "recovery": [
+            {
+                "number": recovery_item.number,
+                "title": recovery_item.title,
+                "step": board.RECOVERY_STEP,
+            }
+            for recovery_item in recovery
+        ],
         "skipped": [
             {"number": skipped_item.number, "reason": skipped_item.actionable_reason}
             for skipped_item in skipped
-        ]
+        ],
     }
     if item is not None:
         payload.update(
@@ -795,13 +807,24 @@ def _next_json(item: board.BoardItem | None, skipped: tuple[board.BoardItem, ...
     return 0
 
 
-def _next(item: board.BoardItem | None, skipped: tuple[board.BoardItem, ...]) -> int:
-    lines = (
-        [f"#{item.number} score {item.score}: {item.title}", f"Next: {item.next_step}"]
-        if item is not None
-        else ["No actionable item."]
-    )
-    if item is not None:
+def _next(
+    item: board.BoardItem | None,
+    skipped: tuple[board.BoardItem, ...],
+    recovery: tuple[board.BoardItem, ...],
+) -> int:
+    """A landed-but-open item is named before anything new is pulled."""
+    lines: list[str] = []
+    if recovery:
+        lines.append("RECOVERY")
+        lines.extend(
+            f"#{recovery_item.number}: {board.RECOVERY_STEP}" for recovery_item in recovery
+        )
+        lines.append("")
+    if item is None:
+        lines.append("No actionable item.")
+    else:
+        lines.append(f"#{item.number} score {item.score}: {item.title}")
+        lines.append(f"Next: {item.next_step}")
         hint = _ruling_pull_hint(item)
         if hint is not None:
             lines.append(hint)
@@ -1003,19 +1026,23 @@ def _slice_row_checks(
     )
 
 
-def _parent_line_checks(title: str, body: str) -> tuple[SliceCheck, ...]:
+def _parent_checks(
+    client: github.GitHubIssueComments, repository: str, issue: int, title: str
+) -> tuple[SliceCheck, ...]:
+    """Warn when a slice-shaped title names a parent GitHub does not record as one."""
     match = board.slice_title_match(title)
     if match is None:
         return ()
     slice_number, parent_issue = match
-    if parent_issue in board.parent_line_numbers(body):
+    parent = client.parent_issue(issue)
+    if parent is not None and parent.reference == board.IssueReference(repository, parent_issue):
         return ()
     return (
         SliceCheck(
             "warning",
-            "missing-parent-line",
-            f"looks like slice {slice_number} of #{parent_issue} but carries no "
-            f'"Part of #{parent_issue}" line; the parent inherits nothing',
+            "missing-parent",
+            f"looks like slice {slice_number} of #{parent_issue} but is no sub-issue "
+            f"of #{parent_issue}; the parent inherits nothing",
             slice=slice_number,
             issue=parent_issue,
         ),
@@ -1050,6 +1077,7 @@ def _body_contract_checks(
 
 
 def _slice_rule_checks(
+    client: github.GitHubIssueComments,
     repository: str,
     open_by_number: dict[int, board.Issue],
     issue: int,
@@ -1077,8 +1105,8 @@ def _slice_rule_checks(
     if body is not None:
         for entry in board.parse_slice_table(body):
             checks.extend(_slice_table_entry_checks(repository, open_by_number, entry))
-    if title is not None and body is not None:
-        checks.extend(_parent_line_checks(title, body))
+    if title is not None:
+        checks.extend(_parent_checks(client, repository, issue, title))
     return tuple(checks)
 
 
@@ -1109,10 +1137,52 @@ def _claim_defect(
     )
 
 
+@dataclass(frozen=True)
+class _ParentRequirement:
+    """What an item's parent demands of the pull request that lands the item."""
+
+    reference: board.IssueReference
+    closing_required: bool
+
+
+def _parent_requirement(
+    client: github.GitHubIssueComments,
+    repository: str,
+    item: board.IssueReference,
+) -> _ParentRequirement | board.ClassificationDefect | None:
+    """The parent's demand, read from GitHub's sub-issue relation.
+
+    Closing a parent's last open child completes the parent, so that landing
+    closes the parent too. A parent keeping other open children stays open,
+    and must say what happens next.
+    """
+    parent = client.parent_issue(item.number)
+    if parent is None:
+        return None
+    if parent.reference.repository != repository:
+        return board.ClassificationDefect(
+            f"has parent {parent.reference} in another repository, "
+            "whose children this check cannot read"
+        )
+    remaining = tuple(
+        child for child in client.open_sub_issues(parent.reference.number) if child != item
+    )
+    if not remaining:
+        return _ParentRequirement(parent.reference, True)
+    if board.parse_contract(parent.body).next is None:
+        children = "child" if len(remaining) == 1 else "children"
+        return board.ClassificationDefect(
+            f"leaves parent {parent.reference} open with {len(remaining)} other open "
+            f"{children}, whose body carries no Next line"
+        )
+    return _ParentRequirement(parent.reference, False)
+
+
 def _closing_defect(
     detail: board.PullRequestDetail,
     repository: str,
     item: board.IssueReference,
+    requirement: _ParentRequirement | None,
 ) -> board.ClassificationDefect | None:
     """Which issues this landing must close, and that it closes nothing else."""
     closing = board.closing_references(detail.body, repository)
@@ -1120,7 +1190,18 @@ def _closing_defect(
         return board.ClassificationDefect(
             f"carries no closing reference for its work item {item}"
         )
-    besides = tuple(sorted(closing - {item}, key=str))
+    completed_parent = (
+        {requirement.reference}
+        if requirement is not None and requirement.closing_required
+        else set()
+    )
+    missing_parent = completed_parent - closing
+    if missing_parent:
+        parent = next(iter(missing_parent))
+        return board.ClassificationDefect(
+            f"closes the last open child of parent {parent}; close the parent too"
+        )
+    besides = tuple(sorted(closing - {item} - completed_parent, key=str))
     if besides:
         named = ", ".join(str(reference) for reference in besides)
         return board.ClassificationDefect(
@@ -1147,7 +1228,10 @@ def _work_item_defect(
     claim_defect = _claim_defect(client, detail, item)
     if claim_defect is not None:
         return claim_defect
-    return _closing_defect(detail, repository, item)
+    requirement = _parent_requirement(client, repository, item)
+    if isinstance(requirement, board.ClassificationDefect):
+        return requirement
+    return _closing_defect(detail, repository, item, requirement)
 
 
 def _checked_classification(
@@ -1393,14 +1477,19 @@ def main(arguments: list[str] | None = None) -> int:
             projected = _board(client, protocol.active_claims(comments))
             item = board.highest_scored_actionable(projected)
             skipped = _unworkable(projected)
+            recovery = projected.recovery
             if item is None:
-                if skipped:
+                if skipped or recovery:
                     if parsed.json:
-                        _next_json(None, skipped)
+                        _next_json(None, skipped, recovery)
                     else:
-                        _next(None, skipped)
+                        _next(None, skipped, recovery)
                 return 3
-            return _next_json(item, skipped) if parsed.json else _next(item, skipped)
+            return (
+                _next_json(item, skipped, recovery)
+                if parsed.json
+                else _next(item, skipped, recovery)
+            )
         if parsed.command == "who":
             claims = protocol._ledger_claims(client)
             if parsed.json:
@@ -1480,6 +1569,7 @@ def main(arguments: list[str] | None = None) -> int:
                         client, protocol._ledger_claims(client), issues=open_issues
                     )
                     checks = _slice_rule_checks(
+                        client,
                         repository,
                         open_by_number,
                         target_issue,

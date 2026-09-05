@@ -7,8 +7,8 @@ Codex, Claude, Grok, people, and future agents use the same contract.
 ## Install and maintain
 
 ```bash
-uv tool install git+https://github.com/FlexOr2/agent-claim.git@v0.8.0
-# or: pipx install git+https://github.com/FlexOr2/agent-claim.git@v0.8.0
+uv tool install git+https://github.com/FlexOr2/agent-claim.git@v0.9.0
+# or: pipx install git+https://github.com/FlexOr2/agent-claim.git@v0.9.0
 uv tool upgrade agent-claim
 uv tool uninstall agent-claim
 ```
@@ -132,6 +132,14 @@ classification line inside a fenced code block is documentation, never a
 declaration. `Advances #n` is read nowhere: a dispatched slice is its own item,
 and its pull request closes it.
 
+Parentage is GitHub's own sub-issue relation, not a line in a body. `pr-check`
+reads the work item's recorded parent and that parent's open sub-issues: a
+landing that closes the parent's last open child must close the parent too,
+while a parent that keeps other open children must stay open and carry a `Next`
+line in its body. A parent recorded in another repository is refused by name,
+never skipped silently. `claim` warns when a slice-shaped title such as
+`Schema (#79 Scheibe 21)` names a parent that GitHub does not record as one.
+
 ## Read-only board projection
 
 `agent-claim board` reads the open issues, open PRs, PRs merged since the
@@ -174,6 +182,12 @@ issue blocker has closed, using the latest such UTC closing date and whole days
 since then; it otherwise shows `-`. Every item in `board --json` carries the
 same values as `freed_on` (`YYYY-MM-DD` or `null`) and `freed_days` (a
 nonnegative integer or `null`).
+
+`board` ends with a `RECOVERY (close or re-project)` section, and `next` names
+those items first with that step: open issues that a merged pull request already
+declared as its `Work-Item:` — the landing happened, the bookkeeping did not. It
+is keyed on that typed line, never on an issue's update time, and never names
+the ledger issue. `next --json` carries the same items under `recovery`.
 
 `agent-claim rulings` lists only open board items with open expectation lines
 as `#NUMBER OPEN/TOTAL: TITLE`; `rulings --json` returns the same `number`,
