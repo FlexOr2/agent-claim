@@ -36,13 +36,15 @@ line-length = 100
 
 [tool.ruff.lint]
 # PLR0911 (too-many-return-statements), PLR0912 (too-many-branches) and
-# PLR0915 (too-many-statements) stay unselected: the functions they flag
-# today are open complexity work, split across owners --
-#   main, _parser, _protect_write: #119
-#   _bounded_command: #117
-#   build_board, parse_pull_request_classification,
-#   _acquire_claim_with_observed: the protocol/board complexity slice of
-#   distributor #103 (not yet its own item)
+# PLR0915 (too-many-statements) stay unselected: #134 landed the
+# protocol/board complexity slice of distributor #103 (build_board,
+# parse_pull_request_classification, _acquire_claim_with_observed and the
+# rest of protocol.py/board.py), and #117/#119 each closed their own slice,
+# but three violators remain, none yet owned by an item --
+#   cli.py _parser (PLR0915, 60 > 50)
+#   cli.py _protect_write (PLR0911, 8 > 6)
+#   tests/test_cli.py test_board_projects_fixture_json_without_github_writes
+#     (PLR0915, 66 > 50)
 # -- re-enable once the last of these lands.
 select = ["E", "F", "I", "B", "UP", "SIM", "RUF", "PL", "FURB", "N"]
 ignore = [
