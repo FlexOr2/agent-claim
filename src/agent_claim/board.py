@@ -36,7 +36,8 @@ OPERATOR_RULING_DATE_PATTERN = re.compile(
 )
 RULING_OLD_AFTER_LANDINGS = 10
 FROZEN_LINE_PATTERN = re.compile(
-    r"(?m)^[> \t]*(?:\*\*Eingefroren bis:\*\*|Eingefroren bis:)[ \t]*(?P<value>[^\r\n]*)$"
+    r"(?m)^(?:[ \t]{0,3}>)*[ \t]{0,3}(?:\*\*Eingefroren bis:\*\*|Eingefroren bis:)"
+    r"[ \t]*(?P<value>[^\r\n]*)$"
 )
 FROZEN_TRIGGER_PATTERN = re.compile(
     r"(?P<trigger>\S.*?)[ \t]*\(Operator,[ \t]*"

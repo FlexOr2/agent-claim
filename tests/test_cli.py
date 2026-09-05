@@ -12190,8 +12190,10 @@ def test_a_non_ascii_digit_in_a_hash_reference_is_not_an_issue_number() -> None:
 
 def test_a_nested_quoted_frozen_line_still_parses_and_an_indented_line_does_not() -> None:
     quoted = "> > **Eingefroren bis:** 2026-09-30 (Operator, 30.09.2026)"
+    indented = "    **Eingefroren bis:** 2026-09-30 (Operator, 30.09.2026)"
 
     assert board.frozen_trigger(quoted) == "2026-09-30"
+    assert board.frozen_trigger(indented) is None
 
 
 def test_a_frozen_line_indented_by_three_spaces_parses_like_an_unindented_one() -> None:
