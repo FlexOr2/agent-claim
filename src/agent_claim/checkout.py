@@ -3,83 +3,48 @@
 from __future__ import annotations
 
 import os
-import re
-import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import github
-from .protocol import REPOSITORY_PATTERN, ClaimError, ClaimRequest, _outbound_text
+from . import process
+from .protocol import ClaimError, ClaimRequest, _outbound_text
 
-GH_TIMEOUT_SECONDS = 60
 AGENT_CLAIM_AGENT_ENV = "AGENT_CLAIM_AGENT"
 GROK_SESSION_ID_ENV = "GROK_SESSION_ID"
 CLAUDE_SESSION_ID_ENV = "CLAUDE_SESSION_ID"
 
 
-def _repository(explicit: str | None) -> str:
-    if explicit:
-        repository = explicit
-    else:
-        try:
-            result = subprocess.run(
-                ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=GH_TIMEOUT_SECONDS,
-                env=github.github_command_environment(),
-            )
-        except FileNotFoundError as error:
-            raise ClaimError("gh is required for issue claims") from error
-        except subprocess.TimeoutExpired as error:
-            raise ClaimError("gh timed out while resolving the repository") from error
-        cleaned = github.strip_ansi(result.stdout).strip()
-        if result.returncode == 0 and cleaned:
-            repository = cleaned
-        else:
-            remote = _git_output(["config", "--get", "remote.origin.url"])
-            match = re.search(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?$", remote)
-            if match is None:
-                raise ClaimError("cannot resolve GitHub repository; pass --repo OWNER/REPO")
-            repository = f"{match.group(1)}/{match.group(2)}"
-    if re.fullmatch(REPOSITORY_PATTERN, repository) is None:
-        raise ClaimError("repository must be OWNER/REPO")
-    return repository
-
-
 def _git_output(arguments: list[str]) -> str:
     try:
-        result = subprocess.run(
-            ["git", *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=GH_TIMEOUT_SECONDS,
-        )
-    except FileNotFoundError as error:
+        result = process.run_captured(["git", *arguments])
+    except process.ExecutableMissingError as error:
         raise ClaimError("git is required for issue claims") from error
-    except subprocess.TimeoutExpired as error:
+    except process.ProcessTimedOutError as error:
         raise ClaimError("git timed out while validating the build checkout") from error
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "unknown git failure"
+    if result.exit_status != 0:
+        detail = (
+            result.stderr.decode().strip()
+            or result.stdout.decode().strip()
+            or "unknown git failure"
+        )
         raise ClaimError(detail)
-    return result.stdout.strip()
+    return result.stdout.decode().strip()
+
+
+def origin_remote_url() -> str:
+    """The checkout's `origin` remote, for the GitHub-remote fallback in
+    `github.discover_repository` when `gh` cannot itself resolve a repository."""
+    return _git_output(["config", "--get", "remote.origin.url"])
 
 
 def versioned_paths() -> tuple[str, ...]:
     try:
-        result = subprocess.run(
-            ["git", "ls-files", "-z", "--full-name"],
-            check=False,
-            capture_output=True,
-            timeout=GH_TIMEOUT_SECONDS,
-        )
-    except FileNotFoundError as error:
+        result = process.run_captured(["git", "ls-files", "-z", "--full-name"])
+    except process.ExecutableMissingError as error:
         raise ClaimError("git is required for issue claims") from error
-    except subprocess.TimeoutExpired as error:
+    except process.ProcessTimedOutError as error:
         raise ClaimError("git timed out while validating the build checkout") from error
-    if result.returncode != 0:
+    if result.exit_status != 0:
         detail = (
             result.stderr.decode().strip()
             or result.stdout.decode().strip()

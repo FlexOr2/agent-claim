@@ -10,15 +10,13 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import StrEnum
 from pathlib import Path
 
-from . import __version__, board, checkout, discovery, github, protocol
+from . import __version__, board, checkout, discovery, forge, github, protocol
 
 AGENT_CLAIM_AGENT_ENV = checkout.AGENT_CLAIM_AGENT_ENV
 CLAUDE_SESSION_ID_ENV = checkout.CLAUDE_SESSION_ID_ENV
 GROK_SESSION_ID_ENV = checkout.GROK_SESSION_ID_ENV
-GitHubIssueComments = github.GitHubIssueComments
 MAX_COMMENT_BYTES = protocol.MAX_COMMENT_BYTES
 ActiveClaim = protocol.ActiveClaim
 ClaimError = protocol.ClaimError
@@ -41,7 +39,6 @@ _active_projection = protocol._active_projection
 _git_output = checkout._git_output
 _projection_ledger = protocol._projection_ledger
 _projection_marker = protocol._projection_marker
-_repository = checkout._repository
 _resolved_agent = checkout._resolved_agent
 _timestamp = board._timestamp
 _unclaimed_projection = protocol._unclaimed_projection
@@ -650,7 +647,7 @@ def _merged_pull_request_floor(issues: tuple[board.Issue, ...], now: datetime) -
     landing keep crediting its still-open epic for as long as the epic stays
     open, rather than for a fixed number of days after which the credit
     silently reverts. Residual: the underlying query is still capped (see
-    `GitHubIssueComments.list_recent_merged_board_pull_requests`), so an epic
+    `GitHubForge.list_recent_merged_board_pull_requests`), so an epic
     old enough to have more merges than that cap between its filing and now
     can still lose credit for an early slice; this floor removes the
     fortnight-sized version of that gap, not every version of it.
@@ -661,7 +658,7 @@ def _merged_pull_request_floor(issues: tuple[board.Issue, ...], now: datetime) -
 
 
 def _board(
-    client: github.GitHubIssueComments,
+    client: forge.ForgeReader,
     claims: tuple[protocol.ActiveClaim, ...],
     *,
     issues: tuple[board.Issue, ...] | None = None,
@@ -685,7 +682,7 @@ def _board(
         *pull_requests,
         claims,
         board.load_config(toplevel / ".agent-claim" / "board.toml"),
-        repository=client.repository,
+        repository=client.repository.path,
         blocker_references=blocker_references.result(),
         now=now,
         trunk_landings=checkout.trunk_landing_times(),
@@ -813,21 +810,6 @@ def _unworkable(projected: board.Board) -> tuple[board.BoardItem, ...]:
     return tuple(item for item in projected.items if not item.actionable)
 
 
-class ReferenceState(StrEnum):
-    """A referenced issue's state, as seen from this repository."""
-
-    OPEN = "open"
-    CLOSED = "closed"
-    MISSING = "missing"
-
-
-@dataclass(frozen=True)
-class _IssueReference:
-    state: ReferenceState
-    title: str | None = None
-    body: str | None = None
-
-
 @dataclass(frozen=True)
 class SliceCheck:
     """One slice-rule finding — the `check` table `#79` rules.
@@ -857,7 +839,7 @@ class SliceCheck:
         }
 
 
-def _fetch_issue_reference(client: github.GitHubIssueComments, number: int) -> _IssueReference:
+def _fetch_issue_reference(client: forge.ForgeReader, number: int) -> forge.ItemReference:
     """The live state, title, and body of issue `number` from `client`.
 
     Called only for a claim target that the already-fetched open board
@@ -866,44 +848,17 @@ def _fetch_issue_reference(client: github.GitHubIssueComments, number: int) -> _
     lookup; this is that lookup, kept to one issue at a time rather than a
     repository-wide query.
     """
-    try:
-        raw = client.issue_reference_json(number)
-    except protocol.ClaimError as error:
-        # `gh api` reports a nonexistent issue as an HTTP 404 in its combined
-        # stdout/stderr text; `_bounded_command` doesn't expose the process's
-        # real exit status, so this substring is the only signal available
-        # to tell a missing issue apart from every other adapter failure.
-        if "HTTP 404" in str(error):
-            return _IssueReference(ReferenceState.MISSING)
-        raise
-    try:
-        value = json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise protocol.ClaimError("GitHub returned a malformed issue reference") from error
-    state = value.get("state") if isinstance(value, dict) else None
-    title = value.get("title") if isinstance(value, dict) else None
-    body = value.get("body") if isinstance(value, dict) else None
-    if (
-        state not in {"open", "closed"}
-        or not isinstance(title, str)
-        or (body is not None and not isinstance(body, str))
-    ):
-        raise protocol.ClaimError("GitHub returned a malformed issue reference")
-    return _IssueReference(
-        ReferenceState.OPEN if state == "open" else ReferenceState.CLOSED,
-        title,
-        body or "",
-    )
+    return client.item_reference(number)
 
 
 def _issue_reference_state(
-    client: github.GitHubIssueComments,
+    client: forge.ForgeReader,
     open_by_number: dict[int, board.Issue],
     number: int,
-) -> tuple[ReferenceState, str | None, str | None]:
+) -> tuple[forge.ItemState, str | None, str | None]:
     open_issue = open_by_number.get(number)
     if open_issue is not None:
-        return ReferenceState.OPEN, open_issue.title, open_issue.body
+        return forge.ItemState.OPEN, open_issue.title, open_issue.body
     reference = _fetch_issue_reference(client, number)
     return reference.state, reference.title, reference.body
 
@@ -928,7 +883,7 @@ def _out_of_order_check(
 
 
 def _parent_checks(
-    client: github.GitHubIssueComments, repository: str, issue: int, title: str
+    client: forge.ForgeReader, repository: str, issue: int, title: str
 ) -> SliceCheck | None:
     """Warn when a slice-shaped title names a parent GitHub does not record as one."""
     match = board.slice_title_match(title)
@@ -981,7 +936,7 @@ class BoardReferenceLookup:
     resolve `#reference`s against — what every cross-issue slice/parent check
     below needs to look a referenced issue up."""
 
-    client: github.GitHubIssueComments
+    client: forge.ForgeReader
     repository: str
     open_by_number: dict[int, board.Issue]
 
@@ -997,9 +952,9 @@ def _slice_rule_checks(
     if out_of_order is not None:
         checks.append(out_of_order)
     state, title, _body = _issue_reference_state(lookup.client, lookup.open_by_number, issue)
-    if state is ReferenceState.CLOSED:
+    if state is forge.ItemState.CLOSED:
         checks.append(SliceCheck("error", "closed-issue", f"issue #{issue} is closed", issue=issue))
-    elif state is ReferenceState.MISSING:
+    elif state is forge.ItemState.MISSING:
         checks.append(
             SliceCheck("error", "missing-issue", f"issue #{issue} does not exist here", issue=issue)
         )
@@ -1023,13 +978,13 @@ def _refuse_claim(json_mode: bool, issue: int | None, checks: tuple[SliceCheck, 
 
 
 def _claim_defect(
-    client: github.GitHubIssueComments,
-    detail: board.PullRequestDetail,
+    client: forge.ForgeReader,
+    detail: forge.Landing,
     identity: protocol.ClaimIdentity,
 ) -> board.ClassificationDefect | None:
     """A landing declares only what its own head branch holds a live claim on."""
     if any(
-        claim.identity == identity and claim.branch == detail.head_ref_name
+        claim.identity == identity and claim.branch == detail.source_branch
         for claim in protocol._ledger_claims(client)
     ):
         return None
@@ -1038,13 +993,13 @@ def _claim_defect(
         if isinstance(identity, protocol.IssueIdentity)
         else "issue-less lane claim"
     )
-    return board.ClassificationDefect(f"has no active {subject} on branch {detail.head_ref_name!r}")
+    return board.ClassificationDefect(f"has no active {subject} on branch {detail.source_branch!r}")
 
 
 def _no_item_defect(
-    client: github.GitHubIssueComments,
+    client: forge.ForgeReader,
     repository: str,
-    detail: board.PullRequestDetail,
+    detail: forge.Landing,
 ) -> board.ClassificationDefect | None:
     """Why this repository does not accept an issue-less landing as declared.
 
@@ -1073,7 +1028,7 @@ class _ParentRequirement:
 
 
 def _parent_requirement(
-    client: github.GitHubIssueComments,
+    client: forge.ForgeReader,
     repository: str,
     item: board.IssueReference,
 ) -> _ParentRequirement | board.ClassificationDefect | None:
@@ -1092,7 +1047,7 @@ def _parent_requirement(
             "whose children this check cannot read"
         )
     remaining = tuple(
-        child for child in client.open_sub_issues(parent.reference.number) if child != item
+        child for child in client.open_children(parent.reference.number) if child != item
     )
     if not remaining:
         return _ParentRequirement(parent.reference, True)
@@ -1106,7 +1061,7 @@ def _parent_requirement(
 
 
 def _closing_defect(
-    detail: board.PullRequestDetail,
+    detail: forge.Landing,
     repository: str,
     item: board.IssueReference,
     requirement: _ParentRequirement | None,
@@ -1136,9 +1091,9 @@ def _closing_defect(
 
 
 def _work_item_defect(
-    client: github.GitHubIssueComments,
+    client: forge.ForgeReader,
     repository: str,
-    detail: board.PullRequestDetail,
+    detail: forge.Landing,
     item: board.IssueReference,
 ) -> board.ClassificationDefect | None:
     """Why this repository does not accept `item` as the landing pull request's work item."""
@@ -1160,20 +1115,20 @@ def _work_item_defect(
 
 
 def _checked_classification(
-    client: github.GitHubIssueComments, repository: str, detail: board.PullRequestDetail
+    client: forge.ForgeReader, repository: str, detail: forge.Landing
 ) -> board.Classification | board.ClassificationDefect:
-    if detail.head_repository != repository:
+    if detail.source_repository.path != repository:
         return board.ClassificationDefect(
-            f"proposes a branch of {detail.head_repository}; cross-repository pull "
+            f"proposes a branch of {detail.source_repository}; cross-repository pull "
             "requests are not classified"
         )
     classification = board.parse_pull_request_classification(detail.body, repository)
     if isinstance(classification, board.ClassificationDefect):
         return classification
     default_branch = client.default_branch()
-    if detail.base_ref_name != default_branch:
+    if detail.target_branch != default_branch:
         return board.ClassificationDefect(
-            f"targets {detail.base_ref_name!r}, not the default branch {default_branch!r}"
+            f"targets {detail.target_branch!r}, not the default branch {default_branch!r}"
         )
     defect = (
         _no_item_defect(client, repository, detail)
@@ -1183,8 +1138,8 @@ def _checked_classification(
     return classification if defect is None else defect
 
 
-def _pull_request_check(client: github.GitHubIssueComments, repository: str, number: int) -> int:
-    detail = client.pull_request_detail(number)
+def _pull_request_check(client: forge.ForgeReader, repository: str, number: int) -> int:
+    detail = client.landing(number)
     checked = _checked_classification(client, repository, detail)
     if isinstance(checked, board.ClassificationDefect):
         print(f"REFUSED: pull request #{detail.number} {checked.message}", file=sys.stderr)
@@ -1202,19 +1157,19 @@ def _release_outcome(merged: int | None, abandoned: str | None) -> protocol.Rele
 
 
 def _verify_merged_release(
-    client: github.GitHubIssueComments,
+    client: forge.ForgeReader,
     repository: str,
     identity: protocol.ClaimIdentity,
     merged: protocol.MergedRelease,
 ) -> None:
     """Refuse a `--merged` release the landing itself does not support."""
-    detail = client.pull_request_detail(merged.pull_request)
+    detail = client.landing(merged.pull_request)
     if not detail.merged:
         raise protocol.ClaimUnavailableError(f"pull request #{detail.number} is not merged")
     default_branch = client.default_branch()
-    if detail.base_ref_name != default_branch:
+    if detail.target_branch != default_branch:
         raise protocol.ClaimUnavailableError(
-            f"pull request #{detail.number} merged into {detail.base_ref_name!r}, "
+            f"pull request #{detail.number} merged into {detail.target_branch!r}, "
             f"not the default branch {default_branch!r}"
         )
     classification = board.parse_pull_request_classification(detail.body, repository)
@@ -1235,7 +1190,7 @@ def _verify_merged_release(
             f"pull request #{detail.number} names {classification}, not work item #{identity.issue}"
         )
     reference = _fetch_issue_reference(client, identity.issue)
-    if reference.state is not ReferenceState.CLOSED:
+    if reference.state is not forge.ItemState.CLOSED:
         raise protocol.ClaimUnavailableError(
             f"work item #{identity.issue} is {reference.state.value}, not closed"
         )
@@ -1310,12 +1265,14 @@ def _protect_write(repository: str | None, payload: dict[str, object]) -> int:
     relative = _protect_relative_path(raw_path)
     if relative is None:
         return _hook_deny(PATH_REQUIRED)
-    client = github.GitHubIssueComments(checkout._repository(repository))
-    ledger = discovery.discover_ledger(client)
+    forge_handle = github.GitHubForge(
+        github.discover_repository(repository, remote_url=checkout.origin_remote_url)
+    )
+    ledger = discovery.discover_ledger(forge_handle)
     if ledger is None:
         return _hook_deny("claim first")
     protocol.configure_ledger(ledger)
-    for claim in protocol._ledger_claims(client):
+    for claim in protocol._ledger_claims(forge_handle):
         if (
             claim.agent == agent
             and claim.branch == branch
@@ -1346,10 +1303,18 @@ def _optional_issue_number(value: int | None) -> int | None:
 
 
 @dataclass(frozen=True)
-class _CommandSession:
-    """What a dispatched subcommand needs beyond its own parsed arguments."""
+class _ReadSession:
+    """What a dispatched read-only subcommand needs beyond its parsed arguments."""
 
-    client: github.GitHubIssueComments
+    forge: forge.ForgeReader
+    ledger: int
+
+
+@dataclass(frozen=True)
+class _WriteSession:
+    """What a dispatched write subcommand needs beyond its parsed arguments."""
+
+    forge: forge.ForgeWriter
     ledger: int
     release_branch: str | None
 
@@ -1385,14 +1350,14 @@ def _rescope_command(parsed: argparse.Namespace) -> _RescopeCommand:
     )
 
 
-def _cmd_pull_request_check(parsed: argparse.Namespace, session: _CommandSession) -> int:
+def _cmd_pull_request_check(parsed: argparse.Namespace, session: _ReadSession) -> int:
     pull_request_number = int(parsed.pr)
-    return _pull_request_check(session.client, session.client.repository, pull_request_number)
+    return _pull_request_check(session.forge, session.forge.repository.path, pull_request_number)
 
 
-def _cmd_status(parsed: argparse.Namespace, session: _CommandSession) -> int:
+def _cmd_status(parsed: argparse.Namespace, session: _ReadSession) -> int:
     issue = _optional_issue_number(parsed.issue)
-    comments = session.client.list_protocol_candidates(protocol.LEDGER_ISSUE)
+    comments = session.forge.list_protocol_candidates(protocol.LEDGER_ISSUE)
     claims = protocol.active_claims(comments)
     now = datetime.now(UTC)
     if parsed.json:
@@ -1401,22 +1366,22 @@ def _cmd_status(parsed: argparse.Namespace, session: _CommandSession) -> int:
     return _status(claims, issue, now=now)
 
 
-def _cmd_board(parsed: argparse.Namespace, session: _CommandSession) -> None:
-    comments = session.client.list_protocol_candidates(protocol.LEDGER_ISSUE)
-    projected = _board(session.client, protocol.active_claims(comments))
+def _cmd_board(parsed: argparse.Namespace, session: _ReadSession) -> None:
+    comments = session.forge.list_protocol_candidates(protocol.LEDGER_ISSUE)
+    projected = _board(session.forge, protocol.active_claims(comments))
     print(board.board_json(projected) if parsed.json else board.render(projected))
 
 
-def _cmd_rulings(parsed: argparse.Namespace, session: _CommandSession) -> None:
-    comments = session.client.list_protocol_candidates(protocol.LEDGER_ISSUE)
-    issues = session.client.list_open_board_issues()
-    projected = _board(session.client, protocol.active_claims(comments), issues=issues)
+def _cmd_rulings(parsed: argparse.Namespace, session: _ReadSession) -> None:
+    comments = session.forge.list_protocol_candidates(protocol.LEDGER_ISSUE)
+    issues = session.forge.list_open_board_issues()
+    projected = _board(session.forge, protocol.active_claims(comments), issues=issues)
     _rulings(projected, issues, as_json=parsed.json)
 
 
-def _cmd_next(parsed: argparse.Namespace, session: _CommandSession) -> int:
-    comments = session.client.list_protocol_candidates(protocol.LEDGER_ISSUE)
-    projected = _board(session.client, protocol.active_claims(comments))
+def _cmd_next(parsed: argparse.Namespace, session: _ReadSession) -> int:
+    comments = session.forge.list_protocol_candidates(protocol.LEDGER_ISSUE)
+    projected = _board(session.forge, protocol.active_claims(comments))
     item = board.highest_scored_actionable(projected)
     skipped = _unworkable(projected)
     recovery = projected.recovery
@@ -1430,8 +1395,8 @@ def _cmd_next(parsed: argparse.Namespace, session: _CommandSession) -> int:
     return _next_json(item, skipped, recovery) if parsed.json else _next(item, skipped, recovery)
 
 
-def _cmd_who(parsed: argparse.Namespace, session: _CommandSession) -> None:
-    claims = protocol._ledger_claims(session.client)
+def _cmd_who(parsed: argparse.Namespace, session: _ReadSession) -> None:
+    claims = protocol._ledger_claims(session.forge)
     if parsed.json:
         _who_json(claims, parsed.path, session.ledger)
         return
@@ -1439,8 +1404,8 @@ def _cmd_who(parsed: argparse.Namespace, session: _CommandSession) -> None:
     _who(claims, parsed.path)
 
 
-def _cmd_rescope(parsed: argparse.Namespace, session: _CommandSession) -> None:
-    client = session.client
+def _cmd_rescope(parsed: argparse.Namespace, session: _WriteSession) -> None:
+    client = session.forge
     requested = _rescope_command(parsed)
     if requested.add or requested.drop:
         versioned = checkout.versioned_paths()
@@ -1469,8 +1434,8 @@ def _cmd_rescope(parsed: argparse.Namespace, session: _CommandSession) -> None:
     print(f"RESCOPED {_claim_subject(rescoped)}: {rescoped.claim_id}")
 
 
-def _cmd_claim(parsed: argparse.Namespace, session: _CommandSession) -> int:
-    client = session.client
+def _cmd_claim(parsed: argparse.Namespace, session: _WriteSession) -> int:
+    client = session.forge
     requested = _request(parsed)
     versioned = checkout.versioned_paths()
     n, total, share = _reject_wide_scope(requested.scope, versioned, requested.whole_reason)
@@ -1484,7 +1449,7 @@ def _cmd_claim(parsed: argparse.Namespace, session: _CommandSession) -> int:
             open_by_number = {issue.number: issue for issue in open_issues}
             projected = _board(client, protocol._ledger_claims(client), issues=open_issues)
             checks = _slice_rule_checks(
-                BoardReferenceLookup(client, client.repository, open_by_number),
+                BoardReferenceLookup(client, client.repository.path, open_by_number),
                 target_issue,
                 projected,
                 requested.out_of_order_reason,
@@ -1533,14 +1498,14 @@ def _cmd_claim(parsed: argparse.Namespace, session: _CommandSession) -> int:
     return 0
 
 
-def _cmd_release(parsed: argparse.Namespace, session: _CommandSession) -> None:
-    client = session.client
+def _cmd_release(parsed: argparse.Namespace, session: _WriteSession) -> None:
+    client = session.forge
     issue = _optional_issue_number(parsed.issue)
     identity = _resolved_identity(issue, session.release_branch or "")
     merged = None if parsed.merged is None else int(parsed.merged)
     outcome = _release_outcome(merged, parsed.abandoned)
     if isinstance(outcome, protocol.MergedRelease):
-        _verify_merged_release(client, client.repository, identity, outcome)
+        _verify_merged_release(client, client.repository.path, identity, outcome)
     released = protocol.release_claim(
         client,
         identity,
@@ -1557,10 +1522,10 @@ def _cmd_release(parsed: argparse.Namespace, session: _CommandSession) -> None:
     print(f"RELEASED {_claim_subject(released)}: {released.claim_id}")
 
 
-def _cmd_supersede(parsed: argparse.Namespace, session: _CommandSession) -> None:
+def _cmd_supersede(parsed: argparse.Namespace, session: _WriteSession) -> None:
     successor_issue = int(parsed.successor_issue)
     frozen = protocol.supersede_ledger(
-        session.client,
+        session.forge,
         successor_issue,
         parsed.agent,
         parsed.role,
@@ -1573,8 +1538,8 @@ def _cmd_supersede(parsed: argparse.Namespace, session: _CommandSession) -> None
     )
 
 
-def _cmd_reconcile(parsed: argparse.Namespace, session: _CommandSession) -> None:
-    client = session.client
+def _cmd_reconcile(parsed: argparse.Namespace, session: _WriteSession) -> None:
+    client = session.forge
     try:
         for repair in protocol.repair_duplicate_claims(client):
             superseded = ", ".join(f"#{cid}" for cid in repair.superseded_comment_ids)
@@ -1599,13 +1564,15 @@ def _cmd_reconcile(parsed: argparse.Namespace, session: _CommandSession) -> None
     print("RECONCILED " + (", ".join(f"#{issue}" for issue in reconciled) or "no claims"))
 
 
-_COMMAND_HANDLERS: dict[str, Callable[[argparse.Namespace, _CommandSession], int | None]] = {
+_READ_HANDLERS: dict[str, Callable[[argparse.Namespace, _ReadSession], int | None]] = {
     "pr-check": _cmd_pull_request_check,
     "status": _cmd_status,
     "board": _cmd_board,
     "rulings": _cmd_rulings,
     "next": _cmd_next,
     "who": _cmd_who,
+}
+_WRITE_HANDLERS: dict[str, Callable[[argparse.Namespace, _WriteSession], int | None]] = {
     "rescope": _cmd_rescope,
     "claim": _cmd_claim,
     "release": _cmd_release,
@@ -1637,21 +1604,27 @@ def _dispatch(parsed: argparse.Namespace) -> int:
     if parsed.command in {"claim", "release", "rescope"}:
         parsed.agent = checkout._resolved_agent(parsed.agent)
     release_branch = _release_branch_for(parsed) if parsed.command == "release" else None
-    repository = checkout._repository(parsed.repo)
-    client = github.GitHubIssueComments(repository)
+    repository = github.discover_repository(parsed.repo, remote_url=checkout.origin_remote_url)
+    forge_handle = github.GitHubForge(repository)
     if parsed.command == "bootstrap":
-        ledger = discovery.bootstrap_ledger(client)
+        ledger = discovery.bootstrap_ledger(forge_handle)
         protocol.configure_ledger(ledger)
         print(f"LEDGER #{ledger}")
         return 0
-    ledger = discovery.discover_ledger(client)
+    ledger = discovery.discover_ledger(forge_handle)
     if ledger is None:
         raise protocol.ClaimUnavailableError(
             "no agent-claim ledger exists; run agent-claim bootstrap"
         )
     protocol.configure_ledger(ledger)
-    session = _CommandSession(client=client, ledger=ledger, release_branch=release_branch)
-    result = _COMMAND_HANDLERS[parsed.command](parsed, session)
+    if parsed.command in _READ_HANDLERS:
+        read_session = _ReadSession(forge=forge_handle, ledger=ledger)
+        result = _READ_HANDLERS[parsed.command](parsed, read_session)
+    else:
+        write_session = _WriteSession(
+            forge=forge_handle, ledger=ledger, release_branch=release_branch
+        )
+        result = _WRITE_HANDLERS[parsed.command](parsed, write_session)
     return 0 if result is None else result
 
 
