@@ -78,9 +78,20 @@ REFERENCE_PATTERN = re.compile(r"(?<![A-Za-z0-9_])#([1-9][0-9]*)")
 QUALIFIED_REFERENCE = (
     rf"(?:(?P<repository>{protocol.REPOSITORY_PATTERN.pattern}))?#(?P<number>[1-9][0-9]*)"
 )
+# The keywords GitHub itself closes an issue on when a pull request merges.
+# Nothing else retires an item, so this is what a landing's typed closing
+# reference is checked against.
+CLOSING_KEYWORDS = r"close(?:s|d)?|fix(?:es|ed)?|resolve(?:s|d)?"
 CLOSING_REFERENCE_PATTERN = re.compile(
-    r"(?im)\b(?:close(?:s|d)?|fix(?:es|ed)?|resolve(?:s|d)?|"
-    r"land(?:s|ed)?|implement(?:s|ed)?)\s*:?\s*" + QUALIFIED_REFERENCE
+    rf"(?im)\b(?:{CLOSING_KEYWORDS})\s*:?\s*" + QUALIFIED_REFERENCE
+)
+# The board's stage heuristic also believes a pull request that says it landed
+# or implemented an issue. GitHub closes on neither word, so this wider set
+# answers "which issue did this pull request work on", never "which issue does
+# it retire".
+LANDING_CLAIM_PATTERN = re.compile(
+    rf"(?im)\b(?:{CLOSING_KEYWORDS}|land(?:s|ed)?|implement(?:s|ed)?)\s*:?\s*"
+    + QUALIFIED_REFERENCE
 )
 WORK_ITEM_KIND = "work-item"
 CLASSIFICATION_LINE_PATTERN = re.compile(
@@ -726,18 +737,23 @@ def _issue_reference(match: re.Match[str], repository: str) -> IssueReference:
     return IssueReference(match.group("repository") or repository, int(match.group("number")))
 
 
-def closing_references(text: str, repository: str) -> frozenset[IssueReference]:
-    """Every issue the text closes, read the way GitHub renders it.
-
-    Routed through `_live_text` for the same reason every other marker in
+def _references_matching(
+    pattern: re.Pattern[str], text: str, repository: str
+) -> frozenset[IssueReference]:
+    """Routed through `_live_text` for the same reason every other marker in
     this module is: a fenced example of the closing-keyword convention
     ("Fixes #64" inside a code block, say) must document the syntax without
     silently closing #64.
     """
     return frozenset(
         _issue_reference(match, repository)
-        for match in CLOSING_REFERENCE_PATTERN.finditer(_live_text(text))
+        for match in pattern.finditer(_live_text(text))
     )
+
+
+def closing_references(text: str, repository: str) -> frozenset[IssueReference]:
+    """Every issue merging this text closes, by GitHub's own keywords."""
+    return _references_matching(CLOSING_REFERENCE_PATTERN, text, repository)
 
 
 def parse_pull_request_classification(
@@ -995,12 +1011,12 @@ def _priority_bucket(
 def _associated_issues(
     pull_requests: tuple[PullRequest, ...], repository: str
 ) -> frozenset[int]:
-    """Issues of `repository` that these pull requests close."""
+    """Issues of `repository` that these pull requests close or claim to land."""
     return frozenset(
         reference.number
         for pull_request in pull_requests
-        for reference in closing_references(
-            f"{pull_request.title}\n{pull_request.body}", repository
+        for reference in _references_matching(
+            LANDING_CLAIM_PATTERN, f"{pull_request.title}\n{pull_request.body}", repository
         )
         if reference.repository == repository
     )

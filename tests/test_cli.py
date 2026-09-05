@@ -11898,3 +11898,18 @@ def test_next_names_a_recovery_item_before_the_item_it_recommends(
     assert capsys.readouterr().out.startswith(
         f"RECOVERY\n#90: {board.RECOVERY_STEP}\n\n"
     )
+
+
+def test_pr_check_accepts_a_body_naming_work_github_does_not_close_on(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`Implements #80` retires nothing on GitHub, so it is no closing reference."""
+    pr_check_client(
+        monkeypatch,
+        landing_pull_request(body="Work-Item: #72\n\nCloses #72\n\nImplements #80"),
+    )
+
+    assert run_pr_check() == 0
+    assert capsys.readouterr().out == (
+        f"PR #12 by ada declares Work-Item: {REPOSITORY}#{WORK_ITEM_ISSUE}\n"
+    )
