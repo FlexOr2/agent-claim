@@ -100,11 +100,7 @@ def paths_under_scope(paths: tuple[str, ...], scope: tuple[str, ...]) -> tuple[s
 
 
 def _scope_directories(paths: tuple[str, ...]) -> tuple[str, ...]:
-    """Return the scope entries that name a git tree or on-disk directory.
-
-    A directory scope locks every descendant path. Callers must require a cut
-    or an explicit --allow-directory reason before storing one.
-    """
+    """Return the scope entries that name a git tree or on-disk directory."""
     directories: list[str] = []
     toplevel: str | None = None
     for path in paths:

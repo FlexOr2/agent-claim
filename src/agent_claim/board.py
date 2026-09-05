@@ -122,9 +122,6 @@ TOUCHES_WITHOUT_CLOSING_LINE_PATTERN = re.compile(
     r"(?im)^(?:Refs?|References?|Part of|Teil von)\b[:\s].*$"
 )
 CLAIM_OLD_AFTER = timedelta(hours=1)
-CUT_HEADING_PATTERN = re.compile(r"(?m)^##[ \t]+Schnitt")
-CUT_SECTION_HEADING_PATTERN = re.compile(r"(?m)^##[ \t]+")
-SLICE_LINE_PATTERN = re.compile(r"(?m)^\*\*Scheibe [1-9]\d*:[ \t]*\S.*?\*\*\s*$", re.ASCII)
 # The slice table's header cells, in order, compared case- and
 # whitespace-insensitively (`_table_row_cells` already strips each cell).
 SLICE_TABLE_HEADER_CELLS = ("#", "scheibe", "item", "hängt ab von")
@@ -928,15 +925,6 @@ def _freed_on(contract: Contract, blockers: dict[int, BlockerReference]) -> date
     )
 
 
-def has_cut(body: str) -> bool:
-    heading = CUT_HEADING_PATTERN.search(body)
-    if heading is None:
-        return False
-    next_heading = CUT_SECTION_HEADING_PATTERN.search(body, heading.end())
-    end = next_heading.start() if next_heading is not None else len(body)
-    return SLICE_LINE_PATTERN.search(body[heading.end() : end]) is not None
-
-
 def claim_age(created_at: str, now: datetime) -> timedelta:
     return now.astimezone(UTC) - _timestamp(created_at)
 
@@ -1064,7 +1052,7 @@ def board_rank(item: BoardItem) -> tuple[int, int, int]:
     return (item.priority_category, -item.score, item.number)
 
 
-def build_board(  # noqa: PLR0913 -- protocol/board slice, #103
+def build_board(  # noqa: PLR0913  # protocol/board slice, #103
     issues: tuple[Issue, ...],
     open_pull_requests: tuple[PullRequest, ...],
     recent_merged_pull_requests: tuple[PullRequest, ...],

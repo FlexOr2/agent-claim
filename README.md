@@ -53,9 +53,8 @@ released, is refused before anything is posted; release the old claim and pass a
 fresh `--claim-id` instead.
 `rescope <issue> --add <path> [--drop <path>]` changes a live claim's scope
 without releasing it: the claim id and base stay, added paths are advisory
-like `claim`, `--add` of a directory or a combined share above a quarter uses
-the same cut / `--allow-directory` rules as `claim`, and there is no release
-window. It does not require HEAD to match
+like `claim`, and a resulting wide scope uses the same `--whole` rule as
+`claim`. There is no release window. It does not require HEAD to match
 base or a clean tree. A `rescope` ledger event is a new v2 action; older
 helpers fail loud on the whole ledger until they upgrade.
 
@@ -64,11 +63,13 @@ OWNER/REPOSITORY`. A claim must begin from a clean linked worktree and binds its
 base commit, branch, issue, and repository-relative scope. `--scope a,b` is
 the same as `--scope a --scope b`; each path is stored and compared
 separately, including when an older ledger comment still has one comma-joined
-string. Directory scopes (`docs`, `frontend/src`) lock the whole tree: claim one only
-when the issue body has a `## Schnitt` cut with at least one `**Scheibe n: ...**`
-slice, or pass `--allow-directory REASON`. A scope covering more than a quarter
-of versioned files also needs that flag. Live claims are advisory: they say who
-works where and do not refuse path overlap. Two lanes may claim the same
+string. A scope is wide when it declares more than three paths, any directory,
+or more than a quarter of versioned files. Named new paths count; children of
+containers are never exempt. Wide scopes need `--whole "<one sentence why it
+does not split>"`; the sentence lands in the claim record and `status`/`who`
+show it. `--allow-directory` is removed: pass `--whole` instead. Live claims
+are advisory: they say who works where and do not refuse path overlap. Two
+lanes may claim the same
 directory or the same file; `claim` and `status` print the overlap as a note.
 The same issue or the same `docs/`/`fix/` lane branch still holds at most one
 live claim. `claim --resource <name>` posts a name-only intent; the live integer is the next
