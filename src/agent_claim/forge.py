@@ -5,7 +5,9 @@
 contract and `Capability` answers, per operation, whether an adapter can
 perform it at all. Nothing in this module or its callers branches on that
 answer yet -- the GitHub adapter never refuses an operation -- so the first
-real consumer is the GitLab adapter (decision record 0001, criterion D3).
+real consumer is #112 (item kind as the native issue type; decision record
+0001 ruling D3 maps kind read-only on GitLab Free, which cannot create a
+custom `Container` type).
 """
 
 from __future__ import annotations
@@ -96,9 +98,24 @@ class LedgerItem:
     state: ItemState
     locked: bool
     body: str
-    author_association: str
-    labels: tuple[str, ...]
+    author_is_trusted: bool
     is_landing: bool
+
+
+@dataclass(frozen=True)
+class Listing:
+    """A `list_items` result, plus the provenance discovery needs to judge it.
+
+    `page_count` is the number of paginated fetches the adapter needed to
+    read `items`; only the adapter knows its own page size, so it reports
+    this fact rather than letting a caller infer it from `len(items)` against
+    a duplicated constant. `page_count > 1` means the fetch spanned more than
+    one round trip and can never be trusted to prove absence -- a concurrent
+    open/close could have shifted an item across the page boundary.
+    """
+
+    items: tuple[LedgerItem, ...]
+    page_count: int
 
 
 class Capability(StrEnum):
@@ -110,17 +127,14 @@ class Capability(StrEnum):
 class ForgeOperation(StrEnum):
     """Every port operation; each member's value is its Protocol method name."""
 
-    # -- inherited from protocol.ClaimReader (3) ---------------------------
     LIST_PROTOCOL_CANDIDATES = "list_protocol_candidates"
     LIST_CLAIMED_ISSUES = "list_claimed_issues"
     VALIDATE_SUCCESSOR = "validate_successor"
-    # -- inherited from protocol.ClaimWriter (5) ---------------------------
     POST_COMMENT = "post_comment"
     ADD_LABEL = "add_label"
     REMOVE_LABEL = "remove_label"
     UPSERT_PROJECTION = "upsert_projection"
     NEUTRALIZE_CLAIM_COMMENT = "neutralize_claim_comment"
-    # -- forge-specific (9) --------------------------------------------------
     ITEM_REFERENCE = "item_reference"
     LANDING = "landing"
     PARENT_ISSUE = "parent_issue"
@@ -130,7 +144,6 @@ class ForgeOperation(StrEnum):
     LIST_BOARD_BLOCKERS = "list_board_blockers"
     LIST_OPEN_BOARD_PULL_REQUESTS = "list_open_board_pull_requests"
     LIST_RECENT_MERGED_BOARD_PULL_REQUESTS = "list_recent_merged_board_pull_requests"
-    # -- forge-specific, ledger discovery (6) ------------------------------
     LIST_ITEMS = "list_items"
     OPEN_ITEM_COUNT = "open_item_count"
     ENSURE_LABEL = "ensure_label"
@@ -169,7 +182,7 @@ class ForgeReader(protocol.ClaimReader, Protocol):
 
     def list_items(
         self, *, state: ItemState | None = None, label: str | None = None
-    ) -> tuple[LedgerItem, ...]: ...
+    ) -> Listing: ...
 
     def open_item_count(self) -> int: ...
 

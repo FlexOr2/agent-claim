@@ -6,9 +6,10 @@ import json
 import os
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
+from types import MappingProxyType
 from typing import TypeVar
 
 from . import board, forge, process, protocol
@@ -195,7 +196,7 @@ def _is_transient_signal(decoded: str) -> bool:
     )
 
 
-def _nonzero_exit_failure(decoded: str, return_code: int, purpose: str) -> ClaimError:
+def _nonzero_exit_failure(decoded: str, return_code: int, purpose: str) -> forge.ForgeError:
     """Classify a nonzero `gh` exit from its decoded combined output (#4.2).
 
     `gh`'s own exit code never carries the HTTP status, so this reads the
@@ -260,10 +261,12 @@ _READ_WRITE_OPERATIONS = (
 )
 # The GitHub adapter never refuses an operation: every member answers
 # READ_ONLY or READ_WRITE, never UNSUPPORTED (decision record 0001 §2).
-GITHUB_CAPABILITIES: dict[forge.ForgeOperation, forge.Capability] = {
-    **dict.fromkeys(_READ_ONLY_OPERATIONS, forge.Capability.READ_ONLY),
-    **dict.fromkeys(_READ_WRITE_OPERATIONS, forge.Capability.READ_WRITE),
-}
+GITHUB_CAPABILITIES: Mapping[forge.ForgeOperation, forge.Capability] = MappingProxyType(
+    {
+        **dict.fromkeys(_READ_ONLY_OPERATIONS, forge.Capability.READ_ONLY),
+        **dict.fromkeys(_READ_WRITE_OPERATIONS, forge.Capability.READ_WRITE),
+    }
+)
 
 
 class GitHubForge:
@@ -953,7 +956,7 @@ class GitHubForge:
 
     def list_items(
         self, *, state: forge.ItemState | None = None, label: str | None = None
-    ) -> tuple[forge.LedgerItem, ...]:
+    ) -> forge.Listing:
         query_state = "all" if state is None else state.value
         label_filter = f"&labels={label}" if label else ""
         raw = self._run(
@@ -965,7 +968,7 @@ class GitHubForge:
                 "--jq",
                 (
                     ".[] | {number,state,locked,body,author_association,"
-                    'labels:(.labels | map(.name)),is_landing:has("pull_request")}'
+                    'is_landing:has("pull_request")}'
                 ),
             ]
         )
@@ -974,7 +977,7 @@ class GitHubForge:
             if not isinstance(value, dict):
                 raise forge.ForgeMalformedResponseError("GitHub returned a malformed ledger issue")
             number = value.get("number")
-            labels = value.get("labels")
+            author_association = value.get("author_association")
             raw_state = value.get("state")
             item_state = _LEDGER_ITEM_STATES.get(raw_state) if isinstance(raw_state, str) else None
             if (
@@ -984,9 +987,7 @@ class GitHubForge:
                 or item_state is None
                 or not isinstance(value.get("locked"), bool)
                 or not isinstance(value.get("body"), str)
-                or not isinstance(value.get("author_association"), str)
-                or not isinstance(labels, list)
-                or not all(isinstance(label, str) for label in labels)
+                or not isinstance(author_association, str)
                 or not isinstance(value.get("is_landing"), bool)
             ):
                 raise forge.ForgeMalformedResponseError("GitHub returned a malformed ledger issue")
@@ -996,12 +997,19 @@ class GitHubForge:
                     item_state,
                     value["locked"],
                     value["body"],
-                    value["author_association"],
-                    tuple(labels),
+                    author_association in TRUSTED_ASSOCIATIONS,
                     value["is_landing"],
                 )
             )
-        return tuple(items)
+        # `--paginate` already followed every page GitHub offered; a result at
+        # or past the per-page cap could only have come from more than one
+        # HTTP round trip (GitHub still probes for a next page after a full
+        # one), so that is the only signal available for "provably one
+        # snapshot" -- the exact page count is diagnostic text, not a
+        # contract, so this floor need not match GitHub's request count byte
+        # for byte.
+        page_count = len(items) // ISSUES_PER_PAGE + 1
+        return forge.Listing(tuple(items), page_count)
 
     def open_item_count(self) -> int:
         raw = self._run(["api", f"repos/{self.repository}", "--jq", ".open_issues_count"])
@@ -1040,7 +1048,7 @@ class GitHubForge:
             created = json.loads(raw)
         except json.JSONDecodeError as error:
             raise forge.ForgeMalformedResponseError(
-                "GitHub returned invalid created-item JSON"
+                "GitHub returned invalid created-ledger JSON"
             ) from error
         if (
             not isinstance(created, dict)
@@ -1048,7 +1056,7 @@ class GitHubForge:
             or not isinstance(created.get("number"), int)
             or created["number"] < 1
         ):
-            raise forge.ForgeMalformedResponseError("GitHub did not return a created item number")
+            raise forge.ForgeMalformedResponseError("GitHub did not return a created ledger number")
         return created["number"]
 
     def lock_item(self, number: int) -> None:

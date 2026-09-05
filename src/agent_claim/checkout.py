@@ -9,9 +9,6 @@ from pathlib import Path
 from . import process
 from .protocol import ClaimError, ClaimRequest, _outbound_text
 
-# One canonical source (process.DEFAULT_TIMEOUT_SECONDS); kept as a name here
-# because callers -- and tests -- read it as `checkout.GH_TIMEOUT_SECONDS`.
-GH_TIMEOUT_SECONDS = process.DEFAULT_TIMEOUT_SECONDS
 AGENT_CLAIM_AGENT_ENV = "AGENT_CLAIM_AGENT"
 GROK_SESSION_ID_ENV = "GROK_SESSION_ID"
 CLAUDE_SESSION_ID_ENV = "CLAUDE_SESSION_ID"
@@ -19,7 +16,7 @@ CLAUDE_SESSION_ID_ENV = "CLAUDE_SESSION_ID"
 
 def _git_output(arguments: list[str]) -> str:
     try:
-        result = process.run_captured(["git", *arguments], timeout=GH_TIMEOUT_SECONDS)
+        result = process.run_captured(["git", *arguments])
     except process.ExecutableMissingError as error:
         raise ClaimError("git is required for issue claims") from error
     except process.ProcessTimedOutError as error:
@@ -42,9 +39,7 @@ def origin_remote_url() -> str:
 
 def versioned_paths() -> tuple[str, ...]:
     try:
-        result = process.run_captured(
-            ["git", "ls-files", "-z", "--full-name"], timeout=GH_TIMEOUT_SECONDS
-        )
+        result = process.run_captured(["git", "ls-files", "-z", "--full-name"])
     except process.ExecutableMissingError as error:
         raise ClaimError("git is required for issue claims") from error
     except process.ProcessTimedOutError as error:
