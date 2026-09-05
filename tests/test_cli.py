@@ -1589,17 +1589,24 @@ def test_rescope_help_names_the_whole_reason(
     assert "three paths" in help_text
 
 
-@pytest.mark.parametrize("command", ["claim", "rescope"])
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["claim", "5", "--scope", "src", "--allow-directory", "x"],
+        ["rescope", "5", "--allow-directory", "x"],
+    ],
+    ids=["claim", "rescope"],
+)
 def test_cli_claim_and_rescope_reject_the_removed_allow_directory_flag(
     capsys: pytest.CaptureFixture[str],
-    command: str,
+    arguments: list[str],
 ) -> None:
-    parser = issue_claim._parser()
     with pytest.raises(SystemExit) as exited:
-        parser.parse_args([command, "--allow-directory", "REASON"])
+        issue_claim.main(arguments)
 
     assert exited.value.code == 2
 
+    command = arguments[0]
     with pytest.raises(SystemExit) as help_exited:
         issue_claim.main([command, "--help"])
 
