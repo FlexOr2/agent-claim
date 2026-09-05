@@ -339,6 +339,7 @@ def request(
     scope: tuple[str, ...] = ("docs/COORDINATION.md", "scripts/issue_claim.py"),
     resource: str | None = None,
     resource_value: int | None = None,
+    whole_reason: str | None = None,
 ) -> ClaimRequest:
     """Build a `ClaimRequest`, issue-identified by default or lane-identified via `lane=True`.
 
@@ -361,6 +362,7 @@ def request(
         claim_id=claim_id,
         resource=resource,
         resource_value=resource_value,
+        whole_reason=whole_reason,
     )
 
 
@@ -1559,6 +1561,32 @@ def test_claim_help_names_the_out_of_order_refusal(
     assert "refuse" in help_text
     assert "without a reason" in help_text
     assert "priority actionable item is free" in help_text
+
+
+def test_claim_help_names_the_whole_reason(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exited:
+        issue_claim.main(["claim", "--help"])
+
+    assert exited.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "--whole" in help_text
+    assert "three paths" in help_text
+    assert "directory" in help_text
+    assert "quarter" in help_text
+
+
+def test_rescope_help_names_the_whole_reason(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exited:
+        issue_claim.main(["rescope", "--help"])
+
+    assert exited.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "--whole" in help_text
+    assert "three paths" in help_text
 
 
 def test_claim_refuses_out_of_order_without_a_reason_before_mutating(
@@ -8549,8 +8577,8 @@ def test_cli_claim_refuses_a_directory_scope_without_allow_directory(
 
     assert status == 2
     assert captured.out == ""
-    assert "directory scope 'docs'" in captured.err
-    assert "erst schneiden" in captured.err
+    assert "scope is wide" in captured.err
+    assert "--whole" in captured.err
     assert LEDGER_ISSUE not in client.comments
 
 
@@ -8590,9 +8618,7 @@ def test_cli_claim_allows_a_directory_scope_with_reason(
     posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])
     assert isinstance(posted, ActiveClaim)
     assert posted.scope == ("docs",)
-    assert (
-        "- Allow-directory reason: rewrite the docs tree" in client.comments[LEDGER_ISSUE][0].body
-    )
+    assert "- Whole: rewrite the docs tree" in client.comments[LEDGER_ISSUE][0].body
 
 
 def test_cli_who_prints_the_claim_holding_a_path(
@@ -8662,8 +8688,8 @@ def test_cli_rescope_refuses_adding_a_directory_without_allow_directory(
 
     assert status == 2
     assert captured.out == ""
-    assert "directory scope 'docs'" in captured.err
-    assert "erst schneiden" in captured.err
+    assert "scope is wide" in captured.err
+    assert "--whole" in captured.err
     standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
     assert standing[0].scope == ("src/widget.py",)
 
@@ -8702,9 +8728,8 @@ def test_cli_claim_share_above_a_quarter_requires_allow_directory(
 
     assert status == 2
     assert captured.out == ""
-    assert "2 of 4" in captured.err
-    assert "--allow-directory" in captured.err
-    assert "erst schneiden" not in captured.err
+    assert "scope is wide" in captured.err
+    assert "--whole" in captured.err
     assert LEDGER_ISSUE not in client.comments
 
 
@@ -8748,7 +8773,7 @@ def test_cli_claim_share_above_a_quarter_succeeds_with_allow_directory(
     assert payload["versioned_files_total"] == 4
     assert payload["share"] == 0.5
     assert payload["touches"] == []
-    assert "- Allow-directory reason: cover two files" in client.comments[LEDGER_ISSUE][0].body
+    assert "- Whole: cover two files" in client.comments[LEDGER_ISSUE][0].body
 
 
 def test_cli_claim_share_at_a_quarter_does_not_need_allow_directory(
@@ -8993,6 +9018,7 @@ def test_claim_age_uses_the_claim_comment_not_a_later_rescope(
 
 def test_cli_claim_allows_a_cut_directory_without_allow_directory(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     client = FakeComments()
     client.board_issues = (
@@ -9028,10 +9054,12 @@ def test_cli_claim_allows_a_cut_directory_without_allow_directory(
         ]
     )
 
-    assert status == 0
-    posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])
-    assert isinstance(posted, ActiveClaim)
-    assert posted.scope == ("docs",)
+    captured = capsys.readouterr()
+
+    assert status == 2
+    assert "scope is wide" in captured.err
+    assert "--whole" in captured.err
+    assert LEDGER_ISSUE not in client.comments
 
 
 def test_cli_claim_refuses_a_schnitt_heading_without_a_scheibe_line(
@@ -9074,7 +9102,8 @@ def test_cli_claim_refuses_a_schnitt_heading_without_a_scheibe_line(
     captured = capsys.readouterr()
 
     assert status == 2
-    assert "erst schneiden" in captured.err
+    assert "scope is wide" in captured.err
+    assert "--whole" in captured.err
     assert LEDGER_ISSUE not in client.comments
 
 
@@ -9111,7 +9140,8 @@ def test_cli_lane_directory_without_allow_directory_is_erst_schneiden(
     captured = capsys.readouterr()
 
     assert status == 2
-    assert "erst schneiden" in captured.err
+    assert "scope is wide" in captured.err
+    assert "--whole" in captured.err
     assert LEDGER_ISSUE not in client.comments
 
 
@@ -9161,9 +9191,8 @@ def test_cli_claim_cut_directory_still_needs_allow_directory_when_share_is_high(
 
     assert status == 2
     assert captured.out == ""
-    assert "2 of 4" in captured.err
-    assert "--allow-directory" in captured.err
-    assert "erst schneiden" not in captured.err
+    assert "scope is wide" in captured.err
+    assert "--whole" in captured.err
     assert LEDGER_ISSUE not in client.comments
 
 
@@ -9199,9 +9228,8 @@ def test_cli_rescope_add_that_raises_combined_share_requires_allow_directory(
 
     assert status == 2
     assert captured.out == ""
-    assert "3 of 4" in captured.err
-    assert "--allow-directory" in captured.err
-    assert "erst schneiden" not in captured.err
+    assert "scope is wide" in captured.err
+    assert "--whole" in captured.err
     standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
     assert standing[0].scope == ("src",)
 
@@ -9236,9 +9264,264 @@ def test_cli_rescope_persists_allow_directory_reason(
 
     assert status == 0
     bodies = [entry.body for entry in client.comments[LEDGER_ISSUE]]
-    assert any("- Allow-directory reason: widen to the docs tree" in body for body in bodies)
+    assert any("- Whole: widen to the docs tree" in body for body in bodies)
     standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
     assert standing[0].scope == ("src/widget.py", "docs")
+
+
+def test_scope_is_wide_for_more_than_three_paths_any_directory_or_a_share_above_a_quarter() -> None:
+    three = ("a.py", "b.py", "c.py")
+    four = (*three, "d.py")
+    assert (
+        protocol.scope_is_wide(three, directories=(), covered_file_count=3, versioned_file_count=20)
+        is False
+    )
+    assert (
+        protocol.scope_is_wide(four, directories=(), covered_file_count=4, versioned_file_count=20)
+        is True
+    )
+    assert (
+        protocol.scope_is_wide(
+            ("docs",), directories=("docs",), covered_file_count=1, versioned_file_count=20
+        )
+        is True
+    )
+    assert (
+        protocol.scope_is_wide(
+            ("a.py",), directories=(), covered_file_count=1, versioned_file_count=4
+        )
+        is False
+    )
+    assert (
+        protocol.scope_is_wide(
+            ("a.py", "b.py"), directories=(), covered_file_count=2, versioned_file_count=4
+        )
+        is True
+    )
+
+
+def test_cli_claim_accepts_three_named_paths_without_whole(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeComments()
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "new_a.py",
+            "--scope",
+            "new_b.py",
+            "--scope",
+            "new_c.py",
+            "--claim-id",
+            "three",
+        ]
+    )
+
+    assert status == 0
+    posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])
+    assert isinstance(posted, ActiveClaim)
+    assert posted.scope == ("new_a.py", "new_b.py", "new_c.py")
+    assert posted.whole_reason is None
+
+
+def test_cli_claim_refuses_four_named_paths_without_whole(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "new_a.py",
+            "--scope",
+            "new_b.py",
+            "--scope",
+            "new_c.py",
+            "--scope",
+            "new_d.py",
+            "--claim-id",
+            "four",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert status == 2
+    assert captured.out == ""
+    assert "scope is wide" in captured.err
+    assert "--whole" in captured.err
+    assert LEDGER_ISSUE not in client.comments
+
+
+def test_cli_rescope_widening_to_four_paths_refuses_without_whole(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    acquire_claim(
+        client,
+        request(issue=72, branch="codex/issue-72", scope=("new_a.py",)),
+    )
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    git_values = _git_checkout()
+    monkeypatch.setattr(checkout, "_git_output", lambda arguments: git_values[tuple(arguments)])
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+    _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: "Codex Sol"})
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "rescope",
+            "72",
+            "--add",
+            "new_b.py",
+            "--add",
+            "new_c.py",
+            "--add",
+            "new_d.py",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert status == 2
+    assert captured.out == ""
+    assert "scope is wide" in captured.err
+    assert "--whole" in captured.err
+    standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    assert standing[0].scope == ("new_a.py",)
+
+
+def test_cli_claim_persists_whole_reason_and_status_and_who_show_it(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
+    reason = "the four adapters share one lock"
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "new_a.py",
+            "--scope",
+            "new_b.py",
+            "--scope",
+            "new_c.py",
+            "--scope",
+            "new_d.py",
+            "--whole",
+            reason,
+            "--claim-id",
+            "wide",
+        ]
+    )
+
+    assert status == 0
+    posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])
+    assert isinstance(posted, ActiveClaim)
+    assert posted.whole_reason == reason
+    assert f"- Whole: {reason}" in client.comments[LEDGER_ISSUE][0].body
+
+    _patch_status_cli(monkeypatch, client)
+    assert issue_claim.main(["--repo", "example/agent-claim", "status", "72"]) == 0
+    status_out = capsys.readouterr().out
+    assert f"  whole: {reason}" in status_out
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "status", "72", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["claims"][0]["whole"] == reason
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "who", "new_a.py"]) == 0
+    who_out = capsys.readouterr().out
+    assert f"  whole: {reason}" in who_out
+
+    assert issue_claim.main(["--repo", "example/agent-claim", "who", "new_a.py", "--json"]) == 0
+    who_payload = json.loads(capsys.readouterr().out)
+    assert who_payload["claims"][0]["whole"] == reason
+
+
+def test_cli_claim_allows_a_directory_scope_with_whole(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeComments()
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(
+        checkout, "_scope_directories", lambda paths: tuple(p for p in paths if p == "docs")
+    )
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "docs",
+            "--whole",
+            "rewrite the docs tree",
+            "--claim-id",
+            "tree",
+        ]
+    )
+
+    assert status == 0
+    posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])
+    assert isinstance(posted, ActiveClaim)
+    assert posted.scope == ("docs",)
+    assert posted.whole_reason == "rewrite the docs tree"
+    assert "- Whole: rewrite the docs tree" in client.comments[LEDGER_ISSUE][0].body
 
 
 def test_cli_release_without_json_prints_the_released_line(

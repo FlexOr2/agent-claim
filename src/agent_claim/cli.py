@@ -86,6 +86,14 @@ NEXT_PULL_DESCRIPTION = (
 ALLOW_DIRECTORY_HELP = (
     "permit a directory without a cut, or a scope covering more than a quarter of versioned files"
 )
+WHOLE_HELP = (
+    "one sentence why this wide scope does not split; required for more than "
+    "three paths, any directory, or more than a quarter of versioned files"
+)
+WIDE_SCOPE_REFUSAL = (
+    "scope is wide: more than three paths, a directory, or more than a quarter "
+    "of versioned files; pass --whole REASON"
+)
 
 
 def _resolved_identity(issue: int | None, branch: str) -> protocol.ClaimIdentity:
@@ -173,6 +181,33 @@ def _reject_oversized_scope(
     return n, total, share
 
 
+def _optional_whole_reason(arguments: argparse.Namespace) -> str | None:
+    raw = getattr(arguments, "whole", None)
+    if raw is None:
+        return None
+    return protocol._outbound_text(raw, "whole reason", maximum=512)
+
+
+def _reject_wide_scope(
+    scope: tuple[str, ...],
+    versioned: tuple[str, ...],
+    whole_reason: str | None,
+) -> tuple[int, int, float]:
+    n, total, share = _scope_cost(versioned, scope)
+    directories = checkout._scope_directories(scope)
+    if (
+        protocol.scope_is_wide(
+            scope,
+            directories=directories,
+            covered_file_count=n,
+            versioned_file_count=total,
+        )
+        and whole_reason is None
+    ):
+        raise protocol.ClaimError(WIDE_SCOPE_REFUSAL)
+    return n, total, share
+
+
 def _touch_json(claim: protocol.ActiveClaim) -> dict[str, object]:
     return {
         **_identity_json(claim.identity),
@@ -225,11 +260,7 @@ def _request(arguments: argparse.Namespace) -> protocol.ClaimRequest:
     parsed = protocol.parse_claim_event(synthetic)
     if not isinstance(parsed, protocol.ActiveClaim):
         raise protocol.ClaimError("claim request did not produce a marker")
-    allow_directory_reason = getattr(arguments, "allow_directory", None)
-    if allow_directory_reason is not None:
-        allow_directory_reason = protocol._outbound_text(
-            allow_directory_reason, "allow-directory reason", maximum=512
-        )
+    whole_reason = _optional_whole_reason(arguments)
     resource = getattr(arguments, "resource", None)
     if resource is not None:
         resource = protocol._outbound_resource_name(resource)
@@ -242,7 +273,7 @@ def _request(arguments: argparse.Namespace) -> protocol.ClaimRequest:
         scope=parsed.scope,
         claim_id=parsed.claim_id,
         out_of_order_reason=arguments.out_of_order,
-        allow_directory_reason=allow_directory_reason,
+        whole_reason=whole_reason,
         resource=resource,
     )
     checkout._validate_checkout(request)
@@ -306,8 +337,14 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     claim.add_argument(
+        "--whole",
+        metavar="REASON",
+        help=WHOLE_HELP,
+    )
+    claim.add_argument(
         "--allow-directory",
         metavar="REASON",
+        dest="whole",
         help=ALLOW_DIRECTORY_HELP,
     )
     claim.add_argument(
@@ -364,8 +401,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     rescope.add_argument("--claim-id")
     rescope.add_argument(
+        "--whole",
+        metavar="REASON",
+        help=WHOLE_HELP,
+    )
+    rescope.add_argument(
         "--allow-directory",
         metavar="REASON",
+        dest="whole",
         help=ALLOW_DIRECTORY_HELP,
     )
     rescope.add_argument("--json", action="store_true")
@@ -480,6 +523,8 @@ def _status(
             print(f"  {path}")
         if claim.resource is not None:
             print(f"  resource {claim.resource.name}={claim.resource.value}")
+        if claim.whole_reason is not None:
+            print(f"  whole: {claim.whole_reason}")
         note = _overlap_note(claims_by_id, protocol._overlap_peer_ids(index, claim))
         if note is not None:
             print(f"  {note}")
@@ -515,6 +560,7 @@ def _status_json(
                 "claim_id": claim.claim_id,
                 "scope": list(claim.scope),
                 **_resource_fields(claim),
+                **({"whole": claim.whole_reason} if claim.whole_reason is not None else {}),
                 "overlaps": _overlap_subjects(
                     claims_by_id, protocol._overlap_peer_ids(index, claim)
                 ),
@@ -539,6 +585,8 @@ def _who(claims: tuple[protocol.ActiveClaim, ...], path: str) -> None:
             f"CLAIMED {path} {_claim_subject(claim)}: {claim.agent} ({claim.role}) "
             f"claim={claim.claim_id}"
         )
+        if claim.whole_reason is not None:
+            print(f"  whole: {claim.whole_reason}")
     if len(holders) > 1:
         print(
             "overlap: "
@@ -563,6 +611,7 @@ def _who_json(claims: tuple[protocol.ActiveClaim, ...], path: str, ledger: int) 
                 "claim_id": claim.claim_id,
                 "scope": list(claim.scope),
                 **_resource_fields(claim),
+                **({"whole": claim.whole_reason} if claim.whole_reason is not None else {}),
                 "state": "CLAIMED",
             }
             for claim in holders
@@ -1426,6 +1475,37 @@ class _CommandSession:
     release_branch: str | None
 
 
+@dataclass(frozen=True)
+class _RescopeCommand:
+    identity: protocol.ClaimIdentity
+    agent: str
+    add: tuple[str, ...]
+    drop: tuple[str, ...]
+    claim_id: str | None
+    branch: str
+    whole_reason: str | None
+
+
+def _rescope_command(parsed: argparse.Namespace) -> _RescopeCommand:
+    branch = checkout._git_output(["branch", "--show-current"])
+    if not branch:
+        raise protocol.ClaimUnavailableError(
+            "rescope requires a non-empty current branch; "
+            "check out the claim branch, or pass an issue number"
+        )
+    checkout._validate_worktree_branch(branch)
+    identity = _resolved_identity(_optional_issue_number(parsed.issue), branch)
+    return _RescopeCommand(
+        identity=identity,
+        agent=parsed.agent,
+        add=protocol._valid_scope(parsed.add) if parsed.add else (),
+        drop=protocol._valid_scope(parsed.drop) if parsed.drop else (),
+        claim_id=parsed.claim_id,
+        branch=branch,
+        whole_reason=_optional_whole_reason(parsed),
+    )
+
+
 def _cmd_pull_request_check(parsed: argparse.Namespace, session: _CommandSession) -> int:
     pull_request_number = int(parsed.pr)
     return _pull_request_check(session.client, session.client.repository, pull_request_number)
@@ -1482,46 +1562,32 @@ def _cmd_who(parsed: argparse.Namespace, session: _CommandSession) -> None:
 
 def _cmd_rescope(parsed: argparse.Namespace, session: _CommandSession) -> None:
     client = session.client
-    issue = _optional_issue_number(parsed.issue)
-    rescope_branch = checkout._git_output(["branch", "--show-current"])
-    if not rescope_branch:
-        raise protocol.ClaimUnavailableError(
-            "rescope requires a non-empty current branch; "
-            "check out the claim branch, or pass an issue number"
-        )
-    checkout._validate_worktree_branch(rescope_branch)
-    identity = _resolved_identity(issue, rescope_branch)
-    add = protocol._valid_scope(parsed.add) if parsed.add else ()
-    drop = protocol._valid_scope(parsed.drop) if parsed.drop else ()
-    allow_directory_reason = parsed.allow_directory
-    if allow_directory_reason is not None:
-        allow_directory_reason = protocol._outbound_text(
-            allow_directory_reason, "allow-directory reason", maximum=512
-        )
-    if add:
+    requested = _rescope_command(parsed)
+    if requested.add or requested.drop:
         versioned = checkout.versioned_paths()
-        _reject_uncut_directory_scope(client, identity, add, allow_directory_reason)
         selected = protocol._select_rescope_claim(
             protocol._ledger_claims(client),
-            identity,
-            parsed.agent,
-            parsed.claim_id,
-            branch=rescope_branch,
+            requested.identity,
+            requested.agent,
+            requested.claim_id,
+            branch=requested.branch,
         )
-        _reject_oversized_scope(
-            protocol._combined_scope(selected.scope, add, drop),
-            allow_directory_reason,
-            versioned,
-        )
+        combined = protocol._combined_scope(selected.scope, requested.add, requested.drop)
+        _reject_wide_scope(combined, versioned, requested.whole_reason)
+        if requested.add:
+            _reject_uncut_directory_scope(
+                client, requested.identity, requested.add, requested.whole_reason
+            )
+            _reject_oversized_scope(combined, requested.whole_reason, versioned)
     rescoped = protocol.rescope_claim(
         client,
-        identity,
-        parsed.agent,
-        add,
-        drop,
-        parsed.claim_id,
-        branch=rescope_branch,
-        allow_directory_reason=allow_directory_reason,
+        requested.identity,
+        requested.agent,
+        requested.add,
+        requested.drop,
+        requested.claim_id,
+        branch=requested.branch,
+        whole_reason=requested.whole_reason,
     )
     if parsed.json:
         _rescope_json(rescoped)
@@ -1533,15 +1599,14 @@ def _cmd_claim(parsed: argparse.Namespace, session: _CommandSession) -> int:
     client = session.client
     requested = _request(parsed)
     versioned = checkout.versioned_paths()
+    n, total, share = _reject_wide_scope(requested.scope, versioned, requested.whole_reason)
     _reject_uncut_directory_scope(
         client,
         requested.identity,
         requested.scope,
-        requested.allow_directory_reason,
+        requested.whole_reason,
     )
-    n, total, share = _reject_oversized_scope(
-        requested.scope, requested.allow_directory_reason, versioned
-    )
+    _reject_oversized_scope(requested.scope, requested.whole_reason, versioned)
     checks: tuple[SliceCheck, ...] = ()
     target_issue: int | None = None
     if isinstance(requested.identity, protocol.IssueIdentity):

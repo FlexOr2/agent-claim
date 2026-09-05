@@ -35,6 +35,8 @@ MAX_PROTOCOL_BYTES = 8 * 1024 * 1024
 MAX_COMMENT_BYTES = 48 * 1024
 MAX_SCOPE_ENTRIES = 256
 MAX_SCOPE_PATH_LENGTH = 512
+WIDE_SCOPE_PATH_LIMIT = 3
+WIDE_SCOPE_SHARE_LIMIT = 0.25
 # The first printable ASCII code point (space) and DEL bound the control
 # characters a claim marker field, scope path, or outbound text may never
 # contain -- each is meant to read as a single printable line.
@@ -120,6 +122,7 @@ class ActiveClaim:
     comment: IssueComment
     resource: ResourceHold | None = None
     requested_resource: str | None = None
+    whole_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -157,6 +160,7 @@ class ClaimRescope:
     role: str
     scope: tuple[str, ...]
     comment: IssueComment
+    whole_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -239,7 +243,7 @@ class ClaimRequest:
     scope: tuple[str, ...]
     claim_id: str
     out_of_order_reason: str | None = None
-    allow_directory_reason: str | None = None
+    whole_reason: str | None = None
     resource: str | None = None
     resource_value: int | None = None
 
@@ -447,6 +451,28 @@ def _valid_scope(scope: object) -> tuple[str, ...]:
     return tuple(result)
 
 
+def scope_is_wide(
+    scope: tuple[str, ...],
+    *,
+    directories: tuple[str, ...],
+    covered_file_count: int,
+    versioned_file_count: int,
+) -> bool:
+    if len(scope) > WIDE_SCOPE_PATH_LIMIT:
+        return True
+    if directories:
+        return True
+    if versioned_file_count == 0:
+        return False
+    return covered_file_count / versioned_file_count > WIDE_SCOPE_SHARE_LIMIT
+
+
+def _optional_whole_reason(payload: dict[str, object]) -> str | None:
+    if "whole" not in payload:
+        return None
+    return _required_text(payload, "whole", maximum=512)
+
+
 def _strict_keys(
     payload: dict[str, object], expected: frozenset[str], comment: IssueComment
 ) -> None:
@@ -547,6 +573,8 @@ def _parse_active_claim(
         expected.add("resource")
         if "resource_value" in payload:
             expected.add("resource_value")
+    if "whole" in payload:
+        expected.add("whole")
     _strict_keys(payload, frozenset(expected), comment)
     claim_id, agent, role = _event_identity(payload, comment)
     base = _required_text(payload, "base", maximum=40)
@@ -572,6 +600,7 @@ def _parse_active_claim(
         comment=comment,
         resource=resource,
         requested_resource=requested_resource,
+        whole_reason=_optional_whole_reason(payload),
     )
 
 
@@ -681,20 +710,17 @@ def _parse_ledger_supersede(
 def _parse_claim_rescope(
     payload: dict[str, object], comment: IssueComment, identity: ClaimIdentity
 ) -> ClaimRescope:
-    _strict_keys(
-        payload,
-        frozenset(
-            {
-                "action",
-                "agent",
-                "claim_id",
-                _identity_marker_key(identity),
-                "role",
-                "scope",
-            }
-        ),
-        comment,
-    )
+    expected = {
+        "action",
+        "agent",
+        "claim_id",
+        _identity_marker_key(identity),
+        "role",
+        "scope",
+    }
+    if "whole" in payload:
+        expected.add("whole")
+    _strict_keys(payload, frozenset(expected), comment)
     claim_id, agent, role = _event_identity(payload, comment)
     return ClaimRescope(
         identity=identity,
@@ -703,6 +729,7 @@ def _parse_claim_rescope(
         role=role,
         scope=_valid_scope(payload.get("scope")),
         comment=comment,
+        whole_reason=_optional_whole_reason(payload),
     )
 
 
@@ -859,7 +886,13 @@ def _aggregate_claim_events(comments: tuple[IssueComment, ...]) -> ClaimLedgerAg
                 raise InvalidClaimMarkerError(
                     f"claim id {event.claim_id!r} can only be rescoped by its claimant"
                 )
-            active[event.claim_id] = replace(current, scope=event.scope)
+            active[event.claim_id] = replace(
+                current,
+                scope=event.scope,
+                whole_reason=(
+                    current.whole_reason if event.whole_reason is None else event.whole_reason
+                ),
+            )
             continue
         if _apply_terminal_event(event, active, acquired):
             terminated_by.setdefault(event.claim_id, []).append(event.comment)
@@ -1185,12 +1218,11 @@ def claim_comment(request: ClaimRequest) -> str:
     if request.out_of_order_reason is not None:
         reason = _outbound_text(request.out_of_order_reason, "out-of-order reason", maximum=512)
         out_of_order = f"- Out-of-order reason: {reason}\n"
-    allow_directory = ""
-    if request.allow_directory_reason is not None:
-        reason = _outbound_text(
-            request.allow_directory_reason, "allow-directory reason", maximum=512
-        )
-        allow_directory = f"- Allow-directory reason: {reason}\n"
+    whole = ""
+    if request.whole_reason is not None:
+        reason = _outbound_text(request.whole_reason, "whole reason", maximum=512)
+        payload["whole"] = reason
+        whole = f"- Whole: {reason}\n"
     return _validated_comment(
         f"{_marker(payload)}\n"
         "## CLAIM — build lane\n\n"
@@ -1201,7 +1233,7 @@ def claim_comment(request: ClaimRequest) -> str:
         f"- Claim ID: `{request.claim_id}`\n"
         f"{resource_line}"
         f"{out_of_order}"
-        f"{allow_directory}"
+        f"{whole}"
         "- Write scope:\n"
         f"{scope}\n\n"
         "Repository-wide ledger event. No edit starts before this claim is re-read live. "
@@ -1215,7 +1247,8 @@ def rescope_comment(
     scope: tuple[str, ...],
     agent: str,
     role: str,
-    allow_directory_reason: str | None = None,
+    *,
+    whole_reason: str | None = None,
 ) -> str:
     validated_agent = _outbound_text(agent, "agent", maximum=128)
     validated_role = _outbound_text(role, "role", maximum=64)
@@ -1228,10 +1261,11 @@ def rescope_comment(
         "scope": list(scope),
     }
     scope_lines = "\n".join(f"- `{path}`" for path in scope)
-    allow_directory = ""
-    if allow_directory_reason is not None:
-        reason = _outbound_text(allow_directory_reason, "allow-directory reason", maximum=512)
-        allow_directory = f"- Allow-directory reason: {reason}\n"
+    whole = ""
+    if whole_reason is not None:
+        reason = _outbound_text(whole_reason, "whole reason", maximum=512)
+        payload["whole"] = reason
+        whole = f"- Whole: {reason}\n"
     return _validated_comment(
         f"{_marker(payload)}\n"
         "## RESCOPE — build lane\n\n"
@@ -1240,7 +1274,7 @@ def rescope_comment(
         f"- Base: `{claim.base}`\n"
         f"- Branch: `{claim.branch}`\n"
         f"- Claim ID: `{claim.claim_id}`\n"
-        f"{allow_directory}"
+        f"{whole}"
         "- Write scope:\n"
         f"{scope_lines}\n\n"
         "Repository-wide ledger event. Claim id and base are unchanged. "
@@ -1799,7 +1833,7 @@ def rescope_claim(  # noqa: PLR0913, PLR0917 -- protocol/board slice, #103
     claim_id: str | None,
     *,
     branch: str | None = None,
-    allow_directory_reason: str | None = None,
+    whole_reason: str | None = None,
 ) -> ActiveClaim:
     if not add and not drop:
         raise ClaimUnavailableError("rescope requires --add or --drop")
@@ -1815,7 +1849,7 @@ def rescope_claim(  # noqa: PLR0913, PLR0917 -- protocol/board slice, #103
             new_scope,
             agent,
             selected.role,
-            allow_directory_reason=allow_directory_reason,
+            whole_reason=whole_reason,
         ),
     )
     _, own = _observe_rescoped_claim(client, identity, selected, new_scope)
