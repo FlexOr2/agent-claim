@@ -77,14 +77,10 @@ POLICY_LOADER = (
     "second board."
 )
 DEFAULT_CLAIM_ROLE = "builder"
-SCOPE_SHARE_LIMIT = 0.25
 NEXT_PULL_DESCRIPTION = (
     "Pulling is not dispatching: an item whose expectations are still unruled is "
     "named here with refining as its first step, while dispatching a builder onto "
     "it waits for the operator's ruling."
-)
-ALLOW_DIRECTORY_HELP = (
-    "permit a directory without a cut, or a scope covering more than a quarter of versioned files"
 )
 WHOLE_HELP = (
     "one sentence why this wide scope does not split; required for more than "
@@ -134,50 +130,10 @@ def _claim_age_suffix(claim: protocol.ActiveClaim, now: datetime) -> str:
     return f" {rendered} old" if old else f" {rendered}"
 
 
-def _issue_body_for_cut(
-    client: github.GitHubIssueComments, identity: protocol.ClaimIdentity
-) -> str | None:
-    if not isinstance(identity, protocol.IssueIdentity):
-        return None
-    for issue in client.list_open_board_issues():
-        if issue.number == identity.issue:
-            return issue.body
-    return None
-
-
-def _reject_uncut_directory_scope(
-    client: github.GitHubIssueComments,
-    identity: protocol.ClaimIdentity,
-    paths: tuple[str, ...],
-    allow_directory_reason: str | None,
-) -> None:
-    directories = checkout._scope_directories(paths)
-    if not directories or allow_directory_reason is not None:
-        return
-    body = _issue_body_for_cut(client, identity)
-    if body is not None and board.has_cut(body):
-        return
-    raise protocol.ClaimError(f"directory scope {directories[0]!r} erst schneiden")
-
-
 def _scope_cost(versioned: tuple[str, ...], scope: tuple[str, ...]) -> tuple[int, int, float]:
     n = len(checkout.paths_under_scope(versioned, scope))
     total = len(versioned)
     share = 0.0 if total == 0 else n / total
-    return n, total, share
-
-
-def _reject_oversized_scope(
-    scope: tuple[str, ...],
-    allow_directory_reason: str | None,
-    versioned: tuple[str, ...],
-) -> tuple[int, int, float]:
-    n, total, share = _scope_cost(versioned, scope)
-    if share > SCOPE_SHARE_LIMIT and allow_directory_reason is None:
-        raise protocol.ClaimError(
-            f"scope covers more than a quarter of versioned files ({n} of {total}); "
-            "pass --allow-directory REASON"
-        )
     return n, total, share
 
 
@@ -342,12 +298,6 @@ def _parser() -> argparse.ArgumentParser:
         help=WHOLE_HELP,
     )
     claim.add_argument(
-        "--allow-directory",
-        metavar="REASON",
-        dest="whole",
-        help=ALLOW_DIRECTORY_HELP,
-    )
-    claim.add_argument(
         "--resource",
         metavar="NAME",
         help="allocate the next free value of this named scarce resource and hold it",
@@ -404,12 +354,6 @@ def _parser() -> argparse.ArgumentParser:
         "--whole",
         metavar="REASON",
         help=WHOLE_HELP,
-    )
-    rescope.add_argument(
-        "--allow-directory",
-        metavar="REASON",
-        dest="whole",
-        help=ALLOW_DIRECTORY_HELP,
     )
     rescope.add_argument("--json", action="store_true")
 
@@ -916,11 +860,11 @@ class SliceCheck:
 def _fetch_issue_reference(client: github.GitHubIssueComments, number: int) -> _IssueReference:
     """The live state, title, and body of issue `number` from `client`.
 
-    Called only for a claim target or a slice-table `#n` link that the
-    already-fetched open board didn't resolve as OPEN — a closed or missing
-    issue never appears in `list_open_board_issues`, so those two states
-    need their own targeted lookup; this is that lookup, kept to one issue
-    at a time rather than a repository-wide query.
+    Called only for a claim target that the already-fetched open board
+    didn't resolve as OPEN — a closed or missing issue never appears in
+    `list_open_board_issues`, so those two states need their own targeted
+    lookup; this is that lookup, kept to one issue at a time rather than a
+    repository-wide query.
     """
     try:
         raw = client.issue_reference_json(number)
@@ -980,66 +924,6 @@ def _out_of_order_check(
         f"(score {highest.score}) is free: {highest.title}; "
         "use --out-of-order REASON to proceed",
         issue=highest.number,
-    )
-
-
-def _slice_table_entry_checks(
-    client: github.GitHubIssueComments,
-    open_by_number: dict[int, board.Issue],
-    entry: board.SliceTableEntry,
-) -> SliceCheck | None:
-    if isinstance(entry, board.MalformedSliceTable):
-        return SliceCheck(
-            "error",
-            "malformed-slice-table",
-            f'malformed slice table header: "{entry.line}"',
-        )
-    if isinstance(entry, board.MalformedSliceRow):
-        return SliceCheck(
-            "error",
-            "malformed-slice-cell",
-            f'malformed slice table row: "{entry.line}"',
-        )
-    return _slice_row_checks(client, open_by_number, entry)
-
-
-def _slice_row_checks(
-    client: github.GitHubIssueComments,
-    open_by_number: dict[int, board.Issue],
-    row: board.SliceTableRow,
-) -> SliceCheck | None:
-    if row.item_issue is not None:
-        state, _title, _body = _issue_reference_state(client, open_by_number, row.item_issue)
-        if state is ReferenceState.CLOSED:
-            return SliceCheck(
-                "error",
-                "landed-slice-in-table",
-                f"slice {row.index} links closed #{row.item_issue}; "
-                "a landed slice leaves the table",
-                slice=row.index,
-                issue=row.item_issue,
-            )
-        if state is ReferenceState.MISSING:
-            return SliceCheck(
-                "error",
-                "missing-slice-item",
-                f"slice {row.index} links #{row.item_issue}, which does not exist here",
-                slice=row.index,
-                issue=row.item_issue,
-            )
-        return None
-    if row.item_cell == board.UNDISPATCHED_SLICE_CELL:
-        return SliceCheck(
-            "warning",
-            "undispatched-slice",
-            f'slice {row.index} "{row.name}" is not dispatched; make it an item before building it',
-            slice=row.index,
-        )
-    return SliceCheck(
-        "error",
-        "malformed-slice-cell",
-        f'slice {row.index} item cell "{row.item_cell}" is neither — nor #n',
-        slice=row.index,
     )
 
 
@@ -1112,7 +996,7 @@ def _slice_rule_checks(
     out_of_order = _out_of_order_check(projected, issue, out_of_order_reason)
     if out_of_order is not None:
         checks.append(out_of_order)
-    state, title, body = _issue_reference_state(lookup.client, lookup.open_by_number, issue)
+    state, title, _body = _issue_reference_state(lookup.client, lookup.open_by_number, issue)
     if state is ReferenceState.CLOSED:
         checks.append(SliceCheck("error", "closed-issue", f"issue #{issue} is closed", issue=issue))
     elif state is ReferenceState.MISSING:
@@ -1122,11 +1006,6 @@ def _slice_rule_checks(
     item = next((item for item in projected.items if item.number == issue), None)
     if item is not None:
         checks.extend(_body_contract_checks(item.contract, projected.blocker_references))
-    if body is not None:
-        for entry in board.parse_slice_table(body):
-            table_check = _slice_table_entry_checks(lookup.client, lookup.open_by_number, entry)
-            if table_check is not None:
-                checks.append(table_check)
     if title is not None:
         parent_check = _parent_checks(lookup.client, lookup.repository, issue, title)
         if parent_check is not None:
@@ -1574,11 +1453,6 @@ def _cmd_rescope(parsed: argparse.Namespace, session: _CommandSession) -> None:
         )
         combined = protocol._combined_scope(selected.scope, requested.add, requested.drop)
         _reject_wide_scope(combined, versioned, requested.whole_reason)
-        if requested.add:
-            _reject_uncut_directory_scope(
-                client, requested.identity, requested.add, requested.whole_reason
-            )
-            _reject_oversized_scope(combined, requested.whole_reason, versioned)
     rescoped = protocol.rescope_claim(
         client,
         requested.identity,
@@ -1600,13 +1474,6 @@ def _cmd_claim(parsed: argparse.Namespace, session: _CommandSession) -> int:
     requested = _request(parsed)
     versioned = checkout.versioned_paths()
     n, total, share = _reject_wide_scope(requested.scope, versioned, requested.whole_reason)
-    _reject_uncut_directory_scope(
-        client,
-        requested.identity,
-        requested.scope,
-        requested.whole_reason,
-    )
-    _reject_oversized_scope(requested.scope, requested.whole_reason, versioned)
     checks: tuple[SliceCheck, ...] = ()
     target_issue: int | None = None
     if isinstance(requested.identity, protocol.IssueIdentity):

@@ -1824,7 +1824,7 @@ def _select_rescope_claim(
     return selected
 
 
-def rescope_claim(  # noqa: PLR0913, PLR0917 -- protocol/board slice, #103
+def rescope_claim(  # noqa: PLR0913, PLR0917  # protocol/board slice, #103
     client: IssueComments,
     identity: ClaimIdentity,
     agent: str,
@@ -1891,7 +1891,7 @@ def _claims_for_identity(
     )
 
 
-def release_claim(  # noqa: PLR0913, PLR0917 -- protocol/board slice, #103
+def release_claim(  # noqa: PLR0913, PLR0917  # protocol/board slice, #103
     client: IssueComments,
     identity: ClaimIdentity,
     agent: str,
@@ -1956,7 +1956,7 @@ def release_claim(  # noqa: PLR0913, PLR0917 -- protocol/board slice, #103
     return selected
 
 
-def supersede_ledger(  # noqa: PLR0913, PLR0917 -- protocol/board slice, #103
+def supersede_ledger(  # noqa: PLR0913, PLR0917  # protocol/board slice, #103
     client: IssueComments,
     successor_issue: int,
     agent: str,
