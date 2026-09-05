@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import github
+from . import github, process
 from .protocol import REPOSITORY_PATTERN, ClaimError, ClaimRequest, _outbound_text
 
-GH_TIMEOUT_SECONDS = 60
+# One canonical source (process.DEFAULT_TIMEOUT_SECONDS); kept as a name here
+# because callers -- and tests -- read it as `checkout.GH_TIMEOUT_SECONDS`.
+GH_TIMEOUT_SECONDS = process.DEFAULT_TIMEOUT_SECONDS
 AGENT_CLAIM_AGENT_ENV = "AGENT_CLAIM_AGENT"
 GROK_SESSION_ID_ENV = "GROK_SESSION_ID"
 CLAUDE_SESSION_ID_ENV = "CLAUDE_SESSION_ID"
@@ -22,20 +23,17 @@ def _repository(explicit: str | None) -> str:
         repository = explicit
     else:
         try:
-            result = subprocess.run(
+            result = process.run_captured(
                 ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=GH_TIMEOUT_SECONDS,
                 env=github.github_command_environment(),
+                timeout=GH_TIMEOUT_SECONDS,
             )
-        except FileNotFoundError as error:
+        except process.ExecutableMissingError as error:
             raise ClaimError("gh is required for issue claims") from error
-        except subprocess.TimeoutExpired as error:
+        except process.ProcessTimedOutError as error:
             raise ClaimError("gh timed out while resolving the repository") from error
-        cleaned = github.strip_ansi(result.stdout).strip()
-        if result.returncode == 0 and cleaned:
+        cleaned = github.strip_ansi(result.stdout.decode("utf-8")).strip()
+        if result.exit_status == 0 and cleaned:
             repository = cleaned
         else:
             remote = _git_output(["config", "--get", "remote.origin.url"])
@@ -50,36 +48,31 @@ def _repository(explicit: str | None) -> str:
 
 def _git_output(arguments: list[str]) -> str:
     try:
-        result = subprocess.run(
-            ["git", *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=GH_TIMEOUT_SECONDS,
-        )
-    except FileNotFoundError as error:
+        result = process.run_captured(["git", *arguments], timeout=GH_TIMEOUT_SECONDS)
+    except process.ExecutableMissingError as error:
         raise ClaimError("git is required for issue claims") from error
-    except subprocess.TimeoutExpired as error:
+    except process.ProcessTimedOutError as error:
         raise ClaimError("git timed out while validating the build checkout") from error
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "unknown git failure"
+    if result.exit_status != 0:
+        detail = (
+            result.stderr.decode().strip()
+            or result.stdout.decode().strip()
+            or "unknown git failure"
+        )
         raise ClaimError(detail)
-    return result.stdout.strip()
+    return result.stdout.decode().strip()
 
 
 def versioned_paths() -> tuple[str, ...]:
     try:
-        result = subprocess.run(
-            ["git", "ls-files", "-z", "--full-name"],
-            check=False,
-            capture_output=True,
-            timeout=GH_TIMEOUT_SECONDS,
+        result = process.run_captured(
+            ["git", "ls-files", "-z", "--full-name"], timeout=GH_TIMEOUT_SECONDS
         )
-    except FileNotFoundError as error:
+    except process.ExecutableMissingError as error:
         raise ClaimError("git is required for issue claims") from error
-    except subprocess.TimeoutExpired as error:
+    except process.ProcessTimedOutError as error:
         raise ClaimError("git timed out while validating the build checkout") from error
-    if result.returncode != 0:
+    if result.exit_status != 0:
         detail = (
             result.stderr.decode().strip()
             or result.stdout.decode().strip()

@@ -69,6 +69,7 @@ ignore = [
 
 [tool.importlinter]
 root_package = "agent_claim"
+include_external_packages = true
 
 [[tool.importlinter.contracts]]
 name = "Layers"
@@ -80,7 +81,17 @@ layers = [
     "github",
     "board",
     "protocol",
+    "process",
 ]
+
+[[tool.importlinter.contracts]]
+name = "Only the process boundary imports subprocess"
+type = "forbidden"
+source_modules = ["agent_claim", "agent_claim.*"]
+forbidden_modules = ["subprocess"]
+allow_indirect_imports = true
+as_packages = false
+ignore_imports = ["agent_claim.process -> subprocess"]
 
 [dependency-groups]
 dev = [

@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
-from . import __version__, board, checkout, discovery, github, protocol
+from . import __version__, board, checkout, discovery, forge, github, protocol
 
 AGENT_CLAIM_AGENT_ENV = checkout.AGENT_CLAIM_AGENT_ENV
 CLAUDE_SESSION_ID_ENV = checkout.CLAUDE_SESSION_ID_ENV
@@ -868,14 +868,8 @@ def _fetch_issue_reference(client: github.GitHubIssueComments, number: int) -> _
     """
     try:
         raw = client.issue_reference_json(number)
-    except protocol.ClaimError as error:
-        # `gh api` reports a nonexistent issue as an HTTP 404 in its combined
-        # stdout/stderr text; `_bounded_command` doesn't expose the process's
-        # real exit status, so this substring is the only signal available
-        # to tell a missing issue apart from every other adapter failure.
-        if "HTTP 404" in str(error):
-            return _IssueReference(ReferenceState.MISSING)
-        raise
+    except forge.ForgeNotFoundError:
+        return _IssueReference(ReferenceState.MISSING)
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as error:

@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_claim import __version__, board, checkout, discovery, github, protocol
+from agent_claim import __version__, board, checkout, discovery, forge, github, process, protocol
 from agent_claim import cli as issue_claim
 from agent_claim.cli import (
     MAX_COMMENT_BYTES,
@@ -5421,7 +5421,9 @@ def test_github_marks_a_missing_blocker_only_after_a_404(monkeypatch: pytest.Mon
     monkeypatch.setattr(
         client,
         "_run",
-        lambda _arguments: (_ for _ in ()).throw(ClaimError("GitHub API failed: HTTP 404")),
+        lambda _arguments: (_ for _ in ()).throw(
+            forge.ForgeNotFoundError("GitHub API failed: HTTP 404")
+        ),
     )
 
     assert client.list_board_blockers(frozenset({86})) == (
@@ -5493,7 +5495,7 @@ def test_repository_resolution_uses_github_quiet_environment(
         command = arguments[0]
         observed["command"] = command
         observed["env"] = kwargs.get("env")
-        return subprocess.CompletedProcess(command, 0, "\x1b[32mowner/repository\x1b[0m\n", "")
+        return subprocess.CompletedProcess(command, 0, b"\x1b[32mowner/repository\x1b[0m\n", b"")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
@@ -5850,8 +5852,8 @@ def test_repository_falls_back_to_standard_github_remote(
         command = arguments[0]
         calls.append(command)
         if command[0] == "gh":
-            return subprocess.CompletedProcess(command, 1, "", "not a gh repo")
-        return subprocess.CompletedProcess(command, 0, remote + "\n", "")
+            return subprocess.CompletedProcess(command, 1, b"", b"not a gh repo")
+        return subprocess.CompletedProcess(command, 0, (remote + "\n").encode(), b"")
 
     monkeypatch.setattr(subprocess, "run", failed_gh)
 
@@ -5865,7 +5867,7 @@ def test_repository_falls_back_to_standard_github_remote(
 def test_bounded_command_stops_before_unbounded_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(github, "MAX_COMMAND_OUTPUT_BYTES", 32)
+    monkeypatch.setattr(process, "MAX_COMMAND_OUTPUT_BYTES", 32)
 
     with pytest.raises(ClaimError, match="output limit"):
         github._bounded_command(
@@ -5940,7 +5942,7 @@ def test_bounded_command_reaps_child_when_selector_setup_fails(
         raise OSError(5, "selector failed")
 
     monkeypatch.setattr(subprocess, "Popen", start)
-    monkeypatch.setattr(github.selectors, "DefaultSelector", cannot_select)
+    monkeypatch.setattr(process.selectors, "DefaultSelector", cannot_select)
 
     with pytest.raises(ClaimError, match="failed while coordinating I/O"):
         github._bounded_command(
@@ -5984,7 +5986,7 @@ def test_bounded_command_reaps_child_when_select_fails(
             self.closed = True
 
     monkeypatch.setattr(subprocess, "Popen", start)
-    monkeypatch.setattr(github.selectors, "DefaultSelector", FailingSelector)
+    monkeypatch.setattr(process.selectors, "DefaultSelector", FailingSelector)
 
     with pytest.raises(ClaimError, match="failed while waiting for I/O"):
         github._bounded_command(
@@ -5992,10 +5994,10 @@ def test_bounded_command_reaps_child_when_select_fails(
             purpose="select probe",
         )
 
-    process = observed["process"]
-    assert process.poll() is not None
-    assert process.stdout is not None
-    assert process.stdout.closed
+    spawned = observed["process"]
+    assert spawned.poll() is not None
+    assert spawned.stdout is not None
+    assert spawned.stdout.closed
     assert FailingSelector.instance is not None
     assert FailingSelector.instance.closed
 
@@ -6069,7 +6071,7 @@ def test_bounded_command_reaps_child_on_cancellation(
             pass
 
     monkeypatch.setattr(subprocess, "Popen", start)
-    monkeypatch.setattr(github.selectors, "DefaultSelector", CancellingSelector)
+    monkeypatch.setattr(process.selectors, "DefaultSelector", CancellingSelector)
 
     with pytest.raises(CancellationSentinel):
         github._bounded_command(
@@ -7204,7 +7206,7 @@ def test_versioned_paths_reads_nul_terminated_ls_files_without_stripping(
             arguments, 0, stdout=b" foo.py\0bar.py\0 foo.py\0", stderr=b""
         )
 
-    monkeypatch.setattr(checkout.subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "run", run)
 
     assert _LIVE_VERSIONED_PATHS() == (" foo.py", "bar.py")
     assert observed == [["git", "ls-files", "-z", "--full-name"]]
@@ -7214,14 +7216,14 @@ def test_versioned_paths_fails_loud_like_git_output(monkeypatch: pytest.MonkeyPa
     def missing(*_arguments, **_kwargs):
         raise FileNotFoundError("git")
 
-    monkeypatch.setattr(checkout.subprocess, "run", missing)
+    monkeypatch.setattr(subprocess, "run", missing)
     with pytest.raises(ClaimError, match="git is required for issue claims"):
         _LIVE_VERSIONED_PATHS()
 
     def timed_out(*_arguments, **_kwargs):
         raise subprocess.TimeoutExpired(["git"], checkout.GH_TIMEOUT_SECONDS)
 
-    monkeypatch.setattr(checkout.subprocess, "run", timed_out)
+    monkeypatch.setattr(subprocess, "run", timed_out)
     with pytest.raises(ClaimError, match="git timed out while validating the build checkout"):
         _LIVE_VERSIONED_PATHS()
 
@@ -7230,7 +7232,7 @@ def test_versioned_paths_fails_loud_like_git_output(monkeypatch: pytest.MonkeyPa
             arguments, 128, stdout=b"", stderr=b"fatal: not a git repository\n"
         )
 
-    monkeypatch.setattr(checkout.subprocess, "run", failed)
+    monkeypatch.setattr(subprocess, "run", failed)
     with pytest.raises(ClaimError, match="fatal: not a git repository"):
         _LIVE_VERSIONED_PATHS()
 
@@ -12282,7 +12284,7 @@ def test_github_adapter_reads_an_issue_without_a_parent_as_parentless(
     client = GitHubIssueComments(REPOSITORY)
 
     def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
-        raise ClaimError("gh: No parent issue found (HTTP 404)")
+        raise forge.ForgeNotFoundError("gh: No parent issue found (HTTP 404)")
 
     monkeypatch.setattr(client, "_run", run)
 
