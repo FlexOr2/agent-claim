@@ -1589,6 +1589,24 @@ def test_rescope_help_names_the_whole_reason(
     assert "three paths" in help_text
 
 
+@pytest.mark.parametrize("command", ["claim", "rescope"])
+def test_cli_claim_and_rescope_reject_the_removed_allow_directory_flag(
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    parser = issue_claim._parser()
+    with pytest.raises(SystemExit) as exited:
+        parser.parse_args([command, "--allow-directory", "REASON"])
+
+    assert exited.value.code == 2
+
+    with pytest.raises(SystemExit) as help_exited:
+        issue_claim.main([command, "--help"])
+
+    assert help_exited.value.code == 0
+    assert "--allow-directory" not in capsys.readouterr().out
+
+
 def test_claim_refuses_out_of_order_without_a_reason_before_mutating(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -8380,6 +8398,47 @@ def test_cli_claim_refuses_a_directory_scope_without_whole(
     assert LEDGER_ISSUE not in client.comments
 
 
+def test_cli_claim_refuses_a_directory_plus_child_scope_without_whole(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = FakeComments()
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
+    monkeypatch.setattr(
+        checkout, "_scope_directories", lambda paths: tuple(p for p in paths if p == "docs")
+    )
+
+    status = issue_claim.main(
+        [
+            "--repo",
+            "example/agent-claim",
+            "claim",
+            "72",
+            "--agent",
+            "Ada",
+            "--base",
+            BASE,
+            "--branch",
+            "codex/issue-72",
+            "--scope",
+            "docs",
+            "--scope",
+            "docs/a.md",
+            "--claim-id",
+            "tree",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert status == 2
+    assert captured.out == ""
+    assert "scope is wide" in captured.err
+    assert "--whole" in captured.err
+    assert LEDGER_ISSUE not in client.comments
+
+
 def test_cli_who_prints_the_claim_holding_a_path(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -9019,6 +9078,7 @@ def test_cli_rescope_persists_whole_reason(
     assert any("- Whole: widen to the docs tree" in body for body in bodies)
     standing = active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
     assert standing[0].scope == ("src/widget.py", "docs")
+    assert standing[0].whole_reason == "widen to the docs tree"
 
 
 def test_scope_is_wide_for_more_than_three_paths_any_directory_or_a_share_above_a_quarter() -> None:
