@@ -14,9 +14,6 @@ authors = [{name = "agent-claim contributors"}]
 [project.scripts]
 agent-claim = "agent_claim.cli:main"
 
-[project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.8", "build>=1"]
-
 [tool.setuptools.packages.find]
 where = ["src"]
 
@@ -73,7 +70,27 @@ ignore = [
 # -- report to the head instead of forcing it here.
 "src/agent_claim/protocol.py" = ["PLR0913", "PLR0917"]
 
+[tool.importlinter]
+root_package = "agent_claim"
+
+[[tool.importlinter.contracts]]
+name = "Layers"
+type = "layers"
+containers = ["agent_claim"]
+layers = [
+    "cli",
+    "checkout | discovery",
+    "github",
+    "board",
+    "protocol",
+]
+
 [dependency-groups]
 dev = [
+    "pytest>=8",
     "pytest-cov>=7.1.0",
+    "build>=1",
+    "ruff==0.16.2",
+    "vulture==2.16",
+    "import-linter==2.13",
 ]

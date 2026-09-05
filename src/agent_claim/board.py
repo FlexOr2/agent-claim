@@ -364,7 +364,6 @@ class BoardItem:
     claim_age: str | None
     claim_old: bool
     unblocks_count: int
-    single_concrete_next: bool
     score: int
     actionable: bool
     actionable_reason: str | None
@@ -1201,7 +1200,6 @@ def build_board(
                 claim_age=claim_age_text,
                 claim_old=claim_old,
                 unblocks_count=unblocks[issue.number],
-                single_concrete_next=single_next,
                 score=score,
                 actionable=actionable_reason is None,
                 actionable_reason=actionable_reason,
