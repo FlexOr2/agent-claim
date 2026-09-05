@@ -11747,8 +11747,54 @@ def test_github_adapter_fails_loud_on_a_malformed_pull_request(
     client = GitHubIssueComments(REPOSITORY)
     monkeypatch.setattr(client, "_run", lambda arguments, input_data=None: json.dumps(payload))
 
-    with pytest.raises(ClaimError, match="malformed pull request"):
+    with pytest.raises(ClaimError) as excinfo:
         client.pull_request_detail(12)
+
+    assert str(excinfo.value) == github.MALFORMED_PULL_REQUEST
+
+
+def test_github_adapter_fails_loud_when_the_pull_request_payload_is_not_a_dict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GitHubIssueComments(REPOSITORY)
+    monkeypatch.setattr(
+        client, "_run", lambda arguments, input_data=None: json.dumps("not a pull request")
+    )
+
+    with pytest.raises(ClaimError) as excinfo:
+        client.pull_request_detail(12)
+
+    assert str(excinfo.value) == github.MALFORMED_PULL_REQUEST
+
+
+def test_github_adapter_fails_loud_when_github_answers_with_more_than_one_pull_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GitHubIssueComments(REPOSITORY)
+    monkeypatch.setattr(
+        client,
+        "_run",
+        lambda arguments, input_data=None: (
+            f"{json.dumps(api_pull_request())}\n{json.dumps(api_pull_request())}"
+        ),
+    )
+
+    with pytest.raises(ClaimError) as excinfo:
+        client.pull_request_detail(12)
+
+    assert str(excinfo.value) == github.MALFORMED_PULL_REQUEST
+
+
+def test_github_adapter_fails_loud_when_github_answers_with_no_pull_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GitHubIssueComments(REPOSITORY)
+    monkeypatch.setattr(client, "_run", lambda arguments, input_data=None: "")
+
+    with pytest.raises(ClaimError) as excinfo:
+        client.pull_request_detail(12)
+
+    assert str(excinfo.value) == github.MALFORMED_PULL_REQUEST
 
 
 def test_github_adapter_fails_loud_on_a_malformed_default_branch(
