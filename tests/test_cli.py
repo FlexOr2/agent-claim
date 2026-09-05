@@ -77,7 +77,7 @@ def ledger_row(
         "body": body,
         "author_association": association,
         "labels": list(labels),
-        "is_pull_request": False,
+        "is_landing": False,
     }
 
 
@@ -407,9 +407,47 @@ class FakeForge:
     children: dict[int, tuple[board.IssueReference, ...]] = field(default_factory=dict)
     closed_issues: set[int] = field(default_factory=set)
     issue_reference_lookups: list[int] = field(default_factory=list)
+    ledger_items: list[forge.LedgerItem] = field(default_factory=list)
+    live_open_item_count: int | None = None
 
     def capability(self, operation: forge.ForgeOperation) -> forge.Capability:
         return github.GITHUB_CAPABILITIES[operation]
+
+    def list_items(
+        self, *, state: forge.ItemState | None = None, label: str | None = None
+    ) -> tuple[forge.LedgerItem, ...]:
+        return tuple(
+            item
+            for item in self.ledger_items
+            if (state is None or item.state is state) and (label is None or label in item.labels)
+        )
+
+    def open_item_count(self) -> int:
+        if self.live_open_item_count is not None:
+            return self.live_open_item_count
+        return sum(1 for item in self.ledger_items if item.state is forge.ItemState.OPEN)
+
+    def ensure_label(self, name: str, *, colour: str, description: str) -> None:
+        self.other_labels.setdefault(name, set())
+
+    def create_item(self, *, title: str, body: str) -> int:
+        number = max((item.number for item in self.ledger_items), default=0) + 1
+        self.ledger_items.append(
+            forge.LedgerItem(number, forge.ItemState.OPEN, False, body, "OWNER", (), False)
+        )
+        return number
+
+    def lock_item(self, number: int) -> None:
+        self.ledger_items = [
+            replace(item, locked=True) if item.number == number else item
+            for item in self.ledger_items
+        ]
+
+    def close_item(self, number: int) -> None:
+        self.ledger_items = [
+            replace(item, state=forge.ItemState.CLOSED) if item.number == number else item
+            for item in self.ledger_items
+        ]
 
     def list_protocol_candidates(self, issue: int) -> tuple[IssueComment, ...]:
         return tuple(
@@ -613,6 +651,18 @@ class ReaderOnlyForge(FakeForge):
     def neutralize_claim_comment(self, comment_id: int, body: str) -> None:
         pytest.fail("a read-only command must never neutralize a comment")
 
+    def ensure_label(self, name: str, *, colour: str, description: str) -> None:
+        pytest.fail("a read-only command must never ensure a label")
+
+    def create_item(self, *, title: str, body: str) -> int:
+        pytest.fail("a read-only command must never create an item")
+
+    def lock_item(self, number: int) -> None:
+        pytest.fail("a read-only command must never lock an item")
+
+    def close_item(self, number: int) -> None:
+        pytest.fail("a read-only command must never close an item")
+
 
 def test_forge_operation_exhaustiveness_matches_the_declared_reader_and_writer_methods() -> None:
     """Every `ForgeOperation` member names a `ForgeReader`/`ForgeWriter` method and
@@ -624,9 +674,152 @@ def test_forge_operation_exhaustiveness_matches_the_declared_reader_and_writer_m
         if not name.startswith("_") and name not in {"repository", "capability"}
     }
     assert {operation.value for operation in forge.ForgeOperation} == declared_methods
-    assert len(forge.ForgeOperation) == 17
+    assert len(forge.ForgeOperation) == 23
     assert set(github.GITHUB_CAPABILITIES) == set(forge.ForgeOperation)
     assert forge.Capability.UNSUPPORTED not in github.GITHUB_CAPABILITIES.values()
+
+
+def test_only_the_github_adapter_speaks_gh_argv() -> None:
+    """Source check, not a runtime guarantee: import-linter's module contract
+    cannot see an argv string, so "only the adapter speaks `gh`" is proven by
+    grepping every other module for the literal command name instead."""
+    for other in ("cli", "checkout", "discovery", "board", "protocol", "forge", "process"):
+        source = Path(f"src/agent_claim/{other}.py").read_text()
+        assert '"gh"' not in source, f"{other}.py must not construct a gh argv"
+
+
+def test_github_adapter_lists_items_with_state_and_label_filters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GitHubForge(github._repository_id(REPOSITORY))
+    observed: list[list[str]] = []
+
+    def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
+        observed.append(arguments)
+        return json.dumps(
+            {
+                "number": 9,
+                "state": "open",
+                "locked": True,
+                "body": issue_claim.LEDGER_BODY_MARKER,
+                "author_association": "OWNER",
+                "labels": [],
+                "is_landing": False,
+            }
+        )
+
+    monkeypatch.setattr(client, "_run", run)
+
+    items = client.list_items(state=forge.ItemState.OPEN, label=issue_claim.LEDGER_LABEL)
+
+    assert items == (
+        forge.LedgerItem(
+            9, forge.ItemState.OPEN, True, issue_claim.LEDGER_BODY_MARKER, "OWNER", (), False
+        ),
+    )
+    assert observed == [
+        [
+            "api",
+            "--paginate",
+            f"repos/{REPOSITORY}/issues?state=open&labels={issue_claim.LEDGER_LABEL}&per_page=100",
+            "--jq",
+            ".[] | {number,state,locked,body,author_association,"
+            'labels:(.labels | map(.name)),is_landing:has("pull_request")}',
+        ]
+    ]
+
+
+def test_github_adapter_reads_the_open_item_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = GitHubForge(github._repository_id(REPOSITORY))
+    observed: list[list[str]] = []
+
+    def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
+        observed.append(arguments)
+        return "7"
+
+    monkeypatch.setattr(client, "_run", run)
+
+    assert client.open_item_count() == 7
+    assert observed == [["api", f"repos/{REPOSITORY}", "--jq", ".open_issues_count"]]
+
+
+def test_github_adapter_ensures_a_label_definition(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = GitHubForge(github._repository_id(REPOSITORY))
+    observed: list[list[str]] = []
+
+    def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
+        observed.append(arguments)
+        return ""
+
+    monkeypatch.setattr(client, "_run", run)
+
+    client.ensure_label("agent-claim:ledger", colour="6f42c1", description="canonical ledger")
+
+    assert observed == [
+        [
+            "label",
+            "create",
+            "agent-claim:ledger",
+            "--repo",
+            REPOSITORY,
+            "--color",
+            "6f42c1",
+            "--description",
+            "canonical ledger",
+            "--force",
+        ]
+    ]
+
+
+def test_github_adapter_creates_an_item_and_returns_its_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GitHubForge(github._repository_id(REPOSITORY))
+    observed: list[tuple[list[str], bytes | None]] = []
+
+    def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
+        observed.append((arguments, input_data))
+        return json.dumps({"number": 42})
+
+    monkeypatch.setattr(client, "_run", run)
+
+    assert client.create_item(title="Agent claim ledger", body="body text") == 42
+    assert observed == [
+        (
+            ["api", "--method", "POST", f"repos/{REPOSITORY}/issues", "--input", "-"],
+            json.dumps({"title": "Agent claim ledger", "body": "body text"}).encode("utf-8"),
+        )
+    ]
+
+
+def test_github_adapter_locks_an_item(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = GitHubForge(github._repository_id(REPOSITORY))
+    observed: list[list[str]] = []
+
+    def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
+        observed.append(arguments)
+        return ""
+
+    monkeypatch.setattr(client, "_run", run)
+
+    client.lock_item(11)
+
+    assert observed == [["api", "--method", "PUT", f"repos/{REPOSITORY}/issues/11/lock"]]
+
+
+def test_github_adapter_closes_an_item(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = GitHubForge(github._repository_id(REPOSITORY))
+    observed: list[list[str]] = []
+
+    def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
+        observed.append(arguments)
+        return ""
+
+    monkeypatch.setattr(client, "_run", run)
+
+    client.close_item(11)
+
+    assert observed == [["issue", "close", "11", "--repo", REPOSITORY]]
 
 
 def test_read_only_commands_never_write_through_a_reader_only_forge(

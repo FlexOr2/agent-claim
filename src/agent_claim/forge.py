@@ -87,6 +87,20 @@ class Landing:
     merged: bool
 
 
+@dataclass(frozen=True)
+class LedgerItem:
+    """One issue read as ledger-discovery material -- an existing-ledger
+    candidate or the row a foreign coordination contract is detected on."""
+
+    number: int
+    state: ItemState
+    locked: bool
+    body: str
+    author_association: str
+    labels: tuple[str, ...]
+    is_landing: bool
+
+
 class Capability(StrEnum):
     UNSUPPORTED = "unsupported"
     READ_ONLY = "read_only"
@@ -116,6 +130,13 @@ class ForgeOperation(StrEnum):
     LIST_BOARD_BLOCKERS = "list_board_blockers"
     LIST_OPEN_BOARD_PULL_REQUESTS = "list_open_board_pull_requests"
     LIST_RECENT_MERGED_BOARD_PULL_REQUESTS = "list_recent_merged_board_pull_requests"
+    # -- forge-specific, ledger discovery (6) ------------------------------
+    LIST_ITEMS = "list_items"
+    OPEN_ITEM_COUNT = "open_item_count"
+    ENSURE_LABEL = "ensure_label"
+    CREATE_ITEM = "create_item"
+    LOCK_ITEM = "lock_item"
+    CLOSE_ITEM = "close_item"
 
 
 class ForgeReader(protocol.ClaimReader, Protocol):
@@ -146,6 +167,20 @@ class ForgeReader(protocol.ClaimReader, Protocol):
         self, since: datetime
     ) -> tuple[board.PullRequest, ...]: ...
 
+    def list_items(
+        self, *, state: ItemState | None = None, label: str | None = None
+    ) -> tuple[LedgerItem, ...]: ...
+
+    def open_item_count(self) -> int: ...
+
 
 class ForgeWriter(ForgeReader, protocol.ClaimWriter, Protocol):
     """`ForgeReader` plus every operation that mutates forge state."""
+
+    def ensure_label(self, name: str, *, colour: str, description: str) -> None: ...
+
+    def create_item(self, *, title: str, body: str) -> int: ...
+
+    def lock_item(self, number: int) -> None: ...
+
+    def close_item(self, number: int) -> None: ...

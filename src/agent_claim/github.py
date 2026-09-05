@@ -64,6 +64,14 @@ API_ISSUE_STATES: dict[str, board.BlockerState] = {
     "open": board.BlockerState.OPEN,
     "closed": board.BlockerState.CLOSED,
 }
+_LEDGER_ITEM_STATES: dict[str, forge.ItemState] = {
+    "open": forge.ItemState.OPEN,
+    "closed": forge.ItemState.CLOSED,
+}
+# GitHub's issues-list pagination fills every page but the last, so a result
+# strictly under this count could only have come from one request -- one live
+# snapshot a concurrent open/close cannot have shifted an issue across.
+ISSUES_PER_PAGE = 100
 MALFORMED_PULL_REQUEST = "GitHub returned a malformed pull request"
 # `HTTP 5xx` in #4.2's signal table: gh's combined output names the status
 # code but never its class, so any 5xx is matched by digit rather than by an
@@ -236,6 +244,8 @@ _READ_ONLY_OPERATIONS = (
     forge.ForgeOperation.LIST_BOARD_BLOCKERS,
     forge.ForgeOperation.LIST_OPEN_BOARD_PULL_REQUESTS,
     forge.ForgeOperation.LIST_RECENT_MERGED_BOARD_PULL_REQUESTS,
+    forge.ForgeOperation.LIST_ITEMS,
+    forge.ForgeOperation.OPEN_ITEM_COUNT,
 )
 _READ_WRITE_OPERATIONS = (
     forge.ForgeOperation.POST_COMMENT,
@@ -243,6 +253,10 @@ _READ_WRITE_OPERATIONS = (
     forge.ForgeOperation.REMOVE_LABEL,
     forge.ForgeOperation.UPSERT_PROJECTION,
     forge.ForgeOperation.NEUTRALIZE_CLAIM_COMMENT,
+    forge.ForgeOperation.ENSURE_LABEL,
+    forge.ForgeOperation.CREATE_ITEM,
+    forge.ForgeOperation.LOCK_ITEM,
+    forge.ForgeOperation.CLOSE_ITEM,
 )
 # The GitHub adapter never refuses an operation: every member answers
 # READ_ONLY or READ_WRITE, never UNSUPPORTED (decision record 0001 §2).
@@ -936,3 +950,109 @@ class GitHubForge:
         self._run(
             ["issue", "edit", str(issue), "--repo", self.repository.path, "--remove-label", label]
         )
+
+    def list_items(
+        self, *, state: forge.ItemState | None = None, label: str | None = None
+    ) -> tuple[forge.LedgerItem, ...]:
+        query_state = "all" if state is None else state.value
+        label_filter = f"&labels={label}" if label else ""
+        raw = self._run(
+            [
+                "api",
+                "--paginate",
+                f"repos/{self.repository}/issues?state={query_state}{label_filter}"
+                f"&per_page={ISSUES_PER_PAGE}",
+                "--jq",
+                (
+                    ".[] | {number,state,locked,body,author_association,"
+                    'labels:(.labels | map(.name)),is_landing:has("pull_request")}'
+                ),
+            ]
+        )
+        items: list[forge.LedgerItem] = []
+        for value in self._json_lines(raw, "ledger-issue"):
+            if not isinstance(value, dict):
+                raise forge.ForgeMalformedResponseError("GitHub returned a malformed ledger issue")
+            number = value.get("number")
+            labels = value.get("labels")
+            raw_state = value.get("state")
+            item_state = _LEDGER_ITEM_STATES.get(raw_state) if isinstance(raw_state, str) else None
+            if (
+                isinstance(number, bool)
+                or not isinstance(number, int)
+                or number < 1
+                or item_state is None
+                or not isinstance(value.get("locked"), bool)
+                or not isinstance(value.get("body"), str)
+                or not isinstance(value.get("author_association"), str)
+                or not isinstance(labels, list)
+                or not all(isinstance(label, str) for label in labels)
+                or not isinstance(value.get("is_landing"), bool)
+            ):
+                raise forge.ForgeMalformedResponseError("GitHub returned a malformed ledger issue")
+            items.append(
+                forge.LedgerItem(
+                    number,
+                    item_state,
+                    value["locked"],
+                    value["body"],
+                    value["author_association"],
+                    tuple(labels),
+                    value["is_landing"],
+                )
+            )
+        return tuple(items)
+
+    def open_item_count(self) -> int:
+        raw = self._run(["api", f"repos/{self.repository}", "--jq", ".open_issues_count"])
+        try:
+            count = int(raw)
+        except ValueError as error:
+            raise forge.ForgeMalformedResponseError(
+                "GitHub returned a malformed open-issue count"
+            ) from error
+        if count < 0:
+            raise forge.ForgeMalformedResponseError("GitHub returned a malformed open-issue count")
+        return count
+
+    def ensure_label(self, name: str, *, colour: str, description: str) -> None:
+        self._run(
+            [
+                "label",
+                "create",
+                name,
+                "--repo",
+                self.repository.path,
+                "--color",
+                colour,
+                "--description",
+                description,
+                "--force",
+            ]
+        )
+
+    def create_item(self, *, title: str, body: str) -> int:
+        raw = self._run(
+            ["api", "--method", "POST", f"repos/{self.repository}/issues", "--input", "-"],
+            input_data=json.dumps({"title": title, "body": body}).encode("utf-8"),
+        )
+        try:
+            created = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise forge.ForgeMalformedResponseError(
+                "GitHub returned invalid created-item JSON"
+            ) from error
+        if (
+            not isinstance(created, dict)
+            or isinstance(created.get("number"), bool)
+            or not isinstance(created.get("number"), int)
+            or created["number"] < 1
+        ):
+            raise forge.ForgeMalformedResponseError("GitHub did not return a created item number")
+        return created["number"]
+
+    def lock_item(self, number: int) -> None:
+        self._run(["api", "--method", "PUT", f"repos/{self.repository}/issues/{number}/lock"])
+
+    def close_item(self, number: int) -> None:
+        self._run(["issue", "close", str(number), "--repo", self.repository.path])

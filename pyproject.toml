@@ -94,6 +94,18 @@ allow_indirect_imports = true
 as_packages = false
 ignore_imports = ["agent_claim.process -> subprocess"]
 
+[[tool.importlinter.contracts]]
+name = "Only the gh and git owners run commands"
+type = "forbidden"
+source_modules = ["agent_claim", "agent_claim.*"]
+forbidden_modules = ["agent_claim.process"]
+allow_indirect_imports = true
+as_packages = false
+ignore_imports = [
+    "agent_claim.github -> agent_claim.process",
+    "agent_claim.checkout -> agent_claim.process",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8",

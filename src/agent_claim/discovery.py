@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass
-
-from .github import GitHubForge
+from . import forge
 from .protocol import (
     LEDGER_BODY_MARKER,
     LEDGER_LABEL,
@@ -20,103 +17,44 @@ from .protocol import (
 # strictly under this count could only have come from one request — one live
 # snapshot a concurrent open/close cannot have shifted an issue across.
 ISSUES_PER_PAGE = 100
+LEDGER_LABEL_COLOUR = "6f42c1"
 
 
-@dataclass(frozen=True)
-class _LedgerIssue:
-    number: int
-    state: str
-    locked: bool
-    body: str
-    author_association: str
-    labels: tuple[str, ...]
-    is_pull_request: bool
+def _issue_first_line(item: forge.LedgerItem) -> str:
+    return item.body.partition("\n")[0]
 
 
-def _ledger_issue_rows(
-    client: GitHubForge, state: str = "all", *, label: str | None = None
-) -> tuple[_LedgerIssue, ...]:
-    label_filter = f"&labels={label}" if label else ""
-    raw = client._run(
-        [
-            "api",
-            "--paginate",
-            f"repos/{client.repository}/issues?state={state}{label_filter}&per_page={ISSUES_PER_PAGE}",
-            "--jq",
-            (
-                ".[] | {number,state,locked,body,author_association,"
-                'labels:(.labels | map(.name)),is_pull_request:has("pull_request")}'
-            ),
-        ]
-    )
-    rows: list[_LedgerIssue] = []
-    for value in client._json_lines(raw, "ledger-issue"):
-        if not isinstance(value, dict):
-            raise ClaimError("GitHub returned a malformed ledger issue")
-        number = value.get("number")
-        labels = value.get("labels")
-        if (
-            isinstance(number, bool)
-            or not isinstance(number, int)
-            or number < 1
-            or value.get("state") not in {"open", "closed"}
-            or not isinstance(value.get("locked"), bool)
-            or not isinstance(value.get("body"), str)
-            or not isinstance(value.get("author_association"), str)
-            or not isinstance(labels, list)
-            or not all(isinstance(label, str) for label in labels)
-            or not isinstance(value.get("is_pull_request"), bool)
-        ):
-            raise ClaimError("GitHub returned a malformed ledger issue")
-        rows.append(
-            _LedgerIssue(
-                number,
-                value["state"],
-                value["locked"],
-                value["body"],
-                value["author_association"],
-                tuple(labels),
-                value["is_pull_request"],
-            )
-        )
-    return tuple(rows)
-
-
-def _issue_first_line(issue: _LedgerIssue) -> str:
-    return issue.body.partition("\n")[0]
-
-
-def _foreign_contract(issue: _LedgerIssue) -> bool:
-    first = _issue_first_line(issue)
+def _foreign_contract(item: forge.LedgerItem) -> bool:
+    first = _issue_first_line(item)
     if first == LEDGER_BODY_MARKER:
         return False
     return first.startswith("<!-- ") and ("claim" in first or "ledger" in first)
 
 
-def _trusted_ledger_issue(issue: _LedgerIssue) -> bool:
-    return issue.author_association in TRUSTED_ASSOCIATIONS
+def _trusted_ledger_issue(item: forge.LedgerItem) -> bool:
+    return item.author_association in TRUSTED_ASSOCIATIONS
 
 
-def _select_ledger(rows: tuple[_LedgerIssue, ...]) -> int | None:
+def _select_ledger(items: tuple[forge.LedgerItem, ...]) -> int | None:
     """Resolve the canonical ledger from an issue-row snapshot, or raise on
     a locked-marker violation or a competing foreign coordination contract."""
     ledgers: list[int] = []
     foreign: list[int] = []
-    for issue in rows:
-        if issue.is_pull_request:
+    for item in items:
+        if item.is_landing:
             continue
-        if not _trusted_ledger_issue(issue):
+        if not _trusted_ledger_issue(item):
             continue
-        if issue.state == "open" and _foreign_contract(issue):
-            foreign.append(issue.number)
+        if item.state is forge.ItemState.OPEN and _foreign_contract(item):
+            foreign.append(item.number)
             continue
-        if _issue_first_line(issue) != LEDGER_BODY_MARKER or issue.state == "closed":
+        if _issue_first_line(item) != LEDGER_BODY_MARKER or item.state is forge.ItemState.CLOSED:
             continue
-        if not issue.locked:
+        if not item.locked:
             raise ClaimUnavailableError(
-                f"ledger candidate #{issue.number} is not locked; run bootstrap"
+                f"ledger candidate #{item.number} is not locked; run bootstrap"
             )
-        ledgers.append(issue.number)
+        ledgers.append(item.number)
     if foreign:
         raise ClaimError(
             f"another coordination contract exists on issue(s) {foreign}; refusing to compete"
@@ -124,20 +62,7 @@ def _select_ledger(rows: tuple[_LedgerIssue, ...]) -> int | None:
     return min(ledgers) if ledgers else None
 
 
-def _open_issue_count(client: GitHubForge) -> int:
-    """The repository's live open-issue-and-pull-request count, from the
-    single-request repository resource rather than a paginated listing."""
-    raw = client._run(["api", f"repos/{client.repository}", "--jq", ".open_issues_count"])
-    try:
-        count = int(raw)
-    except ValueError as error:
-        raise ClaimError("GitHub returned a malformed open-issue count") from error
-    if count < 0:
-        raise ClaimError("GitHub returned a malformed open-issue count")
-    return count
-
-
-def discover_ledger(client: GitHubForge) -> int | None:
+def discover_ledger(client: forge.ForgeReader) -> int | None:
     """Find the single open, locked protocol ledger without changing GitHub state.
 
     Every bootstrapped ledger is labelled `LEDGER_LABEL` (`_ensure_ledger_labels`
@@ -151,12 +76,12 @@ def discover_ledger(client: GitHubForge) -> int | None:
     Only when the labelled query comes back empty — an unlabelled legacy
     ledger, or a genuine absence — does discovery fall back to scanning every
     open issue. That scan can only report absence (return `None`) when it
-    was a single page: `len(rows) < ISSUES_PER_PAGE` is the only condition
+    was a single page: `len(items) < ISSUES_PER_PAGE` is the only condition
     under which the fetch was provably one snapshot, since GitHub's
     pagination fills every page but the last. A fallback spanning more than
     one page can never prove absence, no matter how the counts line up — an
     issue that closed on an already-consumed page while another opened could
-    leave `len(rows)` exactly equal to the live open-issue count while still
+    leave `len(items)` exactly equal to the live open-issue count while still
     hiding an unlabelled legacy ledger that shifted across the page
     boundary — so that case always fails loud instead. Within a genuinely
     single-page fetch, the open-issue-count comparison is still worth
@@ -167,20 +92,20 @@ def discover_ledger(client: GitHubForge) -> int | None:
     reporting that wrongly invites `bootstrap`, which would create a
     second, competing ledger next to one that still exists.
     """
-    labelled = _select_ledger(_ledger_issue_rows(client, state="open", label=LEDGER_LABEL))
+    labelled = _select_ledger(client.list_items(state=forge.ItemState.OPEN, label=LEDGER_LABEL))
     if labelled is not None:
         return labelled
-    rows = _ledger_issue_rows(client, state="open")
-    ledger = _select_ledger(rows)
+    items = client.list_items(state=forge.ItemState.OPEN)
+    ledger = _select_ledger(items)
     if ledger is not None:
         return ledger
-    if len(rows) >= ISSUES_PER_PAGE:
-        page_count = (len(rows) + ISSUES_PER_PAGE - 1) // ISSUES_PER_PAGE
+    if len(items) >= ISSUES_PER_PAGE:
+        page_count = (len(items) + ISSUES_PER_PAGE - 1) // ISSUES_PER_PAGE
         raise ClaimError(
             f"could not establish ledger absence over {page_count} pages of "
             "open issues; retry, do not bootstrap"
         )
-    if len(rows) != _open_issue_count(client):
+    if len(items) != client.open_item_count():
         raise ClaimError(
             "ledger discovery fetch may be incomplete (the open-issue count "
             "changed mid-fetch); retry rather than bootstrap"
@@ -188,7 +113,7 @@ def discover_ledger(client: GitHubForge) -> int | None:
     return None
 
 
-def _ensure_ledger_labels(client: GitHubForge, ledger: int) -> None:
+def _ensure_ledger_labels(client: forge.ForgeWriter, ledger: int) -> None:
     """Create both label definitions and attach `LEDGER_LABEL` to `ledger` itself.
 
     `claim_label(ledger)` is never attached here — it belongs on whichever
@@ -200,56 +125,28 @@ def _ensure_ledger_labels(client: GitHubForge, ledger: int) -> None:
         (LEDGER_LABEL, "agent-claim canonical ledger"),
         (claim_label(ledger), "agent-claim active issue projection"),
     ):
-        client._run(
-            [
-                "label",
-                "create",
-                label,
-                "--repo",
-                client.repository.path,
-                "--color",
-                "6f42c1",
-                "--description",
-                description,
-                "--force",
-            ]
-        )
+        client.ensure_label(label, colour=LEDGER_LABEL_COLOUR, description=description)
     client.add_label(ledger, LEDGER_LABEL)
 
 
-def _create_ledger(client: GitHubForge) -> int:
+def _create_ledger(client: forge.ForgeWriter) -> int:
     body = (
         f"{LEDGER_BODY_MARKER}\n\n## Agent claim ledger\n\n"
         "This open, collaborator-locked issue serializes build-claim events."
     )
-    raw = client._run(
-        ["api", "--method", "POST", f"repos/{client.repository}/issues", "--input", "-"],
-        input_data=json.dumps({"title": "Agent claim ledger", "body": body}).encode("utf-8"),
-    )
-    try:
-        created = json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise ClaimError("GitHub returned invalid created-ledger JSON") from error
-    if (
-        not isinstance(created, dict)
-        or isinstance(created.get("number"), bool)
-        or not isinstance(created.get("number"), int)
-        or created["number"] < 1
-    ):
-        raise ClaimError("GitHub did not return a created ledger number")
-    number = created["number"]
-    client._run(["api", "--method", "PUT", f"repos/{client.repository}/issues/{number}/lock"])
+    number = client.create_item(title="Agent claim ledger", body=body)
+    client.lock_item(number)
     return number
 
 
-def _refuse_competing_contracts(rows: tuple[_LedgerIssue, ...]) -> None:
+def _refuse_competing_contracts(items: tuple[forge.LedgerItem, ...]) -> None:
     foreign = [
-        issue.number
-        for issue in rows
-        if not issue.is_pull_request
-        and _trusted_ledger_issue(issue)
-        and issue.state == "open"
-        and _foreign_contract(issue)
+        item.number
+        for item in items
+        if not item.is_landing
+        and _trusted_ledger_issue(item)
+        and item.state is forge.ItemState.OPEN
+        and _foreign_contract(item)
     ]
     if foreign:
         raise ClaimError(
@@ -257,46 +154,46 @@ def _refuse_competing_contracts(rows: tuple[_LedgerIssue, ...]) -> None:
         )
 
 
-def _trusted_ledger_candidates(rows: tuple[_LedgerIssue, ...]) -> tuple[_LedgerIssue, ...]:
+def _trusted_ledger_candidates(items: tuple[forge.LedgerItem, ...]) -> tuple[forge.LedgerItem, ...]:
     return tuple(
-        issue
-        for issue in rows
-        if not issue.is_pull_request
-        and issue.state == "open"
-        and _issue_first_line(issue) == LEDGER_BODY_MARKER
-        and _trusted_ledger_issue(issue)
-        and (issue.locked or issue.author_association in TRUSTED_ASSOCIATIONS)
+        item
+        for item in items
+        if not item.is_landing
+        and item.state is forge.ItemState.OPEN
+        and _issue_first_line(item) == LEDGER_BODY_MARKER
+        and _trusted_ledger_issue(item)
+        and (item.locked or item.author_association in TRUSTED_ASSOCIATIONS)
     )
 
 
-def _converge_on_canonical_ledger(client: GitHubForge, candidates: tuple[_LedgerIssue, ...]) -> int:
-    canonical = min(issue.number for issue in candidates)
-    for issue in candidates:
-        if not issue.locked:
-            client._run(
-                ["api", "--method", "PUT", f"repos/{client.repository}/issues/{issue.number}/lock"]
-            )
+def _converge_on_canonical_ledger(
+    client: forge.ForgeWriter, candidates: tuple[forge.LedgerItem, ...]
+) -> int:
+    canonical = min(item.number for item in candidates)
+    for item in candidates:
+        if not item.locked:
+            client.lock_item(item.number)
     _ensure_ledger_labels(client, canonical)
-    for issue in candidates:
-        if issue.number == canonical:
+    for item in candidates:
+        if item.number == canonical:
             continue
         client.post_comment(
-            issue.number,
+            item.number,
             "<!-- agent-claim-ledger-duplicate:v1 "
             f"canonical={canonical}{MARKER_SUFFIX}\n\n"
             f"Superseded duplicate ledger; canonical ledger is #{canonical}.",
         )
-        client._run(["issue", "close", str(issue.number), "--repo", client.repository.path])
+        client.close_item(item.number)
     return canonical
 
 
-def bootstrap_ledger(client: GitHubForge) -> int:
+def bootstrap_ledger(client: forge.ForgeWriter) -> int:
     """Create/adopt one ledger and make racing first starts converge to the earliest issue."""
-    rows = _ledger_issue_rows(client)
-    _refuse_competing_contracts(rows)
-    if not _trusted_ledger_candidates(rows):
+    items = client.list_items()
+    _refuse_competing_contracts(items)
+    if not _trusted_ledger_candidates(items):
         _create_ledger(client)
-    candidates = _trusted_ledger_candidates(_ledger_issue_rows(client))
+    candidates = _trusted_ledger_candidates(client.list_items())
     if not candidates:
         raise ClaimError("bootstrap did not expose a trusted ledger candidate; retry")
     return _converge_on_canonical_ledger(client, candidates)
