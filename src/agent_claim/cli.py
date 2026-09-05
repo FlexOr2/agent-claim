@@ -1486,7 +1486,8 @@ def main(arguments: list[str] | None = None) -> int:
             )
         protocol.configure_ledger(ledger)
         if parsed.command == "pr-check":
-            return _pull_request_check(client, repository, parsed.pr)
+            pull_request_number = int(parsed.pr)
+            return _pull_request_check(client, repository, pull_request_number)
         if parsed.command == "status":
             comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
             claims = protocol.active_claims(comments)
