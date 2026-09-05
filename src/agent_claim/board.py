@@ -91,7 +91,8 @@ REFERENCE_BOUNDARY = r"(?![A-Za-z0-9_])"
 CLOSING_KEYWORDS = r"close(?:s|d)?|fix(?:es|ed)?|resolve(?:s|d)?"
 CLOSING_REFERENCE_PATTERN = re.compile(
     rf"(?im)\b(?:{CLOSING_KEYWORDS}){KEYWORD_SEPARATOR}"
-    rf"{QUALIFIED_REFERENCE}{REFERENCE_BOUNDARY}"
+    rf"{QUALIFIED_REFERENCE}{REFERENCE_BOUNDARY}",
+    re.ASCII,
 )
 # The board's stage heuristic also believes a pull request that says it landed
 # or implemented an issue. GitHub closes on neither word, so this wider set
