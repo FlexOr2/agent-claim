@@ -36,12 +36,14 @@ line-length = 100
 
 [tool.ruff.lint]
 # PLR0911 (too-many-return-statements), PLR0912 (too-many-branches) and
-# PLR0915 (too-many-statements) stay unselected: the functions they would
-# flag today (main, _bounded_command, bootstrap_ledger, _board_blocker,
-# build_board, parse_contract, parse_slice_table,
-# _acquire_claim_with_observed, _apply_derived_resource_holds,
-# _aggregate_claim_events, release_claim) are the open complexity slices
-# #117/#119; re-enable once those land.
+# PLR0915 (too-many-statements) stay unselected: the functions they flag
+# today are open complexity work, split across owners --
+#   main, _parser, _protect_write: #119
+#   _bounded_command: #117
+#   build_board, parse_pull_request_classification,
+#   _acquire_claim_with_observed: the protocol/board complexity slice of
+#   distributor #103 (not yet its own item)
+# -- re-enable once the last of these lands.
 select = ["E", "F", "I", "B", "UP", "SIM", "RUF", "PL", "FURB", "N"]
 ignore = [
     "PLR0911",
@@ -58,17 +60,10 @@ ignore = [
 # Test literals are scenario data, not domain magic numbers; a pytest test
 # function's parameter list is shaped by fixture injection and
 # `parametrize`, not a free design choice, so its argument count isn't a
-# design smell the way a production function's is.
+# design smell the way a production function's is. This is a standing
+# policy for fixture-shaped signatures, not a per-finding exception, so it
+# stays a file-wide ignore rather than a line marker.
 "tests/**" = ["PLR2004", "PLR0913", "PLR0917"]
-# `build_board` is the open complexity slices #117/#119's function (see the
-# comment above); its argument count is part of the same pending redesign.
-"src/agent_claim/board.py" = ["PLR0913"]
-# `release_claim` is #117/#119's function, same as above. `rescope_claim` and
-# `supersede_ledger` are public protocol entry points pinned by many direct
-# tests; grouping their arguments would ripple through every call site for a
-# CI-gate slice that fixes lint findings, not redesigns the protocol surface
-# -- report to the head instead of forcing it here.
-"src/agent_claim/protocol.py" = ["PLR0913", "PLR0917"]
 
 [tool.importlinter]
 root_package = "agent_claim"

@@ -1064,7 +1064,7 @@ def board_rank(item: BoardItem) -> tuple[int, int, int]:
     return (item.priority_category, -item.score, item.number)
 
 
-def build_board(
+def build_board(  # noqa: PLR0913 -- protocol/board slice, #103
     issues: tuple[Issue, ...],
     open_pull_requests: tuple[PullRequest, ...],
     recent_merged_pull_requests: tuple[PullRequest, ...],
