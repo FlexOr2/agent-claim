@@ -52,9 +52,7 @@ FROZEN_TRIGGER_PATTERN = re.compile(
 # modeled here; see `_live_text` for why that gap is safe.
 FENCE_OPENING_PATTERN = re.compile(r"^ {0,3}(?P<run>`{3,}|~{3,})")
 FENCE_CLOSING_PATTERN = re.compile(r"^ {0,3}(?P<run>`{3,}|~{3,})[ \t]*$")
-PROPOSED_EXPECTATION_PATTERN = re.compile(
-    r"\*\(Default:[ \t]*(?:yes|no|later)\)\*", re.IGNORECASE
-)
+PROPOSED_EXPECTATION_PATTERN = re.compile(r"\*\(Default:[ \t]*(?:yes|no|later)\)\*", re.IGNORECASE)
 # `ja` and `NEIN` both may carry trailing justification text before the
 # closing `)*` (`*(geregelt: ja — Owner ist #567)*`, `*(geregelt: NEIN, it
 # stays)*`) — real operator rulings cite an owner or a reservation on a
@@ -105,9 +103,7 @@ LANDING_CLAIM_PATTERN = re.compile(
     re.ASCII,
 )
 WORK_ITEM_KIND = "work-item"
-CLASSIFICATION_LINE_PATTERN = re.compile(
-    r"(?im)^(?P<kind>Work-Item|No-Item):(?P<value>[^\r\n]*)$"
-)
+CLASSIFICATION_LINE_PATTERN = re.compile(r"(?im)^(?P<kind>Work-Item|No-Item):(?P<value>[^\r\n]*)$")
 WORK_ITEM_VALUE_PATTERN = re.compile(QUALIFIED_REFERENCE, re.ASCII)
 RECOVERY_STEP = "close or re-project"
 # A slice's pull request must never close its still-open epic — that would
@@ -664,8 +660,10 @@ def _table_row_cells(line: str) -> tuple[str, ...] | None:
 
 def _is_slice_table_separator(line: str) -> bool:
     cells = _table_row_cells(line)
-    return cells is not None and len(cells) == len(SLICE_TABLE_HEADER_CELLS) and all(
-        _SLICE_TABLE_SEPARATOR_CELL_PATTERN.match(cell) is not None for cell in cells
+    return (
+        cells is not None
+        and len(cells) == len(SLICE_TABLE_HEADER_CELLS)
+        and all(_SLICE_TABLE_SEPARATOR_CELL_PATTERN.match(cell) is not None for cell in cells)
     )
 
 
@@ -719,9 +717,10 @@ def parse_slice_table(body: str) -> tuple[SliceTableEntry, ...]:
         if header_cells is None or not _looks_like_slice_table_header(header_cells):
             line_index += 1
             continue
-        well_formed_header = len(header_cells) == len(SLICE_TABLE_HEADER_CELLS) and tuple(
-            cell.casefold() for cell in header_cells
-        ) == SLICE_TABLE_HEADER_CELLS
+        well_formed_header = (
+            len(header_cells) == len(SLICE_TABLE_HEADER_CELLS)
+            and tuple(cell.casefold() for cell in header_cells) == SLICE_TABLE_HEADER_CELLS
+        )
         has_separator = line_index + 1 < len(lines) and _is_slice_table_separator(
             lines[line_index + 1]
         )
@@ -734,9 +733,10 @@ def parse_slice_table(body: str) -> tuple[SliceTableEntry, ...]:
             row_cells = _table_row_cells(lines[line_index])
             if row_cells is None:
                 break
-            if len(row_cells) != len(SLICE_TABLE_HEADER_CELLS) or _SLICE_TABLE_INDEX_PATTERN.match(
-                row_cells[0]
-            ) is None:
+            if (
+                len(row_cells) != len(SLICE_TABLE_HEADER_CELLS)
+                or _SLICE_TABLE_INDEX_PATTERN.match(row_cells[0]) is None
+            ):
                 entries.append(MalformedSliceRow(lines[line_index].strip()))
                 line_index += 1
                 continue
@@ -758,8 +758,7 @@ def _references_matching(
     silently closing #64.
     """
     return frozenset(
-        _issue_reference(match, repository)
-        for match in pattern.finditer(_live_text(text))
+        _issue_reference(match, repository) for match in pattern.finditer(_live_text(text))
     )
 
 
@@ -780,9 +779,7 @@ def parse_pull_request_classification(
     matches = tuple(CLASSIFICATION_LINE_PATTERN.finditer(_live_text(body)))
     if not matches:
         return ClassificationDefect("carries no `Work-Item:` or `No-Item:` line")
-    work_items = tuple(
-        match for match in matches if match.group("kind").lower() == WORK_ITEM_KIND
-    )
+    work_items = tuple(match for match in matches if match.group("kind").lower() == WORK_ITEM_KIND)
     if len(work_items) > 1:
         named = " and ".join(match.group("value").strip(" \t") for match in work_items[:2])
         return ClassificationDefect(f"names two work items, {named}; split it")
@@ -805,9 +802,7 @@ def parse_pull_request_classification(
     return NoItemClassification(NoItemKind(value.lower()))
 
 
-def declared_work_items(
-    pull_requests: tuple[PullRequest, ...], repository: str
-) -> frozenset[int]:
+def declared_work_items(pull_requests: tuple[PullRequest, ...], repository: str) -> frozenset[int]:
     """The issues of `repository` that these pull requests declare as their work item."""
     declared: set[int] = set()
     for pull_request in pull_requests:
@@ -862,9 +857,7 @@ def frozen_trigger(body: str) -> str | None:
 
 
 def landings_since(trunk_landings: tuple[datetime, ...], ruling: date) -> int:
-    start = datetime(ruling.year, ruling.month, ruling.day, tzinfo=timezone.utc) + timedelta(
-        days=1
-    )
+    start = datetime(ruling.year, ruling.month, ruling.day, tzinfo=timezone.utc) + timedelta(days=1)
     return sum(1 for moment in trunk_landings if moment >= start)
 
 
@@ -891,19 +884,13 @@ def _blocker_references(text: str | None) -> frozenset[int]:
 
 def blocker_references(issues: tuple[Issue, ...]) -> frozenset[int]:
     return frozenset(
-        blocker
-        for issue in issues
-        for blocker in parse_contract(issue.body).blocker_issues
+        blocker for issue in issues for blocker in parse_contract(issue.body).blocker_issues
     )
 
 
-def _with_blocker_defects(
-    contract: Contract, blockers: dict[int, BlockerReference]
-) -> Contract:
+def _with_blocker_defects(contract: Contract, blockers: dict[int, BlockerReference]) -> Contract:
     pull_requests = tuple(
-        blocker
-        for blocker in sorted(contract.blocker_issues)
-        if blockers[blocker].is_pull_request
+        blocker for blocker in sorted(contract.blocker_issues) if blockers[blocker].is_pull_request
     )
     if not pull_requests:
         return contract
@@ -923,10 +910,7 @@ def _open_blockers(contract: Contract, blockers: dict[int, BlockerReference]) ->
     return tuple(
         blocker
         for blocker in sorted(contract.blocker_issues)
-        if (
-            not blockers[blocker].is_pull_request
-            and blockers[blocker].state is BlockerState.OPEN
-        )
+        if (not blockers[blocker].is_pull_request and blockers[blocker].state is BlockerState.OPEN)
     )
 
 
@@ -990,9 +974,7 @@ def _single_concrete_next(value: str | None) -> bool:
 
 
 def _claim_by_issue(claims: tuple[protocol.ActiveClaim, ...]) -> dict[int, protocol.ActiveClaim]:
-    issue_claims = (
-        claim for claim in claims if isinstance(claim.identity, protocol.IssueIdentity)
-    )
+    issue_claims = (claim for claim in claims if isinstance(claim.identity, protocol.IssueIdentity))
     return {claim.identity.issue: claim for claim in issue_claims}
 
 
@@ -1020,9 +1002,7 @@ def _priority_bucket(
     return len(config.priority_labels) + 1, "unlabelled"
 
 
-def _associated_issues(
-    pull_requests: tuple[PullRequest, ...], repository: str
-) -> frozenset[int]:
+def _associated_issues(pull_requests: tuple[PullRequest, ...], repository: str) -> frozenset[int]:
     """Issues of `repository` that these pull requests close or claim to land."""
     return frozenset(
         reference.number
@@ -1101,16 +1081,11 @@ def build_board(
     observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     contracts = {issue.number: parse_contract(issue.body) for issue in issues}
     referenced_blockers = frozenset(
-        blocker
-        for contract in contracts.values()
-        for blocker in contract.blocker_issues
+        blocker for contract in contracts.values() for blocker in contract.blocker_issues
     )
     if blocker_references is None:
         blocker_references = (
-            *(
-                BlockerReference(issue.number, BlockerState.OPEN, False)
-                for issue in issues
-            ),
+            *(BlockerReference(issue.number, BlockerState.OPEN, False) for issue in issues),
             *(
                 BlockerReference(pull_request.number, BlockerState.OPEN, True)
                 for pull_request in open_pull_requests
@@ -1135,12 +1110,10 @@ def build_board(
         for issue in issues
     }
     blockers = {
-        issue.number: _open_blockers(contracts[issue.number], blocker_by_number)
-        for issue in issues
+        issue.number: _open_blockers(contracts[issue.number], blocker_by_number) for issue in issues
     }
     freed_on = {
-        issue.number: _freed_on(contracts[issue.number], blocker_by_number)
-        for issue in issues
+        issue.number: _freed_on(contracts[issue.number], blocker_by_number) for issue in issues
     }
     unblocks = {
         issue.number: sum(issue.number in other_blockers for other_blockers in blockers.values())
@@ -1221,11 +1194,7 @@ def build_board(
                 frozen_trigger=frozen,
                 open_blockers=blockers[issue.number],
                 freed_on=freed_at,
-                freed_days=(
-                    None
-                    if freed_at is None
-                    else max(0, (observed_at - freed_at).days)
-                ),
+                freed_days=(None if freed_at is None else max(0, (observed_at - freed_at).days)),
                 stage=stage,
                 age_days=age_days,
                 idle_days=idle_days,
@@ -1242,15 +1211,9 @@ def build_board(
     ordered = tuple(sorted(items, key=board_rank))
     return Board(
         items=ordered,
-        ready_now=tuple(
-            item
-            for item in ordered
-            if item.actionable
-        ),
+        ready_now=tuple(item for item in ordered if item.actionable),
         stale=tuple(
-            item
-            for item in ordered
-            if item.idle_days > 7 and item.stage is Stage.TEXT_ONLY
+            item for item in ordered if item.idle_days > 7 and item.stage is Stage.TEXT_ONLY
         ),
         recovery=tuple(
             item
@@ -1335,8 +1298,7 @@ def render(board: Board) -> str:
     stale = ", ".join(f"#{item.number}" for item in board.stale) or "none"
     recovery = ", ".join(f"#{item.number}" for item in board.recovery) or "none"
     return (
-        f"{table}\n\nREADY NOW\n{ready}\n\nSTALE\n{stale}\n\n"
-        f"RECOVERY ({RECOVERY_STEP})\n{recovery}"
+        f"{table}\n\nREADY NOW\n{ready}\n\nSTALE\n{stale}\n\nRECOVERY ({RECOVERY_STEP})\n{recovery}"
     )
 
 

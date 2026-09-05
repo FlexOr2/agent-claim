@@ -83,8 +83,7 @@ NEXT_PULL_DESCRIPTION = (
     "it waits for the operator's ruling."
 )
 ALLOW_DIRECTORY_HELP = (
-    "permit a directory without a cut, or a scope covering more than a quarter "
-    "of versioned files"
+    "permit a directory without a cut, or a scope covering more than a quarter of versioned files"
 )
 
 
@@ -190,9 +189,7 @@ def _touch_summary(touches: tuple[protocol.ActiveClaim, ...]) -> str:
     )
 
 
-def _claim_cost_line(
-    n: int, total: int, touches: tuple[protocol.ActiveClaim, ...]
-) -> str:
+def _claim_cost_line(n: int, total: int, touches: tuple[protocol.ActiveClaim, ...]) -> str:
     percent = 0 if total == 0 else round(100 * n / total)
     return f"{n} of {total} versioned files ({percent}%); {_touch_summary(touches)}"
 
@@ -398,9 +395,7 @@ def _parser() -> argparse.ArgumentParser:
 
     policy = commands.add_parser("policy", help="print the provider-neutral loader block")
     policy.add_argument("--print", action="store_true", required=True, dest="print_loader")
-    commands.add_parser(
-        "protect", help="deny PreToolUse writes without this session's live claim"
-    )
+    commands.add_parser("protect", help="deny PreToolUse writes without this session's live claim")
     return parser
 
 
@@ -456,19 +451,11 @@ def _overlap_subjects(
     ]
 
 
-def _overlap_note(
-    claims_by_id: dict[str, protocol.ActiveClaim], peer_ids: set[str]
-) -> str | None:
-    peers = [
-        claims_by_id[claim_id]
-        for claim_id in sorted(peer_ids)
-        if claim_id in claims_by_id
-    ]
+def _overlap_note(claims_by_id: dict[str, protocol.ActiveClaim], peer_ids: set[str]) -> str | None:
+    peers = [claims_by_id[claim_id] for claim_id in sorted(peer_ids) if claim_id in claims_by_id]
     if not peers:
         return None
-    return "overlaps " + ", ".join(
-        f"{_claim_subject(claim)} ({claim.claim_id})" for claim in peers
-    )
+    return "overlaps " + ", ".join(f"{_claim_subject(claim)} ({claim.claim_id})" for claim in peers)
 
 
 def _status(
@@ -556,16 +543,12 @@ def _who(claims: tuple[protocol.ActiveClaim, ...], path: str) -> int:
     if len(holders) > 1:
         print(
             "overlap: "
-            + ", ".join(
-                f"{_claim_subject(claim)} ({claim.claim_id})" for claim in holders
-            )
+            + ", ".join(f"{_claim_subject(claim)} ({claim.claim_id})" for claim in holders)
         )
     return 0
 
 
-def _who_json(
-    claims: tuple[protocol.ActiveClaim, ...], path: str, ledger: int
-) -> int:
+def _who_json(claims: tuple[protocol.ActiveClaim, ...], path: str, ledger: int) -> int:
     holders = protocol.claims_holding_path(claims, path)
     state = "UNCLAIMED" if not holders else "CLAIMED"
     payload = {
@@ -698,9 +681,7 @@ def _board(
     # after another overlaps their `gh` subprocess wait time.
     with ThreadPoolExecutor(max_workers=3) as pool:
         open_pull_requests = pool.submit(client.list_open_board_pull_requests)
-        merged_pull_requests = pool.submit(
-            client.list_recent_merged_board_pull_requests, since
-        )
+        merged_pull_requests = pool.submit(client.list_recent_merged_board_pull_requests, since)
         blocker_references = pool.submit(client.list_board_blockers, blockers)
         pull_requests = (open_pull_requests.result(), merged_pull_requests.result())
     return board.build_board(
@@ -715,12 +696,8 @@ def _board(
     )
 
 
-def _rulings(
-    projected: board.Board, issues: tuple[board.Issue, ...], *, as_json: bool
-) -> int:
-    progress_by_issue = {
-        issue.number: board.expectation_progress(issue.body) for issue in issues
-    }
+def _rulings(projected: board.Board, issues: tuple[board.Issue, ...], *, as_json: bool) -> int:
+    progress_by_issue = {issue.number: board.expectation_progress(issue.body) for issue in issues}
     items = tuple(
         sorted(
             (
@@ -767,9 +744,7 @@ def _ruling_pull_hint(item: board.BoardItem) -> str | None:
         return "Erwartungen ungeregelt, beim Ziehen zuerst refinen"
     if not item.ruling_old:
         return None
-    return (
-        f"vor {item.ruling_landings} Landungen geregelt, beim Ziehen neu refinen"
-    )
+    return f"vor {item.ruling_landings} Landungen geregelt, beim Ziehen neu refinen"
 
 
 def _next_json(
@@ -832,8 +807,7 @@ def _next(
             lines.append(hint)
     if skipped:
         skipped_lines = (
-            f"#{skipped_item.number}: {skipped_item.actionable_reason}"
-            for skipped_item in skipped
+            f"#{skipped_item.number}: {skipped_item.actionable_reason}" for skipped_item in skipped
         )
         lines.extend(("", "SKIPPED", *skipped_lines))
     print("\n".join(lines))
@@ -1007,8 +981,7 @@ def _slice_row_checks(
         return SliceCheck(
             "warning",
             "undispatched-slice",
-            f'slice {row.index} "{row.name}" is not dispatched; '
-            "make it an item before building it",
+            f'slice {row.index} "{row.name}" is not dispatched; make it an item before building it',
             slice=row.index,
         )
     return SliceCheck(
@@ -1081,14 +1054,10 @@ def _slice_rule_checks(
         checks.append(out_of_order)
     state, title, body = _issue_reference_state(client, open_by_number, issue)
     if state is ReferenceState.CLOSED:
-        checks.append(
-            SliceCheck("error", "closed-issue", f"issue #{issue} is closed", issue=issue)
-        )
+        checks.append(SliceCheck("error", "closed-issue", f"issue #{issue} is closed", issue=issue))
     elif state is ReferenceState.MISSING:
         checks.append(
-            SliceCheck(
-                "error", "missing-issue", f"issue #{issue} does not exist here", issue=issue
-            )
+            SliceCheck("error", "missing-issue", f"issue #{issue} does not exist here", issue=issue)
         )
     item = next((item for item in projected.items if item.number == issue), None)
     if item is not None:
@@ -1131,9 +1100,7 @@ def _claim_defect(
         if isinstance(identity, protocol.IssueIdentity)
         else "issue-less lane claim"
     )
-    return board.ClassificationDefect(
-        f"has no active {subject} on branch {detail.head_ref_name!r}"
-    )
+    return board.ClassificationDefect(f"has no active {subject} on branch {detail.head_ref_name!r}")
 
 
 def _no_item_defect(
@@ -1209,9 +1176,7 @@ def _closing_defect(
     """Which issues this landing must close, and that it closes nothing else."""
     closing = board.closing_references(detail.body, repository)
     if item not in closing:
-        return board.ClassificationDefect(
-            f"carries no closing reference for its work item {item}"
-        )
+        return board.ClassificationDefect(f"carries no closing reference for its work item {item}")
     completed_parent = (
         {requirement.reference}
         if requirement is not None and requirement.closing_required
@@ -1280,9 +1245,7 @@ def _checked_classification(
     return classification if defect is None else defect
 
 
-def _pull_request_check(
-    client: github.GitHubIssueComments, repository: str, number: int
-) -> int:
+def _pull_request_check(client: github.GitHubIssueComments, repository: str, number: int) -> int:
     detail = client.pull_request_detail(number)
     checked = _checked_classification(client, repository, detail)
     if isinstance(checked, board.ClassificationDefect):
@@ -1318,9 +1281,7 @@ def _verify_merged_release(
         )
     classification = board.parse_pull_request_classification(detail.body, repository)
     if isinstance(classification, board.ClassificationDefect):
-        raise protocol.ClaimUnavailable(
-            f"pull request #{detail.number} {classification.message}"
-        )
+        raise protocol.ClaimUnavailable(f"pull request #{detail.number} {classification.message}")
     if isinstance(identity, protocol.LaneIdentity):
         if isinstance(classification, board.WorkItemClassification):
             raise protocol.ClaimUnavailable(
@@ -1329,13 +1290,9 @@ def _verify_merged_release(
             )
         return
     item = board.IssueReference(repository, identity.issue)
-    if (
-        not isinstance(classification, board.WorkItemClassification)
-        or classification.item != item
-    ):
+    if not isinstance(classification, board.WorkItemClassification) or classification.item != item:
         raise protocol.ClaimUnavailable(
-            f"pull request #{detail.number} names {classification}, "
-            f"not work item #{identity.issue}"
+            f"pull request #{detail.number} names {classification}, not work item #{identity.issue}"
         )
     reference = _fetch_issue_reference(client, identity.issue)
     if reference.state is not ReferenceState.CLOSED:
@@ -1553,9 +1510,7 @@ def main(arguments: list[str] | None = None) -> int:
                 )
             if add:
                 versioned = checkout.versioned_paths()
-                _reject_uncut_directory_scope(
-                    client, identity, add, allow_directory_reason
-                )
+                _reject_uncut_directory_scope(client, identity, add, allow_directory_reason)
                 selected = protocol._select_rescope_claim(
                     protocol._ledger_claims(client),
                     identity,
@@ -1598,15 +1553,11 @@ def main(arguments: list[str] | None = None) -> int:
             target_issue: int | None = None
             if isinstance(requested.identity, protocol.IssueIdentity):
                 target_issue = requested.identity.issue
-                replayed = protocol.matching_claim_retry(
-                    protocol._ledger_claims(client), requested
-                )
+                replayed = protocol.matching_claim_retry(protocol._ledger_claims(client), requested)
                 if replayed is None:
                     open_issues = client.list_open_board_issues()
                     open_by_number = {issue.number: issue for issue in open_issues}
-                    projected = _board(
-                        client, protocol._ledger_claims(client), issues=open_issues
-                    )
+                    projected = _board(client, protocol._ledger_claims(client), issues=open_issues)
                     checks = _slice_rule_checks(
                         client,
                         repository,

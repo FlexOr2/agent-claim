@@ -123,9 +123,7 @@ def _close_process_streams(process: subprocess.Popen[bytes]) -> None:
             pass
 
 
-def _bounded_command(
-    command: list[str], *, purpose: str, input_data: bytes | None = None
-) -> str:
+def _bounded_command(command: list[str], *, purpose: str, input_data: bytes | None = None) -> str:
     try:
         process = subprocess.Popen(
             command,
@@ -266,10 +264,7 @@ class GitHubIssueComments:
                 ".[] | {id,created_at,updated_at,body,author_association,html_url}",
             ]
         )
-        return tuple(
-            self._parse_comment(value)
-            for value in self._json_lines(raw, "issue-comment")
-        )
+        return tuple(self._parse_comment(value) for value in self._json_lines(raw, "issue-comment"))
 
     def _fetch_pages(
         self, page: Callable[[int], tuple[_Page, ...]], *, per_page: int
@@ -328,8 +323,7 @@ class GitHubIssueComments:
             protocol_bytes += len(parsed.body.encode("utf-8"))
             if len(comments) >= MAX_PROTOCOL_EVENTS or protocol_bytes > MAX_PROTOCOL_BYTES:
                 raise ClaimError(
-                    "claim ledger protocol limit reached; perform the "
-                    "documented ledger rollover"
+                    "claim ledger protocol limit reached; perform the documented ledger rollover"
                 )
             comments.append(parsed)
         return tuple(comments)
@@ -342,10 +336,7 @@ class GitHubIssueComments:
                 comment
                 for comment in page_comments
                 if comment.author_association in TRUSTED_ASSOCIATIONS
-                and PROJECTION_MARKER_PATTERN.fullmatch(
-                    comment.body.partition("\n")[0]
-                )
-                is not None
+                and PROJECTION_MARKER_PATTERN.fullmatch(comment.body.partition("\n")[0]) is not None
             )
             if len(page_comments) < COMMENTS_PER_PAGE:
                 return tuple(projections)
@@ -481,9 +472,7 @@ class GitHubIssueComments:
             raise ClaimError("GitHub returned a malformed pull request")
         detail = self._pull_request_detail(values[0])
         if detail.number != number:
-            raise ClaimError(
-                f"GitHub answered for pull request #{detail.number}, not #{number}"
-            )
+            raise ClaimError(f"GitHub answered for pull request #{detail.number}, not #{number}")
         return detail
 
     def _issue_reference(self, value: object, description: str) -> board.IssueReference:
@@ -562,9 +551,7 @@ class GitHubIssueComments:
         return tuple(children)
 
     def default_branch(self) -> str:
-        branch = self._run(
-            ["api", f"repos/{self.repository}", "--jq", ".default_branch"]
-        )
+        branch = self._run(["api", f"repos/{self.repository}", "--jq", ".default_branch"])
         if protocol.BRANCH_PATTERN.fullmatch(branch) is None:
             raise ClaimError("GitHub returned a malformed default branch")
         return branch
@@ -582,7 +569,7 @@ class GitHubIssueComments:
                     # still correctly signals "no more pages" even when some of
                     # its items are pull requests, filtered out below instead.
                     '.[] | {number,title,labels:(.labels | map(.name)),body:(.body // ""),'
-                    'createdAt:.created_at,updatedAt:.updated_at,'
+                    "createdAt:.created_at,updatedAt:.updated_at,"
                     'isPullRequest:has("pull_request")}'
                 ),
             ]
@@ -628,10 +615,7 @@ class GitHubIssueComments:
             or blocker_state is None
             or not isinstance(is_pull_request, bool)
             or (closed_at is not None and not isinstance(closed_at, str))
-            or (
-                isinstance(closed_at, str)
-                and TIMESTAMP_PATTERN.fullmatch(closed_at) is None
-            )
+            or (isinstance(closed_at, str) and TIMESTAMP_PATTERN.fullmatch(closed_at) is None)
             or (blocker_state is board.BlockerState.CLOSED and closed_at is None)
         ):
             raise ClaimError(self.MALFORMED_BOARD_BLOCKER)
@@ -651,14 +635,10 @@ class GitHubIssueComments:
             parsed_closed_at,
         )
 
-    def list_board_blockers(
-        self, numbers: frozenset[int]
-    ) -> tuple[board.BlockerReference, ...]:
+    def list_board_blockers(self, numbers: frozenset[int]) -> tuple[board.BlockerReference, ...]:
         if not numbers:
             return ()
-        with ThreadPoolExecutor(
-            max_workers=min(len(numbers), PARALLEL_FETCH_CONCURRENCY)
-        ) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(numbers), PARALLEL_FETCH_CONCURRENCY)) as pool:
             return tuple(pool.map(self._board_blocker, sorted(numbers)))
 
     def list_open_board_pull_requests(self) -> tuple[board.PullRequest, ...]:
@@ -752,7 +732,7 @@ class GitHubIssueComments:
                 "--paginate",
                 f"repos/{self.repository}/issues?state=all&labels={claim_label()}&per_page=100",
                 "--jq",
-                ".[] | select(has(\"pull_request\") | not) | .number",
+                '.[] | select(has("pull_request") | not) | .number',
             ]
         )
         issues: list[int] = []
@@ -832,9 +812,7 @@ class GitHubIssueComments:
             projections = adoptable_projections
         if not projections:
             if has_newer_projection:
-                raise ClaimError(
-                    "owning issue has a projection from a newer ledger generation"
-                )
+                raise ClaimError("owning issue has a projection from a newer ledger generation")
             if not create:
                 return False
             self.post_comment(issue, validated)
@@ -877,6 +855,4 @@ class GitHubIssueComments:
         self._run(["issue", "edit", str(issue), "--repo", self.repository, "--add-label", label])
 
     def remove_label(self, issue: int, label: str) -> None:
-        self._run(
-            ["issue", "edit", str(issue), "--repo", self.repository, "--remove-label", label]
-        )
+        self._run(["issue", "edit", str(issue), "--repo", self.repository, "--remove-label", label])

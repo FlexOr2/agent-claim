@@ -195,8 +195,7 @@ class LedgerSuperseded(ClaimError):
         self.successor_issue = successor_issue
         self.claim = claim
         super().__init__(
-            f"claim ledger #{LEDGER_ISSUE} is frozen; update and use "
-            f"successor #{successor_issue}"
+            f"claim ledger #{LEDGER_ISSUE} is frozen; update and use successor #{successor_issue}"
         )
 
 
@@ -278,9 +277,7 @@ def _projection_ledger(comment: IssueComment) -> int | None:
     return int(match["ledger"]) if match is not None else None
 
 
-def _required_text(
-    payload: dict[str, object], key: str, *, maximum: int = 512
-) -> str:
+def _required_text(payload: dict[str, object], key: str, *, maximum: int = 512) -> str:
     value = payload.get(key)
     if not isinstance(value, str):
         raise InvalidClaimMarker(f"claim marker field {key!r} must be text")
@@ -291,9 +288,7 @@ def _required_text(
         or len(normalized) > maximum
         or any(ord(character) < 32 or ord(character) == 127 for character in normalized)
     ):
-        raise InvalidClaimMarker(
-            f"claim marker field {key!r} must be one bounded non-empty line"
-        )
+        raise InvalidClaimMarker(f"claim marker field {key!r} must be one bounded non-empty line")
     return normalized
 
 
@@ -378,9 +373,7 @@ def _valid_branch(payload: dict[str, object]) -> str:
         or "//" in branch
         or "@{" in branch
         or any(
-            not segment
-            or segment.startswith(".")
-            or segment.endswith((".", ".lock"))
+            not segment or segment.startswith(".") or segment.endswith((".", ".lock"))
             for segment in segments
         )
     ):
@@ -412,9 +405,7 @@ def _scope_list_entries(scope: object) -> list[str]:
             raise InvalidClaimMarker(SCOPE_ENTRIES_MUST_BE_CANONICAL)
         expanded.extend(pieces)
     if len(expanded) > MAX_SCOPE_ENTRIES:
-        raise InvalidClaimMarker(
-            f"claim marker scope exceeds {MAX_SCOPE_ENTRIES} entries"
-        )
+        raise InvalidClaimMarker(f"claim marker scope exceeds {MAX_SCOPE_ENTRIES} entries")
     return expanded
 
 
@@ -485,26 +476,18 @@ def _marker_payload(comment: IssueComment) -> tuple[dict[str, object], bool] | N
             f"trusted protocol comment {comment.url} was edited after publication"
         )
     if not first_line.endswith(MARKER_SUFFIX):
-        raise InvalidClaimMarker(
-            f"trusted comment {comment.url} has an unterminated claim marker"
-        )
+        raise InvalidClaimMarker(f"trusted comment {comment.url} has an unterminated claim marker")
     encoded = first_line[len(prefix) : -len(MARKER_SUFFIX)]
     try:
         payload = json.loads(encoded)
     except json.JSONDecodeError as error:
-        raise InvalidClaimMarker(
-            f"trusted comment {comment.url} has invalid claim JSON"
-        ) from error
+        raise InvalidClaimMarker(f"trusted comment {comment.url} has invalid claim JSON") from error
     if not isinstance(payload, dict):
-        raise InvalidClaimMarker(
-            f"trusted comment {comment.url} claim payload must be an object"
-        )
+        raise InvalidClaimMarker(f"trusted comment {comment.url} claim payload must be an object")
     return payload, legacy
 
 
-def _event_identity(
-    payload: dict[str, object], comment: IssueComment
-) -> tuple[str, str, str]:
+def _event_identity(payload: dict[str, object], comment: IssueComment) -> tuple[str, str, str]:
     claim_id = _required_text(payload, "claim_id", maximum=128)
     agent = _required_text(payload, "agent", maximum=128)
     role = _required_text(payload, "role", maximum=64)
@@ -542,9 +525,7 @@ def _parse_active_claim(
     if not legacy:
         expected.add(_identity_marker_key(identity))
     if "resource_value" in payload and "resource" not in payload:
-        raise InvalidClaimMarker(
-            f"trusted comment {comment.url} resource_value requires resource"
-        )
+        raise InvalidClaimMarker(f"trusted comment {comment.url} resource_value requires resource")
     if "resource" in payload:
         expected.add("resource")
         if "resource_value" in payload:
@@ -560,9 +541,7 @@ def _parse_active_claim(
     resource = None
     if "resource" in payload:
         requested_resource = _required_text(payload, "resource", maximum=64)
-        _valid_resource_name(
-            requested_resource, field=f"trusted comment {comment.url} resource"
-        )
+        _valid_resource_name(requested_resource, field=f"trusted comment {comment.url} resource")
         if "resource_value" in payload:
             resource = _required_resource_hold(payload, comment)
     return ActiveClaim(
@@ -717,9 +696,7 @@ def parse_claim_event(comment: IssueComment) -> ClaimEvent | None:
     payload, legacy = parsed_marker
     action = _required_text(payload, "action", maximum=32)
     if action not in {"claim", "release", "override_release", "rescope", "supersede"}:
-        raise InvalidClaimMarker(
-            f"trusted comment {comment.url} has unknown action {action!r}"
-        )
+        raise InvalidClaimMarker(f"trusted comment {comment.url} has unknown action {action!r}")
 
     if legacy:
         if action not in {"claim", "release"}:
@@ -775,13 +752,9 @@ def _apply_terminal_event(
             return False
         raise LedgerSuperseded(event.successor_issue, claimed)
     if claimed is None:
-        raise InvalidClaimMarker(
-            f"claim id {event.claim_id!r} was released before it was acquired"
-        )
+        raise InvalidClaimMarker(f"claim id {event.claim_id!r} was released before it was acquired")
     if claimed.identity != event.identity:
-        raise InvalidClaimMarker(
-            f"claim id {event.claim_id!r} release targets the wrong claim"
-        )
+        raise InvalidClaimMarker(f"claim id {event.claim_id!r} release targets the wrong claim")
     if isinstance(event, ClaimantRelease):
         if (claimed.agent, claimed.role) != (event.agent, event.role):
             raise InvalidClaimMarker(
@@ -912,11 +885,7 @@ def _apply_derived_resource_holds(
     )
     for name in names:
         intents = sorted(
-            (
-                event
-                for event in first_occurrences
-                if event.requested_resource == name
-            ),
+            (event for event in first_occurrences if event.requested_resource == name),
             key=lambda event: (event.comment.created_at, event.comment.identifier),
         )
         occupied: set[int] = set()
@@ -1006,9 +975,7 @@ def claims_overlap(left: ActiveClaim | ClaimRequest, right: ActiveClaim | ClaimR
     return _scopes_overlap(left.scope, right.scope)
 
 
-def claims_holding_path(
-    claims: tuple[ActiveClaim, ...], path: str
-) -> tuple[ActiveClaim, ...]:
+def claims_holding_path(claims: tuple[ActiveClaim, ...], path: str) -> tuple[ActiveClaim, ...]:
     target = _valid_scope([path])
     if len(target) != 1:
         raise ClaimError("who requires a single repository-relative path")
@@ -1129,9 +1096,7 @@ def _claim_conflict_index(claims: tuple[ActiveClaim, ...]) -> ClaimConflictIndex
     )
 
 
-def _related_claim_ids(
-    index: ClaimConflictIndex, selected: tuple[ActiveClaim, ...]
-) -> set[str]:
+def _related_claim_ids(index: ClaimConflictIndex, selected: tuple[ActiveClaim, ...]) -> set[str]:
     related = {claim.claim_id for claim in selected}
     for claim in selected:
         related.update(index.claims_by_identity[_identity_key(claim)])
@@ -1160,9 +1125,7 @@ def _validated_comment(body: str) -> str:
         raise ClaimError("GitHub comment body contains a NUL byte")
     size = len(body.encode("utf-8"))
     if size > MAX_COMMENT_BYTES:
-        raise ClaimError(
-            f"GitHub comment body exceeds the {MAX_COMMENT_BYTES}-byte safety limit"
-        )
+        raise ClaimError(f"GitHub comment body exceeds the {MAX_COMMENT_BYTES}-byte safety limit")
     return body
 
 
@@ -1361,16 +1324,10 @@ def _active_projection(claim: ActiveClaim) -> str:
     )
 
 
-def _unclaimed_projection(
-    ledger_url: str | None = None, reason: str | None = None
-) -> str:
+def _unclaimed_projection(ledger_url: str | None = None, reason: str | None = None) -> str:
     detail = f" · {reason}" if reason else ""
     ledger = f"[Ledger]({ledger_url})" if ledger_url else f"Ledger: #{LEDGER_ISSUE}"
-    return _validated_comment(
-        f"{_projection_marker()}\n"
-        f"🔓 **Unclaimed**{detail}\n\n"
-        f"{ledger}"
-    )
+    return _validated_comment(f"{_projection_marker()}\n🔓 **Unclaimed**{detail}\n\n{ledger}")
 
 
 def _ledger_claims(client: IssueComments) -> tuple[ActiveClaim, ...]:
@@ -1441,9 +1398,7 @@ def reconcile_issue_label(
         except LedgerSuperseded:
             client.remove_label(issue, claim_label())
             raise
-        if (observed.claim_id if observed else None) == (
-            expected.claim_id if expected else None
-        ):
+        if (observed.claim_id if observed else None) == (expected.claim_id if expected else None):
             return
     raise ClaimError(f"issue #{issue} claim label changed repeatedly during reconciliation")
 
@@ -1542,9 +1497,7 @@ def repair_duplicate_claims(client: IssueComments) -> tuple[DuplicateClaimRepair
         repairs.append(
             DuplicateClaimRepair(
                 claim_id=claim_id,
-                superseded_comment_ids=tuple(
-                    entry.identifier for entry in superseded_comments
-                ),
+                superseded_comment_ids=tuple(entry.identifier for entry in superseded_comments),
                 survivor_comment_id=survivor.comment.identifier,
             )
         )
@@ -1709,9 +1662,7 @@ def _acquire_claim_with_observed(
                     f"{holder.agent} ({holder.role}) on "
                     f"{_identity_summary(holder.identity, holder.branch)}"
                 )
-            raise ClaimUnavailable(
-                f"{expected.name} {expected.value} is held by another claim"
-            )
+            raise ClaimUnavailable(f"{expected.name} {expected.value} is held by another claim")
     elif request.resource is not None:
         hold = own.resource
         if hold is None or hold.name != request.resource:
@@ -1736,9 +1687,7 @@ def _combined_scope(
     current_set = set(current)
     missing = next((path for path in drop if path not in current_set), None)
     if missing is not None:
-        raise ClaimUnavailable(
-            f"cannot drop {missing!r}; it is not in this claim's scope"
-        )
+        raise ClaimUnavailable(f"cannot drop {missing!r}; it is not in this claim's scope")
     drop_set = set(drop)
     kept = tuple(path for path in current if path not in drop_set)
     added = tuple(path for path in add if path not in kept)
@@ -1764,9 +1713,7 @@ def _observe_rescoped_claim(
     observed = aggregate.active
     own = next((claim for claim in observed if claim.claim_id == selected.claim_id), None)
     if own is None:
-        raise ClaimError(
-            f"{_identity_summary(identity, selected.branch)} did not expose {expose}"
-        )
+        raise ClaimError(f"{_identity_summary(identity, selected.branch)} did not expose {expose}")
     if own.scope != expected_scope:
         raise ClaimError(
             f"{_identity_summary(identity, selected.branch)} did not observe {observe}"
@@ -1790,13 +1737,10 @@ def _select_rescope_claim(
     if claim_id is None:
         if not branch:
             raise ClaimUnavailable(
-                "rescope without --claim-id requires a non-empty current branch; "
-                "pass --claim-id"
+                "rescope without --claim-id requires a non-empty current branch; pass --claim-id"
             )
         matches = tuple(
-            claim
-            for claim in standing
-            if claim.agent == agent and claim.branch == branch
+            claim for claim in standing if claim.agent == agent and claim.branch == branch
         )
         if len(matches) != 1:
             raise ClaimUnavailable(
@@ -1811,8 +1755,7 @@ def _select_rescope_claim(
         )
         if selected is None:
             raise ClaimUnavailable(
-                f"{_identity_summary(identity, branch or '')} has no active claim "
-                f"{claim_id!r}"
+                f"{_identity_summary(identity, branch or '')} has no active claim {claim_id!r}"
             )
     if agent != selected.agent:
         raise ClaimUnavailable("only the original claimant may rescope")
@@ -1839,9 +1782,7 @@ def rescope_claim(
     add_scope = _valid_scope(list(add)) if add else ()
     drop_scope = _valid_scope(list(drop)) if drop else ()
     observed = _ledger_claims(client)
-    selected = _select_rescope_claim(
-        observed, identity, agent, claim_id, branch=branch
-    )
+    selected = _select_rescope_claim(observed, identity, agent, claim_id, branch=branch)
     new_scope = _combined_scope(selected.scope, add_scope, drop_scope)
     client.post_comment(
         LEDGER_ISSUE,
@@ -1885,8 +1826,7 @@ def _claims_for_identity(
         return tuple(
             claim
             for claim in claims
-            if isinstance(claim.identity, IssueIdentity)
-            and claim.identity.issue == identity.issue
+            if isinstance(claim.identity, IssueIdentity) and claim.identity.issue == identity.issue
         )
     if not branch:
         raise ClaimUnavailable(
@@ -1921,13 +1861,10 @@ def release_claim(
     if claim_id is None:
         if not branch:
             raise ClaimUnavailable(
-                "release without --claim-id requires a non-empty current branch; "
-                "pass --claim-id"
+                "release without --claim-id requires a non-empty current branch; pass --claim-id"
             )
         matches = tuple(
-            claim
-            for claim in standing
-            if claim.agent == agent and claim.branch == branch
+            claim for claim in standing if claim.agent == agent and claim.branch == branch
         )
         if len(matches) != 1:
             raise ClaimUnavailable(
@@ -1942,8 +1879,7 @@ def release_claim(
         )
         if selected is None:
             raise ClaimUnavailable(
-                f"{_identity_summary(identity, branch or '')} has no active claim "
-                f"{claim_id!r}"
+                f"{_identity_summary(identity, branch or '')} has no active claim {claim_id!r}"
             )
     if role is None:
         role = selected.role

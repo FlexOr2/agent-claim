@@ -86,9 +86,7 @@ def versioned_paths() -> tuple[str, ...]:
             or "unknown git failure"
         )
         raise ClaimError(detail)
-    return tuple(
-        dict.fromkeys(path for path in result.stdout.decode().split("\0") if path)
-    )
+    return tuple(dict.fromkeys(path for path in result.stdout.decode().split("\0") if path))
 
 
 def paths_under_scope(paths: tuple[str, ...], scope: tuple[str, ...]) -> tuple[str, ...]:
@@ -139,9 +137,7 @@ def _validate_worktree_branch(branch: str) -> None:
     git_directory = Path(_git_output(["rev-parse", "--git-dir"])).resolve()
     common_directory = Path(_git_output(["rev-parse", "--git-common-dir"])).resolve()
     if current != branch:
-        raise ClaimError(
-            f"claim branch {branch!r} does not match checkout branch {current!r}"
-        )
+        raise ClaimError(f"claim branch {branch!r} does not match checkout branch {current!r}")
     if git_directory == common_directory:
         raise ClaimError("build claims require a linked isolated worktree checkout")
 
@@ -149,9 +145,7 @@ def _validate_worktree_branch(branch: str) -> None:
 def _validate_checkout(request: ClaimRequest) -> None:
     head = _git_output(["rev-parse", "HEAD"])
     if head != request.base:
-        raise ClaimError(
-            f"claim base {request.base} does not match checkout HEAD {head}"
-        )
+        raise ClaimError(f"claim base {request.base} does not match checkout HEAD {head}")
     _validate_worktree_branch(request.branch)
     dirty = _git_output(["status", "--porcelain"])
     if dirty:
