@@ -1,9 +1,14 @@
 # 0001 — Claim state without a ledger issue
 
-Status: accepted as direction, not yet implementable. Every criterion in §4 must be
-satisfied by the first slice's plan review before that slice is dispatched.
+Status: accepted as direction, not yet implementable. Each §4 criterion is gated by the §5
+step that resolves it: the state-ref cut (step 5) resolves criteria 1–6 and 10 (criterion 8
+is already tied there to fencing v0.9 clients); port extraction (step 3) resolves criterion 9,
+the complete Landing candidate (already tied there); and criterion 7, the GitLab
+state-transport preflight, must be re-run before the first GitLab adapter. No slice may be
+dispatched before its gating step's criteria are satisfied.
 
-Date: 05.09.2026. Baseline: `origin/main` = `eb384b1`, tag `v0.9.0`.
+Date: 05.09.2026. Baseline: `origin/main` = `2bcf3f3` (v0.9.0 plus the #109/#110 Sonar
+cleanup, which changed no contract), tag `v0.9.0`.
 
 Source: a two-round architecture concept and two independent counter-checks, both
 returning REBUILD. This record harvests them. Where a counter-check contradicts the
@@ -123,9 +128,9 @@ plan review must satisfy. The direction in §2 is ruled; these are not.
    the state cut needs a tombstone the *old* client reads and refuses on.
 9. **A complete `Landing` candidate.** The proposed
    `Landing(number, merged_at, work_item, head_branch, merge_commit)` cannot carry #108's
-   `pr-check` and merged-release verification contract, which also reads PR body and
-   classification, target and default branch, source repository, closing references, and the
-   no-item case. The port must preserve that contract before anything is rewired to it.
+   `pr-check` and merged-release verification contract, which also reads an author, PR body
+   and classification, target and default branch, source repository, closing references, and
+   the no-item case. The port must preserve that contract before anything is rewired to it.
 10. **The typed-model gaps.** A collision-free reversible codec for `LaneKey.branch` as a
     file name; a claim transition carrying a resource *intent* rather than a preallocated
     allocation, with one allocation owner instead of the hold appearing in both the claim and
@@ -133,8 +138,16 @@ plan review must satisfy. The direction in §2 is ruled; these are not.
     preserve today's `(agent, role)` authorization; a runtime-validating OID type (`NewType`
     validates nothing); immutable collections inside the frozen state; item created/updated
     timestamps the board needs; a body-update operation the migration needs; a
-    provider-neutral kind mapping — `idea_label` is still a competing owner of kind; and
-    `RuledExpectation.default` with a typed `yes | no | later`.
+    provider-neutral kind mapping — `idea_label` is still a competing owner of kind;
+    `RuledExpectation.default` with a typed `yes | no | later`; and a typed failure for a
+    malformed or unsupported state-tree schema, distinct from a stale rejection and from
+    ambiguous push completion.
+11. **GitHub custom-ref probe re-run.** §6 marks GitHub's acceptance of pushes to
+    `refs/agent-claim/*` as reported live but unverified — both counter-checks lost network
+    access before they could reproduce it. Required, before the port-extraction/state-ref
+    slice is dispatched: a live re-run of the custom-ref push/fetch/CAS probe against GitHub —
+    create-if-absent, fast-forward update, non-fast-forward rejection, concurrent rejection,
+    and delete.
 
 Removed until a caller exists: chain-length reporting, a public `capabilities()` if only
 adapters consume it, nonzero gate freshness, and the receipt unless phone visibility is
