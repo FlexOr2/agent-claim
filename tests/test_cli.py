@@ -11241,6 +11241,7 @@ def test_no_path_class_list_is_read_or_written() -> None:
 
 WORK_ITEM_ISSUE = 72
 LANDING_BRANCH = f"codex/issue-{WORK_ITEM_ISSUE}-claims"
+DOCUMENTATION_LANE_BRANCH = "docs/tidy-readme"
 
 
 def landing_pull_request(
@@ -11249,10 +11250,19 @@ def landing_pull_request(
     number: int = 12,
     base_ref_name: str = "main",
     head_ref_name: str = LANDING_BRANCH,
+    head_repository: str = REPOSITORY,
     author: str = "ada",
     merged: bool = False,
 ) -> board.PullRequestDetail:
-    return board.PullRequestDetail(number, body, base_ref_name, head_ref_name, author, merged)
+    return board.PullRequestDetail(
+        number, body, base_ref_name, head_ref_name, head_repository, author, merged
+    )
+
+
+def documentation_lane_claim(
+    claim_id: str = "tidy", branch: str = DOCUMENTATION_LANE_BRANCH
+) -> ClaimRequest:
+    return request(claim_id, lane=True, branch=branch, scope=("README.md",))
 
 
 def pr_check_client(
@@ -11311,10 +11321,95 @@ def test_pr_check_reads_the_same_work_item_from_shorthand_and_qualified_lines(
 def test_pr_check_accepts_an_issueless_documentation_pull_request(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    pr_check_client(monkeypatch, landing_pull_request(body="No-Item: docs\n\nTidy the README."))
+    pr_check_client(
+        monkeypatch,
+        landing_pull_request(
+            body="No-Item: docs\n\nTidy the README.",
+            head_ref_name=DOCUMENTATION_LANE_BRANCH,
+        ),
+        standing=(documentation_lane_claim(),),
+    )
 
     assert run_pr_check() == 0
     assert capsys.readouterr().out == "PR #12 by ada declares No-Item: docs\n"
+
+
+@pytest.mark.parametrize(
+    ("standing", "reason"),
+    [
+        pytest.param(
+            (documentation_lane_claim(branch="docs/another-lane"),),
+            f"has no active issue-less lane claim on branch {DOCUMENTATION_LANE_BRANCH!r}",
+            id="lane-claim-on-another-branch",
+        ),
+        pytest.param(
+            (
+                request(
+                    "item-lane",
+                    issue=WORK_ITEM_ISSUE,
+                    branch=DOCUMENTATION_LANE_BRANCH,
+                    scope=("README.md",),
+                ),
+            ),
+            f"has no active issue-less lane claim on branch {DOCUMENTATION_LANE_BRANCH!r}",
+            id="issue-claim-on-the-head-branch",
+        ),
+    ],
+)
+def test_pr_check_refuses_an_issueless_pull_request_without_its_lane_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    standing: tuple[ClaimRequest, ...],
+    reason: str,
+) -> None:
+    pr_check_client(
+        monkeypatch,
+        landing_pull_request(
+            body="No-Item: docs\n\nTidy the README.",
+            head_ref_name=DOCUMENTATION_LANE_BRANCH,
+        ),
+        standing=standing,
+    )
+
+    assert run_pr_check() == 1
+    assert capsys.readouterr().err == f"REFUSED: pull request #12 {reason}\n"
+
+
+def test_pr_check_refuses_an_issueless_pull_request_that_closes_an_item(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pr_check_client(
+        monkeypatch,
+        landing_pull_request(
+            body=f"No-Item: fix\n\nCloses #{WORK_ITEM_ISSUE}",
+            head_ref_name=DOCUMENTATION_LANE_BRANCH,
+        ),
+        standing=(documentation_lane_claim(),),
+    )
+
+    assert run_pr_check() == 1
+    assert capsys.readouterr().err == (
+        f"REFUSED: pull request #12 declares no work item but closes "
+        f"{REPOSITORY}#{WORK_ITEM_ISSUE}; name it as the work item\n"
+    )
+
+
+def test_pr_check_refuses_a_pull_request_proposing_another_repositorys_branch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pr_check_client(
+        monkeypatch,
+        landing_pull_request(
+            body=f"Work-Item: #{WORK_ITEM_ISSUE}\n\nCloses #{WORK_ITEM_ISSUE}",
+            head_repository="fork/agent-claim",
+        ),
+    )
+
+    assert run_pr_check() == 1
+    assert capsys.readouterr().err == (
+        "REFUSED: pull request #12 proposes a branch of fork/agent-claim; "
+        "cross-repository pull requests are not classified\n"
+    )
 
 
 @pytest.mark.parametrize(
@@ -11426,6 +11521,43 @@ def test_pr_check_reads_a_fenced_classification_line_as_documentation(
     )
 
 
+def api_pull_request(**overrides: object) -> dict[str, object]:
+    owner, _, name = REPOSITORY.partition("/")
+    payload: dict[str, object] = {
+        "number": 12,
+        "body": "Work-Item: #72",
+        "baseRefName": "main",
+        "headRefName": LANDING_BRANCH,
+        "headRepository": {"name": name},
+        "headRepositoryOwner": {"login": owner},
+        "author": {"login": "ada"},
+        "mergedAt": "2026-09-05T10:00:00Z",
+    }
+    return payload | overrides
+
+
+@pytest.mark.parametrize(
+    ("body", "closed"),
+    [
+        pytest.param("Closes #72", (72,), id="keyword-space-reference"),
+        pytest.param("Fixes: #72", (72,), id="colon-then-space"),
+        pytest.param("resolved  #72.", (72,), id="sentence-punctuation-ends-it"),
+        pytest.param(f"Closes {REPOSITORY}#72, then rest", (72,), id="qualified-reference"),
+        pytest.param("Closes#72", (), id="no-space-after-the-keyword"),
+        pytest.param("Closes:#72", (), id="colon-without-space"),
+        pytest.param("Closes\n#72", (), id="reference-on-the-next-line"),
+        pytest.param("Closes #72suffix", (), id="reference-runs-into-a-word"),
+        pytest.param("Lands #72", (), id="keyword-github-never-closes-on"),
+    ],
+)
+def test_a_closing_reference_follows_githubs_own_syntax(
+    body: str, closed: tuple[int, ...]
+) -> None:
+    assert board.closing_references(body, REPOSITORY) == frozenset(
+        board.IssueReference(REPOSITORY, number) for number in closed
+    )
+
+
 def test_github_adapter_reads_a_pull_request_and_the_default_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -11433,58 +11565,63 @@ def test_github_adapter_reads_a_pull_request_and_the_default_branch(
 
     def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
         if arguments[:2] == ["pr", "view"]:
-            return json.dumps(
-                {
-                    "number": 12,
-                    "body": "Work-Item: #72",
-                    "baseRefName": "main",
-                    "headRefName": "codex/issue-72-claims",
-                    "author": {"login": "ada"},
-                    "mergedAt": "2026-09-05T10:00:00Z",
-                }
-            )
+            return json.dumps(api_pull_request())
         return "main"
 
     monkeypatch.setattr(client, "_run", run)
 
     assert client.pull_request_detail(12) == board.PullRequestDetail(
-        12, "Work-Item: #72", "main", "codex/issue-72-claims", "ada", True
+        12, "Work-Item: #72", "main", LANDING_BRANCH, REPOSITORY, "ada", True
     )
     assert client.default_branch() == "main"
 
 
-@pytest.mark.parametrize(
-    ("payload", "branch"),
-    [
-        pytest.param({"number": 12, "body": "b"}, "main", id="missing-refs"),
-        pytest.param(
-            {
-                "number": 12,
-                "body": "b",
-                "baseRefName": "main",
-                "headRefName": "work",
-                "author": {},
-                "mergedAt": None,
-            },
-            "main",
-            id="author-without-login",
+def test_github_adapter_reads_a_fork_branch_as_its_own_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GitHubIssueComments(REPOSITORY)
+    monkeypatch.setattr(
+        client,
+        "_run",
+        lambda arguments, input_data=None: json.dumps(
+            api_pull_request(
+                headRepository={"name": "agent-claim"},
+                headRepositoryOwner={"login": "fork"},
+            )
         ),
+    )
+
+    assert client.pull_request_detail(12).head_repository == "fork/agent-claim"
+
+
+def test_github_adapter_fails_loud_when_github_answers_for_another_pull_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GitHubIssueComments(REPOSITORY)
+    monkeypatch.setattr(
+        client,
+        "_run",
+        lambda arguments, input_data=None: json.dumps(api_pull_request(number=13)),
+    )
+
+    with pytest.raises(ClaimError, match="answered for pull request #13, not #12"):
+        client.pull_request_detail(12)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"number": 12, "body": "b"}, id="missing-refs"),
+        pytest.param(api_pull_request(author={}), id="author-without-login"),
+        pytest.param(api_pull_request(mergedAt="yesterday"), id="malformed-merge-time"),
+        pytest.param(api_pull_request(headRepository={}), id="head-repository-without-name"),
         pytest.param(
-            {
-                "number": 12,
-                "body": "b",
-                "baseRefName": "main",
-                "headRefName": "work",
-                "author": {"login": "ada"},
-                "mergedAt": "yesterday",
-            },
-            "main",
-            id="malformed-merge-time",
+            api_pull_request(headRepositoryOwner=None), id="head-repository-without-owner"
         ),
     ],
 )
 def test_github_adapter_fails_loud_on_a_malformed_pull_request(
-    monkeypatch: pytest.MonkeyPatch, payload: dict[str, object], branch: str
+    monkeypatch: pytest.MonkeyPatch, payload: dict[str, object]
 ) -> None:
     client = GitHubIssueComments(REPOSITORY)
     monkeypatch.setattr(
@@ -11803,20 +11940,39 @@ def test_pr_check_refuses_a_parent_recorded_in_another_repository(
     )
 
 
+API_REPOSITORY_URL = f"https://api.github.com/repos/{REPOSITORY}"
+
+
+def api_sub_issue(number: int, state: str) -> dict[str, object]:
+    return {"number": number, "repository": API_REPOSITORY_URL, "state": state}
+
+
+def sub_issue_client(
+    monkeypatch: pytest.MonkeyPatch, *children: dict[str, object]
+) -> GitHubIssueComments:
+    client = GitHubIssueComments(REPOSITORY)
+    monkeypatch.setattr(
+        client,
+        "_run",
+        lambda arguments, input_data=None: "\n".join(
+            json.dumps(child) for child in children
+        ),
+    )
+    return client
+
+
 def test_github_adapter_reads_a_recorded_parent_and_its_open_children(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = GitHubIssueComments(REPOSITORY)
-    repository_url = f"https://api.github.com/repos/{REPOSITORY}"
 
     def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
         if arguments[1].endswith("/parent"):
             return json.dumps(
-                {"number": 79, "repository": repository_url, "body": "## Next\nCut."}
+                {"number": 79, "repository": API_REPOSITORY_URL, "body": "## Next\nCut."}
             )
         return "\n".join(
-            json.dumps({"number": number, "repository": repository_url})
-            for number in (72, 73)
+            json.dumps(api_sub_issue(number, "open")) for number in (72, 73)
         )
 
     monkeypatch.setattr(client, "_run", run)
@@ -11828,6 +11984,32 @@ def test_github_adapter_reads_a_recorded_parent_and_its_open_children(
         board.IssueReference(REPOSITORY, 72),
         board.IssueReference(REPOSITORY, 73),
     )
+
+
+def test_github_adapter_leaves_a_parents_closed_children_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = sub_issue_client(
+        monkeypatch, api_sub_issue(72, "closed"), api_sub_issue(73, "open")
+    )
+
+    assert client.open_sub_issues(79) == (board.IssueReference(REPOSITORY, 73),)
+
+
+@pytest.mark.parametrize(
+    "child",
+    [
+        pytest.param({"number": 72, "repository": API_REPOSITORY_URL}, id="state-missing"),
+        pytest.param(api_sub_issue(72, "archived"), id="state-unknown"),
+    ],
+)
+def test_github_adapter_fails_loud_on_a_sub_issue_state_it_cannot_read(
+    monkeypatch: pytest.MonkeyPatch, child: dict[str, object]
+) -> None:
+    client = sub_issue_client(monkeypatch, child)
+
+    with pytest.raises(ClaimError, match="malformed sub-issue"):
+        client.open_sub_issues(79)
 
 
 def test_github_adapter_reads_an_issue_without_a_parent_as_parentless(

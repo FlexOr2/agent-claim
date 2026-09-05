@@ -1123,18 +1123,45 @@ def _refuse_claim(json_mode: bool, issue: int | None, checks: tuple[SliceCheck, 
 def _claim_defect(
     client: github.GitHubIssueComments,
     detail: board.PullRequestDetail,
-    item: board.IssueReference,
+    identity: protocol.ClaimIdentity,
 ) -> board.ClassificationDefect | None:
+    """A landing declares only what its own head branch holds a live claim on."""
     if any(
-        isinstance(claim.identity, protocol.IssueIdentity)
-        and claim.identity.issue == item.number
-        and claim.branch == detail.head_ref_name
+        claim.identity == identity and claim.branch == detail.head_ref_name
         for claim in protocol._ledger_claims(client)
     ):
         return None
-    return board.ClassificationDefect(
-        f"has no active claim for #{item.number} on branch {detail.head_ref_name!r}"
+    subject = (
+        f"claim for #{identity.issue}"
+        if isinstance(identity, protocol.IssueIdentity)
+        else "issue-less lane claim"
     )
+    return board.ClassificationDefect(
+        f"has no active {subject} on branch {detail.head_ref_name!r}"
+    )
+
+
+def _no_item_defect(
+    client: github.GitHubIssueComments,
+    repository: str,
+    detail: board.PullRequestDetail,
+) -> board.ClassificationDefect | None:
+    """Why this repository does not accept an issue-less landing as declared.
+
+    A `No-Item` lane owns no issue, so it needs its own lane claim and may
+    retire nothing: a closing reference here would close an item no claim and
+    no `Work-Item:` line ever named.
+    """
+    claim_defect = _claim_defect(client, detail, protocol.LaneIdentity())
+    if claim_defect is not None:
+        return claim_defect
+    closing = board.closing_references(detail.body, repository)
+    if closing:
+        named = ", ".join(str(reference) for reference in sorted(closing, key=str))
+        return board.ClassificationDefect(
+            f"declares no work item but closes {named}; name it as the work item"
+        )
+    return None
 
 
 @dataclass(frozen=True)
@@ -1225,7 +1252,7 @@ def _work_item_defect(
         return board.ClassificationDefect(
             f"names the claim ledger #{protocol.LEDGER_ISSUE} as its work item"
         )
-    claim_defect = _claim_defect(client, detail, item)
+    claim_defect = _claim_defect(client, detail, protocol.IssueIdentity(item.number))
     if claim_defect is not None:
         return claim_defect
     requirement = _parent_requirement(client, repository, item)
@@ -1237,6 +1264,11 @@ def _work_item_defect(
 def _checked_classification(
     client: github.GitHubIssueComments, repository: str, detail: board.PullRequestDetail
 ) -> board.Classification | board.ClassificationDefect:
+    if detail.head_repository != repository:
+        return board.ClassificationDefect(
+            f"proposes a branch of {detail.head_repository}; cross-repository pull "
+            "requests are not classified"
+        )
     classification = board.parse_pull_request_classification(detail.body, repository)
     if isinstance(classification, board.ClassificationDefect):
         return classification
@@ -1245,9 +1277,11 @@ def _checked_classification(
         return board.ClassificationDefect(
             f"targets {detail.base_ref_name!r}, not the default branch {default_branch!r}"
         )
-    if isinstance(classification, board.NoItemClassification):
-        return classification
-    defect = _work_item_defect(client, repository, detail, classification.item)
+    defect = (
+        _no_item_defect(client, repository, detail)
+        if isinstance(classification, board.NoItemClassification)
+        else _work_item_defect(client, repository, detail, classification.item)
+    )
     return classification if defect is None else defect
 
 

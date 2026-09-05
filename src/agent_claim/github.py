@@ -64,7 +64,7 @@ GH_QUIET_ENVIRONMENT = {
     "NO_COLOR": "1",
     "GH_NO_UPDATE_NOTIFIER": "1",
 }
-API_BLOCKER_STATES: dict[str, board.BlockerState] = {
+API_ISSUE_STATES: dict[str, board.BlockerState] = {
     "open": board.BlockerState.OPEN,
     "closed": board.BlockerState.CLOSED,
 }
@@ -74,6 +74,21 @@ def github_command_environment() -> dict[str, str]:
     environment = os.environ.copy()
     environment.update(GH_QUIET_ENVIRONMENT)
     return environment
+
+
+def _head_repository(pull_request: dict[str, object]) -> str | None:
+    """`OWNER/REPOSITORY` of the branch a pull request proposes, or None when
+    GitHub does not name both halves — a fork deleted after the pull request
+    opened, say.
+    """
+    repository = pull_request.get("headRepository")
+    owner = pull_request.get("headRepositoryOwner")
+    name = repository.get("name") if isinstance(repository, dict) else None
+    login = owner.get("login") if isinstance(owner, dict) else None
+    if not isinstance(name, str) or not isinstance(login, str):
+        return None
+    full_name = f"{login}/{name}"
+    return full_name if REPOSITORY_PATTERN.fullmatch(full_name) else None
 
 
 def strip_ansi(text: str) -> str:
@@ -413,6 +428,7 @@ class GitHubIssueComments:
             body = ""
         base_ref_name = value.get("baseRefName")
         head_ref_name = value.get("headRefName")
+        head_repository = _head_repository(value)
         author = value.get("author")
         login = author.get("login") if isinstance(author, dict) else None
         merged_at = value.get("mergedAt")
@@ -423,6 +439,7 @@ class GitHubIssueComments:
             or not isinstance(body, str)
             or not isinstance(base_ref_name, str)
             or not isinstance(head_ref_name, str)
+            or head_repository is None
             or not isinstance(login, str)
             or not login
             or (merged_at is not None and not isinstance(merged_at, str))
@@ -430,7 +447,13 @@ class GitHubIssueComments:
         ):
             raise ClaimError("GitHub returned a malformed pull request")
         return board.PullRequestDetail(
-            number, body, base_ref_name, head_ref_name, login, merged_at is not None
+            number,
+            body,
+            base_ref_name,
+            head_ref_name,
+            head_repository,
+            login,
+            merged_at is not None,
         )
 
     def pull_request_detail(self, number: int) -> board.PullRequestDetail:
@@ -442,7 +465,8 @@ class GitHubIssueComments:
                 "--repo",
                 self.repository,
                 "--json",
-                "number,body,baseRefName,headRefName,author,mergedAt",
+                "number,body,baseRefName,headRefName,headRepository,"
+                "headRepositoryOwner,author,mergedAt",
                 "--jq",
                 ".",
             ]
@@ -450,7 +474,12 @@ class GitHubIssueComments:
         values = self._json_lines(raw, "pull request")
         if len(values) != 1:
             raise ClaimError("GitHub returned a malformed pull request")
-        return self._pull_request_detail(values[0])
+        detail = self._pull_request_detail(values[0])
+        if detail.number != number:
+            raise ClaimError(
+                f"GitHub answered for pull request #{detail.number}, not #{number}"
+            )
+        return detail
 
     def _issue_reference(self, value: object, description: str) -> board.IssueReference:
         if not isinstance(value, dict):
@@ -469,6 +498,13 @@ class GitHubIssueComments:
         ):
             raise ClaimError(f"GitHub returned a malformed {description}")
         return board.IssueReference(repository, number)
+
+    def _issue_state(self, value: object, description: str) -> board.BlockerState:
+        state = value.get("state") if isinstance(value, dict) else None
+        parsed = API_ISSUE_STATES.get(state) if isinstance(state, str) else None
+        if parsed is None:
+            raise ClaimError(f"GitHub returned a malformed {description}")
+        return parsed
 
     def parent_issue(self, number: int) -> board.ParentIssue | None:
         """The issue GitHub records as `number`'s parent, or None when it has none."""
@@ -497,19 +533,28 @@ class GitHubIssueComments:
         return board.ParentIssue(self._issue_reference(values[0], "parent issue"), body)
 
     def open_sub_issues(self, number: int) -> tuple[board.IssueReference, ...]:
+        """The parent's children GitHub still holds open.
+
+        Every child's state is read here rather than filtered by `--jq`: a
+        state this adapter does not understand would otherwise vanish and make
+        a parent look childless, which is exactly the landing this check must
+        refuse.
+        """
         raw = self._run(
             [
                 "api",
                 "--paginate",
                 f"repos/{self.repository}/issues/{number}/sub_issues?per_page=100",
                 "--jq",
-                '.[] | select(.state == "open") | {number,repository:.repository_url}',
+                ".[] | {number,repository:.repository_url,state}",
             ]
         )
-        return tuple(
-            self._issue_reference(value, "sub-issue")
-            for value in self._json_lines(raw, "sub-issue")
-        )
+        children: list[board.IssueReference] = []
+        for value in self._json_lines(raw, "sub-issue"):
+            reference = self._issue_reference(value, "sub-issue")
+            if self._issue_state(value, "sub-issue") is board.BlockerState.OPEN:
+                children.append(reference)
+        return tuple(children)
 
     def default_branch(self) -> str:
         branch = self._run(
@@ -569,7 +614,7 @@ class GitHubIssueComments:
         state = value.get("state")
         closed_at = value.get("closedAt")
         is_pull_request = value.get("isPullRequest")
-        blocker_state = API_BLOCKER_STATES.get(state) if isinstance(state, str) else None
+        blocker_state = API_ISSUE_STATES.get(state) if isinstance(state, str) else None
         if (
             isinstance(returned_number, bool)
             or returned_number != number

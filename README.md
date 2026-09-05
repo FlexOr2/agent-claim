@@ -14,7 +14,7 @@ uv tool uninstall agent-claim
 ```
 
 To roll back, force-install the previous tag with `uv tool install --force
-git+https://github.com/FlexOr2/agent-claim.git@v0.6.0`.
+git+https://github.com/FlexOr2/agent-claim.git@v0.8.0`.
 
 ## Five-command quick start
 
@@ -127,10 +127,12 @@ A pull request body carries exactly one classification line:
 naming two work items (split the pull request); a work item that is the claim
 ledger issue or lives in another repository; a work item with no active claim
 on the pull request's head branch; a closing reference naming anything but the
-work item; and a pull request that does not target the default branch. A
-classification line inside a fenced code block is documentation, never a
-declaration. `Advances #n` is read nowhere: a dispatched slice is its own item,
-and its pull request closes it.
+work item; a `No-Item` pull request without an active issue-less lane claim on
+that head branch, or carrying any closing reference at all; a pull request
+whose head branch lives in another repository; and a pull request that does not
+target the default branch. A classification line inside a fenced code block is
+documentation, never a declaration. `Advances #n` is read nowhere: a dispatched
+slice is its own item, and its pull request closes it.
 
 Parentage is GitHub's own sub-issue relation, not a line in a body. `pr-check`
 reads the work item's recorded parent and that parent's open sub-issues: a

@@ -78,20 +78,27 @@ REFERENCE_PATTERN = re.compile(r"(?<![A-Za-z0-9_])#([1-9][0-9]*)")
 QUALIFIED_REFERENCE = (
     rf"(?:(?P<repository>{protocol.REPOSITORY_PATTERN.pattern}))?#(?P<number>[1-9][0-9]*)"
 )
+# GitHub links a keyword to a reference only on one line, separated by
+# horizontal space and ending at the reference: `Closes#7`, a keyword whose
+# reference sits on the next line, and `#7suffix` all leave the issue open, so
+# reading them as a closure would report a landing GitHub never performs.
+KEYWORD_SEPARATOR = r"[ \t]*:?[ \t]+"
+REFERENCE_BOUNDARY = r"(?![A-Za-z0-9_])"
 # The keywords GitHub itself closes an issue on when a pull request merges.
 # Nothing else retires an item, so this is what a landing's typed closing
 # reference is checked against.
 CLOSING_KEYWORDS = r"close(?:s|d)?|fix(?:es|ed)?|resolve(?:s|d)?"
 CLOSING_REFERENCE_PATTERN = re.compile(
-    rf"(?im)\b(?:{CLOSING_KEYWORDS})\s*:?\s*" + QUALIFIED_REFERENCE
+    rf"(?im)\b(?:{CLOSING_KEYWORDS}){KEYWORD_SEPARATOR}"
+    rf"{QUALIFIED_REFERENCE}{REFERENCE_BOUNDARY}"
 )
 # The board's stage heuristic also believes a pull request that says it landed
 # or implemented an issue. GitHub closes on neither word, so this wider set
 # answers "which issue did this pull request work on", never "which issue does
 # it retire".
 LANDING_CLAIM_PATTERN = re.compile(
-    rf"(?im)\b(?:{CLOSING_KEYWORDS}|land(?:s|ed)?|implement(?:s|ed)?)\s*:?\s*"
-    + QUALIFIED_REFERENCE
+    rf"(?im)\b(?:{CLOSING_KEYWORDS}|land(?:s|ed)?|implement(?:s|ed)?)"
+    rf"{KEYWORD_SEPARATOR}{QUALIFIED_REFERENCE}{REFERENCE_BOUNDARY}"
 )
 WORK_ITEM_KIND = "work-item"
 CLASSIFICATION_LINE_PATTERN = re.compile(
@@ -178,6 +185,7 @@ class PullRequestDetail:
     body: str
     base_ref_name: str
     head_ref_name: str
+    head_repository: str
     author: str
     merged: bool
 
