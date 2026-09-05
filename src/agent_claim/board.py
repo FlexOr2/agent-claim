@@ -78,7 +78,7 @@ REFERENCE_PATTERN = re.compile(r"(?<!\w)#([1-9]\d*)", re.ASCII)
 # embeds this one grammar, so a shorthand and its qualified spelling always
 # parse to the same reference.
 QUALIFIED_REFERENCE = (
-    rf"(?:(?P<repository>{protocol.REPOSITORY_PATTERN.pattern}))?#(?P<number>[1-9][0-9]*)"
+    rf"(?:(?P<repository>{protocol.REPOSITORY_PATTERN.pattern}))?#(?P<number>[1-9]\d*)"
 )
 # GitHub links a keyword to a reference only on one line, separated by
 # horizontal space and ending at the reference: `Closes#7`, a keyword whose
@@ -101,13 +101,14 @@ CLOSING_REFERENCE_PATTERN = re.compile(
 # it retire".
 LANDING_CLAIM_PATTERN = re.compile(
     rf"(?im)\b(?:{CLOSING_KEYWORDS}|land(?:s|ed)?|implement(?:s|ed)?)"
-    rf"{KEYWORD_SEPARATOR}{QUALIFIED_REFERENCE}{REFERENCE_BOUNDARY}"
+    rf"{KEYWORD_SEPARATOR}{QUALIFIED_REFERENCE}{REFERENCE_BOUNDARY}",
+    re.ASCII,
 )
 WORK_ITEM_KIND = "work-item"
 CLASSIFICATION_LINE_PATTERN = re.compile(
     r"(?im)^(?P<kind>Work-Item|No-Item):(?P<value>[^\r\n]*)$"
 )
-WORK_ITEM_VALUE_PATTERN = re.compile(QUALIFIED_REFERENCE)
+WORK_ITEM_VALUE_PATTERN = re.compile(QUALIFIED_REFERENCE, re.ASCII)
 RECOVERY_STEP = "close or re-project"
 # A slice's pull request must never close its still-open epic — that would
 # retire the epic before its remaining slices exist. This repository's

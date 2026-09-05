@@ -37,7 +37,6 @@ LedgerSupersede = protocol.LedgerSupersede
 LedgerSuperseded = protocol.LedgerSuperseded
 PROJECTION_MARKER_PATTERN = protocol.PROJECTION_MARKER_PATTERN
 _active_projection = protocol._active_projection
-_bounded_command = github._bounded_command
 _git_output = checkout._git_output
 _projection_ledger = protocol._projection_ledger
 _projection_marker = protocol._projection_marker
@@ -1338,7 +1337,7 @@ def _verify_merged_release(
             f"pull request #{detail.number} names {classification}, "
             f"not work item #{identity.issue}"
         )
-    reference = _fetch_issue_reference(repository, identity.issue)
+    reference = _fetch_issue_reference(client, identity.issue)
     if reference.state is not ReferenceState.CLOSED:
         raise protocol.ClaimUnavailable(
             f"work item #{identity.issue} is {reference.state.value}, not closed"

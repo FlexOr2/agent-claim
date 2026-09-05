@@ -54,6 +54,7 @@ LEDGER_ISSUE = 71
 
 _LIVE_VERSIONED_PATHS = checkout.versioned_paths
 _LIVE_TRUNK_LANDING_TIMES = checkout.trunk_landing_times
+_LIVE_FETCH_ISSUE_REFERENCE = issue_claim._fetch_issue_reference
 
 BASE = "a" * 40
 REPOSITORY = "example/agent-claim"
@@ -390,6 +391,8 @@ class FakeComments:
     pull_requests: dict[int, board.PullRequestDetail] = field(default_factory=dict)
     parents: dict[int, board.ParentIssue] = field(default_factory=dict)
     open_children: dict[int, tuple[board.IssueReference, ...]] = field(default_factory=dict)
+    closed_issues: set[int] = field(default_factory=set)
+    issue_reference_lookups: list[int] = field(default_factory=list)
 
     def list_protocol_candidates(self, issue: int) -> tuple[IssueComment, ...]:
         return tuple(
@@ -463,6 +466,11 @@ class FakeComments:
         if detail is None:
             raise ClaimError(f"GitHub has no pull request #{number}")
         return detail
+
+    def issue_reference_json(self, number: int) -> str:
+        self.issue_reference_lookups.append(number)
+        state = "closed" if number in self.closed_issues else "open"
+        return json.dumps({"state": state, "title": "", "body": ""})
 
     def default_branch(self) -> str:
         return self.default_branch_name
@@ -5636,7 +5644,7 @@ def test_github_comment_reader_accepts_concatenated_pretty_json_objects(
 
 
 def test_bounded_command_sets_github_quiet_environment() -> None:
-    observed = issue_claim._bounded_command(
+    observed = github._bounded_command(
         [
             sys.executable,
             "-c",
@@ -6035,14 +6043,14 @@ def test_bounded_command_stops_before_unbounded_output(
     monkeypatch.setattr(github, "MAX_COMMAND_OUTPUT_BYTES", 32)
 
     with pytest.raises(ClaimError, match="output limit"):
-        issue_claim._bounded_command(
+        github._bounded_command(
             [sys.executable, "-c", "print('x' * 1000)"],
             purpose="test command",
         )
 
 
 def test_bounded_command_disables_github_update_notifications() -> None:
-    observed = issue_claim._bounded_command(
+    observed = github._bounded_command(
         [
             sys.executable,
             "-c",
@@ -6055,7 +6063,7 @@ def test_bounded_command_disables_github_update_notifications() -> None:
 
 
 def test_bounded_command_streams_stdin_without_putting_it_in_argv() -> None:
-    observed = issue_claim._bounded_command(
+    observed = github._bounded_command(
         [sys.executable, "-c", "import sys; print(sys.stdin.buffer.read().decode())"],
         purpose="stdin probe",
         input_data=b"bounded body",
@@ -6073,7 +6081,7 @@ def test_bounded_command_wraps_process_argument_errors(
     monkeypatch.setattr(subprocess, "Popen", cannot_start)
 
     with pytest.raises(ClaimError, match="cannot start test command"):
-        issue_claim._bounded_command(["gh", "issue"], purpose="test command")
+        github._bounded_command(["gh", "issue"], purpose="test command")
 
 
 def test_bounded_command_wraps_stdin_write_errors(
@@ -6085,7 +6093,7 @@ def test_bounded_command_wraps_stdin_write_errors(
     monkeypatch.setattr(github.os, "write", cannot_write)
 
     with pytest.raises(ClaimError, match="failed while sending bounded input"):
-        issue_claim._bounded_command(
+        github._bounded_command(
             [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
             purpose="stdin write probe",
             input_data=b"body",
@@ -6110,7 +6118,7 @@ def test_bounded_command_reaps_child_when_selector_setup_fails(
     monkeypatch.setattr(github.selectors, "DefaultSelector", cannot_select)
 
     with pytest.raises(ClaimError, match="failed while coordinating I/O"):
-        issue_claim._bounded_command(
+        github._bounded_command(
             [sys.executable, "-c", "import time; time.sleep(30)"],
             purpose="selector setup probe",
         )
@@ -6154,7 +6162,7 @@ def test_bounded_command_reaps_child_when_select_fails(
     monkeypatch.setattr(github.selectors, "DefaultSelector", FailingSelector)
 
     with pytest.raises(ClaimError, match="failed while waiting for I/O"):
-        issue_claim._bounded_command(
+        github._bounded_command(
             [sys.executable, "-c", "import time; time.sleep(30)"],
             purpose="select probe",
         )
@@ -6193,7 +6201,7 @@ def test_bounded_command_reaps_child_when_output_read_fails(
     monkeypatch.setattr(github.os, "read", cannot_read)
 
     with pytest.raises(ClaimError, match="failed while reading output"):
-        issue_claim._bounded_command(
+        github._bounded_command(
             [
                 sys.executable,
                 "-u",
@@ -6239,7 +6247,7 @@ def test_bounded_command_reaps_child_on_cancellation(
     monkeypatch.setattr(github.selectors, "DefaultSelector", CancellingSelector)
 
     with pytest.raises(CancellationSentinel):
-        issue_claim._bounded_command(
+        github._bounded_command(
             [sys.executable, "-c", "import time; time.sleep(30)"],
             purpose="cancellation probe",
         )
@@ -11772,12 +11780,12 @@ def test_release_merged_records_the_pull_request_that_landed_the_item(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     client = merged_release_client(monkeypatch, body="Work-Item: #72\n\nCloses #72")
-    _stub_issue_reference(
-        monkeypatch, {WORK_ITEM_ISSUE: (issue_claim.ReferenceState.CLOSED, "", "")}
-    )
+    client.closed_issues.add(WORK_ITEM_ISSUE)
+    monkeypatch.setattr(issue_claim, "_fetch_issue_reference", _LIVE_FETCH_ISSUE_REFERENCE)
 
     assert issue_claim.main(["--repo", REPOSITORY, "release", "72", "--merged", "12"]) == 0
 
+    assert client.issue_reference_lookups == [WORK_ITEM_ISSUE]
     posted = parse_claim_event(client.comments[LEDGER_ISSUE][-1])
     assert isinstance(posted, ClaimantRelease)
     assert posted.reason == "merged #12"
@@ -12187,6 +12195,11 @@ def test_a_non_ascii_digit_in_a_hash_reference_is_not_an_issue_number() -> None:
     assert arabic_three.blocker_issues == frozenset()
     assert mixed.blocker_issues == frozenset()
 
+    qualified = board.closing_references(f"Closes {REPOSITORY}#٣", REPOSITORY)
+    work_item = board.parse_pull_request_classification("Work-Item: #٣", REPOSITORY)
+    assert qualified == frozenset()
+    assert isinstance(work_item, board.ClassificationDefect)
+
 
 def test_a_nested_quoted_frozen_line_still_parses_and_an_indented_line_does_not() -> None:
     quoted = "> > **Eingefroren bis:** 2026-09-30 (Operator, 30.09.2026)"
@@ -12202,3 +12215,13 @@ def test_a_frozen_line_indented_by_three_spaces_parses_like_an_unindented_one() 
 
     assert board.frozen_trigger(unindented) == "2026-09-30"
     assert board.frozen_trigger(indented) == board.frozen_trigger(unindented)
+
+
+def test_a_frozen_line_accepts_three_spaces_around_quote_markers_but_not_four() -> None:
+    three_before_first = "   > **Eingefroren bis:** 2026-09-30 (Operator, 30.09.2026)"
+    three_between = ">   > **Eingefroren bis:** 2026-09-30 (Operator, 30.09.2026)"
+    four_between = ">    > **Eingefroren bis:** 2026-09-30 (Operator, 30.09.2026)"
+
+    assert board.frozen_trigger(three_before_first) == "2026-09-30"
+    assert board.frozen_trigger(three_between) == "2026-09-30"
+    assert board.frozen_trigger(four_between) is None
