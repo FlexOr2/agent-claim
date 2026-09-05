@@ -105,7 +105,7 @@ LANDING_CLAIM_PATTERN = re.compile(
 )
 WORK_ITEM_KIND = "work-item"
 CLASSIFICATION_LINE_PATTERN = re.compile(
-    r"(?im)^(?P<kind>Work-Item|No-Item):[ \t]*(?P<value>[^\r\n]*)$"
+    r"(?im)^(?P<kind>Work-Item|No-Item):(?P<value>[^\r\n]*)$"
 )
 WORK_ITEM_VALUE_PATTERN = re.compile(QUALIFIED_REFERENCE)
 RECOVERY_STEP = "close or re-project"
@@ -783,13 +783,13 @@ def parse_pull_request_classification(
         match for match in matches if match.group("kind").lower() == WORK_ITEM_KIND
     )
     if len(work_items) > 1:
-        named = " and ".join(match.group("value").rstrip(" \t") for match in work_items[:2])
+        named = " and ".join(match.group("value").strip(" \t") for match in work_items[:2])
         return ClassificationDefect(f"names two work items, {named}; split it")
     if len(matches) > 1:
         return ClassificationDefect(
             f"carries {len(matches)} classification lines; exactly one is required"
         )
-    value = matches[0].group("value").rstrip(" \t")
+    value = matches[0].group("value").strip(" \t")
     if work_items:
         reference = WORK_ITEM_VALUE_PATTERN.fullmatch(value)
         if reference is None:

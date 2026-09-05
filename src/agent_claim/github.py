@@ -88,7 +88,7 @@ def _head_repository(pull_request: dict[str, object]) -> str | None:
     if not isinstance(name, str) or not isinstance(login, str):
         return None
     full_name = f"{login}/{name}"
-    return full_name if REPOSITORY_PATTERN.fullmatch(full_name) else None
+    return full_name if re.fullmatch(REPOSITORY_PATTERN, full_name) else None
 
 
 def strip_ansi(text: str) -> str:
@@ -218,7 +218,7 @@ def _bounded_command(
 
 class GitHubIssueComments:
     def __init__(self, repository: str):
-        if REPOSITORY_PATTERN.fullmatch(repository) is None:
+        if re.fullmatch(REPOSITORY_PATTERN, repository) is None:
             raise ClaimError("repository must be OWNER/REPO")
         self.repository = repository
         self._rollover_warning_printed = False
@@ -499,7 +499,7 @@ class GitHubIssueComments:
             or not isinstance(number, int)
             or number < 1
             or repository is None
-            or REPOSITORY_PATTERN.fullmatch(repository) is None
+            or re.fullmatch(REPOSITORY_PATTERN, repository) is None
         ):
             raise ClaimError(f"GitHub returned a malformed {description}")
         return board.IssueReference(repository, number)

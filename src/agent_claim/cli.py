@@ -1445,6 +1445,10 @@ def _protect(repository: str | None) -> int:
         return _hook_deny(str(error))
 
 
+def _optional_issue_number(value: int | None) -> int | None:
+    return None if value is None else int(value)
+
+
 def main(arguments: list[str] | None = None) -> int:
     parsed = _parser().parse_args(arguments)
     if parsed.command == "policy":
@@ -1489,13 +1493,14 @@ def main(arguments: list[str] | None = None) -> int:
             pull_request_number = int(parsed.pr)
             return _pull_request_check(client, repository, pull_request_number)
         if parsed.command == "status":
+            issue = _optional_issue_number(parsed.issue)
             comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
             claims = protocol.active_claims(comments)
             now = datetime.now(timezone.utc)
             if parsed.json:
-                return _status_json(claims, parsed.issue, ledger, now=now)
+                return _status_json(claims, issue, ledger, now=now)
             print(f"LEDGER #{ledger}")
-            return _status(claims, parsed.issue, now=now)
+            return _status(claims, issue, now=now)
         if parsed.command == "board":
             comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
             projected = _board(client, protocol.active_claims(comments))
@@ -1531,6 +1536,7 @@ def main(arguments: list[str] | None = None) -> int:
             print(f"LEDGER #{ledger}")
             return _who(claims, parsed.path)
         if parsed.command == "rescope":
+            issue = _optional_issue_number(parsed.issue)
             rescope_branch = checkout._git_output(["branch", "--show-current"])
             if not rescope_branch:
                 raise protocol.ClaimUnavailable(
@@ -1538,7 +1544,7 @@ def main(arguments: list[str] | None = None) -> int:
                     "check out the claim branch, or pass an issue number"
                 )
             checkout._validate_worktree_branch(rescope_branch)
-            identity = _resolved_identity(parsed.issue, rescope_branch)
+            identity = _resolved_identity(issue, rescope_branch)
             add = protocol._valid_scope(parsed.add) if parsed.add else ()
             drop = protocol._valid_scope(parsed.drop) if parsed.drop else ()
             allow_directory_reason = parsed.allow_directory
@@ -1654,7 +1660,8 @@ def main(arguments: list[str] | None = None) -> int:
             print(_claim_cost_line(n, total, touches))
             return 0
         if parsed.command == "release":
-            identity = _resolved_identity(parsed.issue, release_branch or "")
+            issue = _optional_issue_number(parsed.issue)
+            identity = _resolved_identity(issue, release_branch or "")
             outcome = _release_outcome(parsed)
             if isinstance(outcome, protocol.MergedRelease):
                 _verify_merged_release(client, repository, identity, outcome)
@@ -1673,9 +1680,10 @@ def main(arguments: list[str] | None = None) -> int:
             print(f"RELEASED {_claim_subject(released)}: {released.claim_id}")
             return 0
         if parsed.command == "supersede":
+            successor_issue = _optional_issue_number(parsed.successor_issue)
             frozen = protocol.supersede_ledger(
                 client,
-                parsed.successor_issue,
+                successor_issue,
                 parsed.agent,
                 parsed.role,
                 parsed.reason,
@@ -1683,7 +1691,7 @@ def main(arguments: list[str] | None = None) -> int:
             )
             print(
                 f"SUPERSEDED ledger #{protocol.LEDGER_ISSUE} successor "
-                f"#{parsed.successor_issue}: {frozen.claim_id}"
+                f"#{successor_issue}: {frozen.claim_id}"
             )
             return 0
         try:
@@ -1697,15 +1705,16 @@ def main(arguments: list[str] | None = None) -> int:
             # A frozen ledger has nothing left for duplicate repair to fix; let the
             # label reconciliation below observe the freeze and run its own cleanup.
             pass
-        if parsed.issue is None:
+        issue = _optional_issue_number(parsed.issue)
+        if issue is None:
             reconciled = protocol.reconcile_all_labels(client)
         else:
-            protocol.reconcile_issue_label(client, parsed.issue)
+            protocol.reconcile_issue_label(client, issue)
             reconciled = tuple(
                 claim.identity.issue
                 for claim in protocol._ledger_claims(client)
                 if isinstance(claim.identity, protocol.IssueIdentity)
-                and claim.identity.issue == parsed.issue
+                and claim.identity.issue == issue
             )
         print("RECONCILED " + (", ".join(f"#{issue}" for issue in reconciled) or "no claims"))
         return 0
