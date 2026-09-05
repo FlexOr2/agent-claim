@@ -161,8 +161,8 @@ As ruled by the round-2 counter-check. Strictly sequential.
 
 1. **#113 revalidated** — one wide-scope predicate on `claim` and `rescope`. It keeps
    `parse_slice_table` alive until step 4 has converted the existing slice data.
-2. **#112 re-cut around item kind** — dispatchable only after D3 is ruled and the cross-forge
-   kind mapping exists.
+2. **#112 re-cut around item kind** — D3 is ruled; dispatchable once the cross-forge kind
+   mapping exists.
 3. **Port extraction** — `ForgeReader` / `ForgeWriter`, the GitHub adapter, typed errors. A
    pure extraction against the current call set, with no behaviour change, and it must
    already satisfy criterion 9. Criterion 11's live GitHub custom-ref probe must also be
@@ -221,13 +221,6 @@ Recorded verbatim.
 |---|---|---|
 | D1 | A receipt comment, written after a successful state change and never read back as truth. No assignee projection | The assignee is a racing copy: an old release removes its claim, a successor claims and assigns, then the old release clears the assignee — and only `status`/`board` could repair it, which read-only commands may not do. It also shows a forge account, not the agent. Exactly-once is not available; the contract is "attempt after a successful transition; a receipt failure never changes the successful state result" |
 | D2 | The write gate authorizes only against live state. No positive caching | A cached commit authorizes writes that live state denies after a release, takeover or scope reduction, and after a clock rollback or a future-dated stamp the window is not even bounded by its nominal length. Only negative decisions may be cached |
+| D3 | Item kind is the native issue type, including an organization-level `Container` type on GitHub. Ruled 05.09.2026: the organization type `Container` (id 859945696) now exists next to Task, Bug, Feature; containers #103, #114, #122 carry it | It is the clean one-owner mechanism. GitLab Free cannot create a custom `Container` type, so its adapter maps item kind read-only there |
 | D4 | Wide-scope thresholds are protocol constants, not configuration | No caller for repository-specific thresholds, and configuration would let two fleets in one repository disagree on what "too wide" means |
 | D5 | The migration machinery is deleted in the first release after every supported repository is proven migrated and old clients are fenced | Release distance does not decide safety; the proof does. A fixed "next release" is right only if that proof already exists |
-
-### Open for the operator
-
-**D3 — item kind as a native issue type,** including an organization-level `Container` type
-on GitHub. It is the clean one-owner mechanism, but creating an organization-level source of
-truth is a product decision, and it is not yet cross-forge implementable: GitLab Free cannot
-create a custom `Container` type. The GitLab Free mapping is to be settled by the first
-GitLab adapter. Step 2 of §5 cannot be dispatched until this is ruled.
