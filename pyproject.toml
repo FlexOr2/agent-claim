@@ -79,6 +79,7 @@ layers = [
     "cli",
     "checkout | discovery",
     "github",
+    "forge",
     "board",
     "protocol",
     "process",

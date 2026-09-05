@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from .github import GitHubIssueComments
+from .github import GitHubForge
 from .protocol import (
     LEDGER_BODY_MARKER,
     LEDGER_LABEL,
@@ -34,7 +34,7 @@ class _LedgerIssue:
 
 
 def _ledger_issue_rows(
-    client: GitHubIssueComments, state: str = "all", *, label: str | None = None
+    client: GitHubForge, state: str = "all", *, label: str | None = None
 ) -> tuple[_LedgerIssue, ...]:
     label_filter = f"&labels={label}" if label else ""
     raw = client._run(
@@ -124,7 +124,7 @@ def _select_ledger(rows: tuple[_LedgerIssue, ...]) -> int | None:
     return min(ledgers) if ledgers else None
 
 
-def _open_issue_count(client: GitHubIssueComments) -> int:
+def _open_issue_count(client: GitHubForge) -> int:
     """The repository's live open-issue-and-pull-request count, from the
     single-request repository resource rather than a paginated listing."""
     raw = client._run(["api", f"repos/{client.repository}", "--jq", ".open_issues_count"])
@@ -137,7 +137,7 @@ def _open_issue_count(client: GitHubIssueComments) -> int:
     return count
 
 
-def discover_ledger(client: GitHubIssueComments) -> int | None:
+def discover_ledger(client: GitHubForge) -> int | None:
     """Find the single open, locked protocol ledger without changing GitHub state.
 
     Every bootstrapped ledger is labelled `LEDGER_LABEL` (`_ensure_ledger_labels`
@@ -188,7 +188,7 @@ def discover_ledger(client: GitHubIssueComments) -> int | None:
     return None
 
 
-def _ensure_ledger_labels(client: GitHubIssueComments, ledger: int) -> None:
+def _ensure_ledger_labels(client: GitHubForge, ledger: int) -> None:
     """Create both label definitions and attach `LEDGER_LABEL` to `ledger` itself.
 
     `claim_label(ledger)` is never attached here — it belongs on whichever
@@ -206,7 +206,7 @@ def _ensure_ledger_labels(client: GitHubIssueComments, ledger: int) -> None:
                 "create",
                 label,
                 "--repo",
-                client.repository,
+                client.repository.path,
                 "--color",
                 "6f42c1",
                 "--description",
@@ -217,7 +217,7 @@ def _ensure_ledger_labels(client: GitHubIssueComments, ledger: int) -> None:
     client.add_label(ledger, LEDGER_LABEL)
 
 
-def _create_ledger(client: GitHubIssueComments) -> int:
+def _create_ledger(client: GitHubForge) -> int:
     body = (
         f"{LEDGER_BODY_MARKER}\n\n## Agent claim ledger\n\n"
         "This open, collaborator-locked issue serializes build-claim events."
@@ -269,9 +269,7 @@ def _trusted_ledger_candidates(rows: tuple[_LedgerIssue, ...]) -> tuple[_LedgerI
     )
 
 
-def _converge_on_canonical_ledger(
-    client: GitHubIssueComments, candidates: tuple[_LedgerIssue, ...]
-) -> int:
+def _converge_on_canonical_ledger(client: GitHubForge, candidates: tuple[_LedgerIssue, ...]) -> int:
     canonical = min(issue.number for issue in candidates)
     for issue in candidates:
         if not issue.locked:
@@ -288,11 +286,11 @@ def _converge_on_canonical_ledger(
             f"canonical={canonical}{MARKER_SUFFIX}\n\n"
             f"Superseded duplicate ledger; canonical ledger is #{canonical}.",
         )
-        client._run(["issue", "close", str(issue.number), "--repo", client.repository])
+        client._run(["issue", "close", str(issue.number), "--repo", client.repository.path])
     return canonical
 
 
-def bootstrap_ledger(client: GitHubIssueComments) -> int:
+def bootstrap_ledger(client: GitHubForge) -> int:
     """Create/adopt one ledger and make racing first starts converge to the earliest issue."""
     rows = _ledger_issue_rows(client)
     _refuse_competing_contracts(rows)

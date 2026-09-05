@@ -248,18 +248,24 @@ class ClaimRequest:
     resource_value: int | None = None
 
 
-class IssueComments(Protocol):
+class ClaimReader(Protocol):
+    """The claim-ledger operations a read-only command may call."""
+
     def list_protocol_candidates(self, issue: int) -> tuple[IssueComment, ...]: ...
+
+    def list_claimed_issues(self) -> tuple[int, ...]: ...
+
+    def validate_successor(self, issue: int) -> None: ...
+
+
+class ClaimWriter(ClaimReader, Protocol):
+    """`ClaimReader` plus the operations that mutate the claim ledger."""
 
     def post_comment(self, issue: int, body: str) -> str: ...
 
     def add_label(self, issue: int, label: str) -> None: ...
 
     def remove_label(self, issue: int, label: str) -> None: ...
-
-    def list_claimed_issues(self) -> tuple[int, ...]: ...
-
-    def validate_successor(self, issue: int) -> None: ...
 
     def upsert_projection(
         self,
@@ -1424,7 +1430,7 @@ def _unclaimed_projection(ledger_url: str | None = None, reason: str | None = No
     return _validated_comment(f"{_projection_marker()}\n🔓 **Unclaimed**{detail}\n\n{ledger}")
 
 
-def _ledger_claims(client: IssueComments) -> tuple[ActiveClaim, ...]:
+def _ledger_claims(client: ClaimReader) -> tuple[ActiveClaim, ...]:
     return active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
 
 
@@ -1443,7 +1449,7 @@ def _issue_claim(claims: tuple[ActiveClaim, ...], issue: int) -> ActiveClaim | N
 
 
 def _apply_issue_projection(
-    client: IssueComments,
+    client: ClaimWriter,
     issue: int,
     claim: ActiveClaim | None,
     *,
@@ -1466,7 +1472,7 @@ def _apply_issue_projection(
 
 
 def reconcile_issue_label(
-    client: IssueComments,
+    client: ClaimWriter,
     issue: int,
     *,
     unclaimed_body: str | None = None,
@@ -1497,7 +1503,7 @@ def reconcile_issue_label(
     raise ClaimError(f"issue #{issue} claim label changed repeatedly during reconciliation")
 
 
-def reconcile_all_labels(client: IssueComments) -> tuple[int, ...]:
+def reconcile_all_labels(client: ClaimWriter) -> tuple[int, ...]:
     # `discover_ledger` trusts `LEDGER_LABEL` on the ledger issue itself to find
     # it in one atomic request instead of scanning every open issue (#74); an
     # older ledger, bootstrapped before that label existed, never got it
@@ -1548,7 +1554,7 @@ class DuplicateClaimRepair:
     survivor_comment_id: int
 
 
-def repair_duplicate_claims(client: IssueComments) -> tuple[DuplicateClaimRepair, ...]:
+def repair_duplicate_claims(client: ClaimWriter) -> tuple[DuplicateClaimRepair, ...]:
     """Tolerant reconcile pre-pass: neutralize safely-superseded duplicate claim ids.
 
     A same-claim-id re-claim poisons every strict reader (status/claim/release) with
@@ -1599,7 +1605,7 @@ def repair_duplicate_claims(client: IssueComments) -> tuple[DuplicateClaimRepair
 
 
 def _reconcile_identity(
-    client: IssueComments, identity: ClaimIdentity, *, unclaimed_body: str | None = None
+    client: ClaimWriter, identity: ClaimIdentity, *, unclaimed_body: str | None = None
 ) -> None:
     """Reconcile the issue label/projection this identity owns, if it owns one.
 
@@ -1640,7 +1646,7 @@ def _assigned_request(request: ClaimRequest) -> ClaimRequest:
     return replace(request, resource=name)
 
 
-def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
+def acquire_claim(client: ClaimWriter, request: ClaimRequest) -> ActiveClaim:
     claimed, _observed = _acquire_claim_with_observed(client, request)
     return claimed
 
@@ -1689,7 +1695,7 @@ def _reject_unavailable_claim(aggregate: ClaimLedgerAggregate, request: ClaimReq
             )
 
 
-def _post_claim_and_observe(client: IssueComments, request: ClaimRequest) -> ClaimLedgerAggregate:
+def _post_claim_and_observe(client: ClaimWriter, request: ClaimRequest) -> ClaimLedgerAggregate:
     client.post_comment(LEDGER_ISSUE, claim_comment(request))
     post_aggregate = _aggregate_claim_events(client.list_protocol_candidates(LEDGER_ISSUE))
     if request.claim_id in post_aggregate.duplicate_claim_ids:
@@ -1703,7 +1709,7 @@ def _post_claim_and_observe(client: IssueComments, request: ClaimRequest) -> Cla
 
 
 def _resolve_identity_race(
-    client: IssueComments,
+    client: ClaimWriter,
     request: ClaimRequest,
     own: ActiveClaim,
     observed: tuple[ActiveClaim, ...],
@@ -1730,7 +1736,7 @@ def _resolve_identity_race(
 
 
 def _resolve_resource_race(
-    client: IssueComments,
+    client: ClaimWriter,
     request: ClaimRequest,
     own: ActiveClaim,
     observed: tuple[ActiveClaim, ...],
@@ -1764,7 +1770,7 @@ def _resolve_resource_race(
 
 
 def _acquire_claim_with_observed(
-    client: IssueComments, request: ClaimRequest
+    client: ClaimWriter, request: ClaimRequest
 ) -> tuple[ActiveClaim, tuple[ActiveClaim, ...]]:
     """`acquire_claim`, plus the active claims its own post-mutation race check already read.
 
@@ -1822,7 +1828,7 @@ def _combined_scope(
 
 
 def _observe_rescoped_claim(
-    client: IssueComments,
+    client: ClaimReader,
     identity: ClaimIdentity,
     selected: ActiveClaim,
     expected_scope: tuple[str, ...],
@@ -1907,7 +1913,7 @@ def _select_rescope_claim(
 
 
 def rescope_claim(  # noqa: PLR0913, PLR0917  # protocol/board slice, #103
-    client: IssueComments,
+    client: ClaimWriter,
     identity: ClaimIdentity,
     agent: str,
     add: tuple[str, ...],
@@ -1974,7 +1980,7 @@ def _claims_for_identity(
 
 
 def release_claim(  # noqa: PLR0913, PLR0917  # protocol/board slice, #103
-    client: IssueComments,
+    client: ClaimWriter,
     identity: ClaimIdentity,
     agent: str,
     role: str | None,
@@ -2019,7 +2025,7 @@ def release_claim(  # noqa: PLR0913, PLR0917  # protocol/board slice, #103
 
 
 def supersede_ledger(  # noqa: PLR0913, PLR0917  # protocol/board slice, #103
-    client: IssueComments,
+    client: ClaimWriter,
     successor_issue: int,
     agent: str,
     role: str,

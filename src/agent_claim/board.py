@@ -176,19 +176,6 @@ class PullRequest:
 
 
 @dataclass(frozen=True)
-class PullRequestDetail:
-    """One pull request read for its own sake, rather than for the board's stages."""
-
-    number: int
-    body: str
-    base_ref_name: str
-    head_ref_name: str
-    head_repository: str
-    author: str
-    merged: bool
-
-
-@dataclass(frozen=True)
 class IssueReference:
     """One issue, always qualified: a same-repository `#n` is resolved at parse time."""
 

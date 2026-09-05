@@ -23,14 +23,12 @@ from agent_claim.cli import (
     ClaimUnavailableError,
     DuplicateClaimConflictError,
     DuplicateClaimRepair,
-    GitHubIssueComments,
     InvalidClaimMarkerError,
     IssueComment,
     IssueIdentity,
     LaneIdentity,
     LedgerSupersede,
     LedgerSupersededError,
-    _repository,
     _status,
     acquire_claim,
     active_claims,
@@ -52,6 +50,7 @@ from agent_claim.cli import (
 
 issue_claim.configure_ledger(71)
 LEDGER_ISSUE = 71
+GitHubForge = github.GitHubForge
 
 _LIVE_VERSIONED_PATHS = checkout.versioned_paths
 _LIVE_TRUNK_LANDING_TIMES = checkout.trunk_landing_times
@@ -87,11 +86,11 @@ def ledger_client(
     rows: list[dict[str, object]],
     *,
     open_issue_count: int | None = None,
-) -> tuple[GitHubIssueComments, list[list[str]]]:
+) -> tuple[GitHubForge, list[list[str]]]:
     """`open_issue_count` defaults to the open rows actually served, i.e. a
     fetch discovery can trust; pass a different number to simulate an issue
     opening or closing while a snapshot was mid-fetch."""
-    client = GitHubIssueComments("example/agent-claim")
+    client = GitHubForge(github._repository_id("example/agent-claim"))
     observed: list[list[str]] = []
     open_rows = [row for row in rows if row["state"] == "open"]
     trustworthy_count = len(open_rows) if open_issue_count is None else open_issue_count
@@ -173,7 +172,7 @@ def test_bootstrap_repairs_trusted_legacy_marker_and_closes_later_duplicate(
 def test_bootstrap_creates_and_locks_a_ledger_when_none_exists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = GitHubIssueComments("example/agent-claim")
+    client = GitHubForge(github._repository_id("example/agent-claim"))
     created = False
     observed: list[list[str]] = []
 
@@ -299,7 +298,7 @@ def test_discovery_reports_absence_after_a_single_page_fallback_scan(
 def test_discovery_fetch_failure_propagates_loudly_without_bootstrap_advice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = GitHubIssueComments("example/agent-claim")
+    client = GitHubForge(github._repository_id("example/agent-claim"))
 
     def failing_run(arguments: list[str], *, input_data: bytes | None = None) -> str:
         raise ClaimError("GitHub issue coordination failed with exit 1")
@@ -371,8 +370,8 @@ def projected_board(*positional, repository: str = REPOSITORY, **keyword) -> boa
     return board.build_board(*positional, repository=repository, **keyword)
 
 
-def _claims_client(*standing: ClaimRequest) -> FakeComments:
-    return FakeComments(
+def _claims_client(*standing: ClaimRequest) -> FakeForge:
+    return FakeForge(
         {
             LEDGER_ISSUE: [
                 comment(index, claim_comment(claimed))
@@ -383,7 +382,7 @@ def _claims_client(*standing: ClaimRequest) -> FakeComments:
 
 
 @dataclass
-class FakeComments:
+class FakeForge:
     comments: dict[int, list[IssueComment]] = field(default_factory=dict)
     labels: set[int] = field(default_factory=set)
     other_labels: dict[str, set[int]] = field(default_factory=dict)
@@ -399,13 +398,18 @@ class FakeComments:
     board_open_pull_requests: tuple[board.PullRequest, ...] = ()
     board_merged_pull_requests: tuple[board.PullRequest, ...] = ()
     board_blocker_references: tuple[board.BlockerReference, ...] | None = None
-    repository: str = REPOSITORY
+    repository: forge.RepositoryId = field(
+        default_factory=lambda: github._repository_id(REPOSITORY)
+    )
     default_branch_name: str = "main"
-    pull_requests: dict[int, board.PullRequestDetail] = field(default_factory=dict)
+    landings: dict[int, forge.Landing] = field(default_factory=dict)
     parents: dict[int, board.ParentIssue] = field(default_factory=dict)
-    open_children: dict[int, tuple[board.IssueReference, ...]] = field(default_factory=dict)
+    children: dict[int, tuple[board.IssueReference, ...]] = field(default_factory=dict)
     closed_issues: set[int] = field(default_factory=set)
     issue_reference_lookups: list[int] = field(default_factory=list)
+
+    def capability(self, operation: forge.ForgeOperation) -> forge.Capability:
+        return github.GITHUB_CAPABILITIES[operation]
 
     def list_protocol_candidates(self, issue: int) -> tuple[IssueComment, ...]:
         return tuple(
@@ -471,16 +475,16 @@ class FakeComments:
     def list_open_board_issues(self) -> tuple[board.Issue, ...]:
         return self.board_issues
 
-    def pull_request_detail(self, number: int) -> board.PullRequestDetail:
-        detail = self.pull_requests.get(number)
+    def landing(self, number: int) -> forge.Landing:
+        detail = self.landings.get(number)
         if detail is None:
             raise ClaimError(f"GitHub has no pull request #{number}")
         return detail
 
-    def issue_reference_json(self, number: int) -> str:
+    def item_reference(self, number: int) -> forge.ItemReference:
         self.issue_reference_lookups.append(number)
-        state = "closed" if number in self.closed_issues else "open"
-        return json.dumps({"state": state, "title": "", "body": ""})
+        state = forge.ItemState.CLOSED if number in self.closed_issues else forge.ItemState.OPEN
+        return forge.ItemReference(state, "", "")
 
     def default_branch(self) -> str:
         return self.default_branch_name
@@ -488,8 +492,8 @@ class FakeComments:
     def parent_issue(self, number: int) -> board.ParentIssue | None:
         return self.parents.get(number)
 
-    def open_sub_issues(self, number: int) -> tuple[board.IssueReference, ...]:
-        return self.open_children.get(number, ())
+    def open_children(self, number: int) -> tuple[board.IssueReference, ...]:
+        return self.children.get(number, ())
 
     def list_board_blockers(self, numbers: frozenset[int]) -> tuple[board.BlockerReference, ...]:
         if self.board_blocker_references is not None:
@@ -579,6 +583,74 @@ class FakeComments:
                     entries[index] = replace(entry, body=body, updated_at=edited_at)
                     return
         raise ClaimError(f"comment {comment_id} not found for neutralization")
+
+
+class ReaderOnlyForge(FakeForge):
+    """A `FakeForge` whose write operations fail the test instead of quietly
+    succeeding -- the enforcement that a read-only command never writes,
+    independent of the `ForgeReader`/`ForgeWriter` annotations (documentation
+    only; nothing type-checks in CI)."""
+
+    def post_comment(self, issue: int, body: str) -> str:
+        pytest.fail("a read-only command must never post a comment")
+
+    def add_label(self, issue: int, label: str) -> None:
+        pytest.fail("a read-only command must never add a label")
+
+    def remove_label(self, issue: int, label: str) -> None:
+        pytest.fail("a read-only command must never remove a label")
+
+    def upsert_projection(
+        self,
+        issue: int,
+        body: str,
+        *,
+        create: bool = True,
+        adopt_stale: bool = False,
+    ) -> bool:
+        pytest.fail("a read-only command must never upsert a projection")
+
+    def neutralize_claim_comment(self, comment_id: int, body: str) -> None:
+        pytest.fail("a read-only command must never neutralize a comment")
+
+
+def test_forge_operation_exhaustiveness_matches_the_declared_reader_and_writer_methods() -> None:
+    """Every `ForgeOperation` member names a `ForgeReader`/`ForgeWriter` method and
+    nothing else; the count is pinned so a new operation cannot be added without
+    its enum member, its capability entry, and this count bump."""
+    declared_methods = {
+        name
+        for name in dir(forge.ForgeWriter)
+        if not name.startswith("_") and name not in {"repository", "capability"}
+    }
+    assert {operation.value for operation in forge.ForgeOperation} == declared_methods
+    assert len(forge.ForgeOperation) == 17
+    assert set(github.GITHUB_CAPABILITIES) == set(forge.ForgeOperation)
+    assert forge.Capability.UNSUPPORTED not in github.GITHUB_CAPABILITIES.values()
+
+
+def test_read_only_commands_never_write_through_a_reader_only_forge(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    claimed = comment(1, claim_comment(request("cli-claim", issue=72, scope=("src",))))
+    client = ReaderOnlyForge({LEDGER_ISSUE: [claimed]}, {72})
+    client.board_issues = (board_issue(72, "Work", complete_contract("Ship it.")),)
+    client.landings[12] = landing_pull_request(body="Work-Item: #72\n\nCloses #72")
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    monkeypatch.setattr(checkout, "_git_output", lambda _arguments: "")
+    monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
+
+    for argv in (
+        ["status"],
+        ["board"],
+        ["next"],
+        ["who", "src"],
+        ["rulings"],
+        ["pr-check", "--pr", "12"],
+    ):
+        issue_claim.main(["--repo", REPOSITORY, *argv])
+        capsys.readouterr()
 
 
 def test_board_projects_fixture_json_without_github_writes(
@@ -677,7 +749,7 @@ def test_board_projects_fixture_json_without_github_writes(
         "author_association": "OWNER",
         "html_url": "https://github.com/example/agent-claim/issues/71#issuecomment-1",
     }
-    client = GitHubIssueComments("example/agent-claim")
+    client = GitHubForge(github._repository_id("example/agent-claim"))
     observed: list[list[str]] = []
 
     def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
@@ -716,7 +788,7 @@ def test_board_projects_fixture_json_without_github_writes(
             return cls(2026, 8, 21, tzinfo=UTC)
 
     monkeypatch.setattr(client, "_run", run)
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(issue_claim, "datetime", FixedDateTime)
     monkeypatch.setattr(github, "datetime", FixedDateTime)
@@ -799,7 +871,7 @@ def test_board_shows_open_and_total_instead_of_proposed(
     monkeypatch.setattr(client, "list_open_board_issues", lambda: issues)
     monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
     monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
     monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
@@ -990,13 +1062,13 @@ def _configured_board_client(
     open_issues: tuple[board.Issue, ...] = (),
     open_pull_requests: tuple[board.PullRequest, ...] = (),
     standing: tuple[ClaimRequest, ...] = (),
-) -> FakeComments:
-    """A `FakeComments` client wired the way every board-reading claim test needs."""
+) -> FakeForge:
+    """A `FakeForge` client wired the way every board-reading claim test needs."""
     client = _claims_client(*standing)
     monkeypatch.setattr(client, "list_open_board_issues", lambda: open_issues)
     monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: open_pull_requests)
     monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
     monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
@@ -1016,13 +1088,13 @@ def open_blocker_references() -> Callable[[frozenset[int]], tuple[board.BlockerR
 
 def _stub_issue_reference(
     monkeypatch: pytest.MonkeyPatch,
-    states: dict[int, tuple[issue_claim.ReferenceState, str, str]],
+    states: dict[int, tuple[forge.ItemState, str, str]],
 ) -> None:
     """Overrides the autouse OPEN default for exactly the given issue numbers."""
 
-    def fetch(client: object, number: int) -> issue_claim._IssueReference:
+    def fetch(client: object, number: int) -> forge.ItemReference:
         state, title, body = states[number]
-        return issue_claim._IssueReference(state, title, body)
+        return forge.ItemReference(state, title, body)
 
     monkeypatch.setattr(issue_claim, "_fetch_issue_reference", fetch)
 
@@ -1106,7 +1178,7 @@ def test_next_reports_the_highest_scored_actionable_item(
     monkeypatch.setattr(client, "list_open_board_issues", lambda: issues)
     monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
     monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
     monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
@@ -1197,7 +1269,7 @@ def test_next_reports_expectation_state(
     monkeypatch.setattr(client, "list_open_board_issues", lambda: (issue,))
     monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
     monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
     monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
@@ -1229,7 +1301,7 @@ def test_next_pulls_an_unruled_item_and_names_only_unworkable_ones_as_skipped(
     monkeypatch.setattr(client, "list_open_board_issues", lambda: (unruled, blocked, claimed))
     monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
     monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
     monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
@@ -1481,7 +1553,7 @@ def test_release_ignores_body_contract_defects(
     monkeypatch.setattr(
         client, "list_open_board_issues", lambda: pytest.fail("release checks no body")
     )
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
 
     assert (
@@ -1522,7 +1594,7 @@ def test_claim_refuses_when_the_higher_priority_item_needs_refining(
     monkeypatch.setattr(client, "list_open_board_issues", lambda: (ready, unruled, waiting))
     monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
     monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
     monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
@@ -1629,7 +1701,7 @@ def test_claim_refuses_out_of_order_without_a_reason_before_mutating(
     monkeypatch.setattr(client, "list_open_board_issues", lambda: issues)
     monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
     monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
     monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
@@ -1673,7 +1745,7 @@ def test_claim_allows_out_of_order_with_a_reason_and_records_it(
     monkeypatch.setattr(client, "list_open_board_issues", lambda: issues)
     monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
     monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
     monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
@@ -1725,7 +1797,7 @@ def test_claim_refuses_for_a_higher_priority_item_even_at_a_lower_score(
     )
     monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: (open_pull_request,))
     monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
     monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
@@ -1830,8 +1902,8 @@ def test_claim_does_not_require_out_of_order_for_the_top_ranked_item(
 @pytest.mark.parametrize(
     ("state", "check", "expected_text"),
     [
-        (issue_claim.ReferenceState.CLOSED, "closed-issue", "issue #72 is closed"),
-        (issue_claim.ReferenceState.MISSING, "missing-issue", "issue #72 does not exist here"),
+        (forge.ItemState.CLOSED, "closed-issue", "issue #72 is closed"),
+        (forge.ItemState.MISSING, "missing-issue", "issue #72 does not exist here"),
     ],
     ids=["closed", "missing"],
 )
@@ -1839,7 +1911,7 @@ def test_claim_refuses_a_closed_or_missing_target(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     tmp_path: Path,
-    state: issue_claim.ReferenceState,
+    state: forge.ItemState,
     check: str,
     expected_text: str,
 ) -> None:
@@ -1875,7 +1947,7 @@ def test_claim_json_refusal_carries_refused_issue_and_checks(
     tmp_path: Path,
 ) -> None:
     client = _configured_board_client(monkeypatch, tmp_path)
-    _stub_issue_reference(monkeypatch, {72: (issue_claim.ReferenceState.CLOSED, "Title", "")})
+    _stub_issue_reference(monkeypatch, {72: (forge.ItemState.CLOSED, "Title", "")})
     monkeypatch.setattr(
         issue_claim, "_request", lambda _arguments: request(issue=72, scope=("src/work.py",))
     )
@@ -2479,7 +2551,7 @@ def test_next_skips_a_frozen_item_and_names_it_as_such(
     monkeypatch.setattr(client, "list_open_board_issues", lambda: (frozen, lower))
     monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
     monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
     monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
@@ -2515,7 +2587,7 @@ def test_claim_does_not_warn_about_a_frozen_higher_scored_item(
     monkeypatch.setattr(client, "list_open_board_issues", lambda: (frozen, lower))
     monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
     monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
     monkeypatch.setattr(checkout, "trunk_landing_times", lambda: ())
@@ -2598,7 +2670,7 @@ def test_board_reads_priority_configuration_from_the_checkout_root(
         return str(toplevel)
 
     class BoardClient:
-        repository = REPOSITORY
+        repository = github._repository_id(REPOSITORY)
 
         def list_open_board_issues(self) -> tuple[board.Issue, ...]:
             return (
@@ -3030,7 +3102,7 @@ def test_board_queries_merged_pull_requests_back_to_the_oldest_open_issue(
     observed_since: list[datetime] = []
 
     class BoardClient:
-        repository = REPOSITORY
+        repository = github._repository_id(REPOSITORY)
 
         def list_open_board_issues(self) -> tuple[board.Issue, ...]:
             return (old_epic, recent_issue)
@@ -3069,7 +3141,7 @@ def test_board_loads_each_distinct_blocker_once(
     observed: list[frozenset[int]] = []
 
     class BoardClient:
-        repository = REPOSITORY
+        repository = github._repository_id(REPOSITORY)
 
         def list_open_board_issues(self) -> tuple[board.Issue, ...]:
             return (first, second)
@@ -3438,11 +3510,11 @@ def test_edited_protocol_comment_fails_loud() -> None:
 
 
 def test_fake_neutralize_claim_comment_bumps_updated_at_like_a_real_patch() -> None:
-    """`FakeComments.neutralize_claim_comment` must mirror the real PATCH's effect on
+    """`FakeForge.neutralize_claim_comment` must mirror the real PATCH's effect on
     `updated_at`, so a comment edit that keeps a claim-marker-shaped first line still
     trips the "was edited after publication" guard in tests, not only in production."""
     claimed = comment(1, claim_comment(request()))
-    client = FakeComments({LEDGER_ISSUE: [claimed]})
+    client = FakeForge({LEDGER_ISSUE: [claimed]})
 
     client.neutralize_claim_comment(1, claimed.body)
 
@@ -3796,7 +3868,7 @@ def test_supersede_is_an_inert_rejected_event_while_another_lane_is_active() -> 
 
 
 def test_supersede_command_posts_terminal_event_and_observes_freeze() -> None:
-    client = FakeComments(valid_successors={170})
+    client = FakeForge(valid_successors={170})
     acquired = acquire_claim(client, request(issue=LEDGER_ISSUE))
 
     selected = supersede_ledger(
@@ -3816,7 +3888,7 @@ def test_supersede_command_posts_terminal_event_and_observes_freeze() -> None:
 
 
 def test_supersede_race_loses_cleanly_without_poisoning_the_ledger() -> None:
-    client = FakeComments(valid_successors={170})
+    client = FakeForge(valid_successors={170})
     acquired = acquire_claim(
         client,
         request(issue=LEDGER_ISSUE, scope=("docs",)),
@@ -3843,7 +3915,7 @@ def test_supersede_race_loses_cleanly_without_poisoning_the_ledger() -> None:
 
 
 def test_supersede_label_failure_can_be_retried_without_reposting_event() -> None:
-    client = FakeComments(valid_successors={170}, fail_remove_label=True)
+    client = FakeForge(valid_successors={170}, fail_remove_label=True)
     acquired = acquire_claim(client, request(issue=LEDGER_ISSUE))
 
     with pytest.raises(ClaimError, match="label remove failed"):
@@ -3874,7 +3946,7 @@ def test_supersede_label_failure_can_be_retried_without_reposting_event() -> Non
 
 
 def test_supersede_refuses_an_unverified_successor_before_posting() -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquired = acquire_claim(client, request(issue=LEDGER_ISSUE))
     protocol_count = len(client.list_protocol_candidates(LEDGER_ISSUE))
 
@@ -3892,7 +3964,7 @@ def test_supersede_refuses_an_unverified_successor_before_posting() -> None:
 
 
 def test_supersede_requires_a_higher_numbered_successor() -> None:
-    client = FakeComments(valid_successors={70})
+    client = FakeForge(valid_successors={70})
     acquired = acquire_claim(client, request(issue=LEDGER_ISSUE))
     protocol_count = len(client.list_protocol_candidates(LEDGER_ISSUE))
 
@@ -3988,7 +4060,7 @@ def test_comma_joined_scope_on_another_issue_is_an_overlap_note_not_a_refusal() 
             }
         ),
     )
-    client = FakeComments({LEDGER_ISSUE: [incumbent]}, {72})
+    client = FakeForge({LEDGER_ISSUE: [incumbent]}, {72})
 
     acquired = acquire_claim(
         client,
@@ -4124,7 +4196,7 @@ def test_status_scope_index_never_rescans_scope_pairs(
 
 def test_existing_scope_on_another_issue_is_posted_as_an_overlap() -> None:
     incumbent = comment(1, claim_comment(request(issue=71, scope=("shared",))))
-    client = FakeComments({LEDGER_ISSUE: [incumbent]}, {71})
+    client = FakeForge({LEDGER_ISSUE: [incumbent]}, {71})
 
     acquired = acquire_claim(
         client,
@@ -4136,7 +4208,7 @@ def test_existing_scope_on_another_issue_is_posted_as_an_overlap() -> None:
 
 
 def test_rescope_adds_a_path_without_changing_claim_id_or_base() -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquired = acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
 
     updated = rescope_claim(
@@ -4158,7 +4230,7 @@ def test_rescope_adds_a_path_without_changing_claim_id_or_base() -> None:
 
 
 def test_rescope_drop_and_add_replace_paths_atomically() -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquired = acquire_claim(client, request(issue=72, scope=("src/old.py", "src/keep.py")))
 
     updated = rescope_claim(
@@ -4175,7 +4247,7 @@ def test_rescope_drop_and_add_replace_paths_atomically() -> None:
 
 
 def test_rescope_adds_a_path_held_by_another_issue() -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
     other = acquire_claim(
         client, request("claim-b", "Grok 4.6", issue=73, scope=("docs/PRODUCT.md",))
@@ -4248,7 +4320,7 @@ def test_rescope_adds_a_held_path_when_the_remainder_already_overlaps() -> None:
 
 
 def test_rescope_refuses_dropping_a_path_it_does_not_hold() -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
 
     identity = IssueIdentity(72)
@@ -4264,7 +4336,7 @@ def test_rescope_refuses_dropping_a_path_it_does_not_hold() -> None:
 
 
 def test_rescope_refuses_an_empty_or_unchanged_scope() -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
 
     identity = IssueIdentity(72)
@@ -4290,7 +4362,7 @@ def test_rescope_refuses_an_empty_or_unchanged_scope() -> None:
 
 
 def test_rescope_refuses_a_foreign_agent() -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
 
     identity = IssueIdentity(72)
@@ -4323,7 +4395,7 @@ def test_rescope_refuses_a_foreign_agent() -> None:
 def test_rescope_keeps_an_added_path_that_another_claim_also_holds(
     competitor_id: str, created_at: str
 ) -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
     competitor = comment(
         50,
@@ -4378,7 +4450,7 @@ def test_who_refuses_a_comma_joined_path() -> None:
 
 
 def test_disjoint_issues_can_be_claimed_and_are_projected() -> None:
-    client = FakeComments()
+    client = FakeForge()
 
     first = acquire_claim(client, request(issue=72, scope=("frontend",)))
     second = acquire_claim(
@@ -4408,7 +4480,7 @@ def test_owning_issue_projection_uses_the_configured_ledger_number(
 
 def test_same_issue_refuses_a_second_claim_even_with_disjoint_scope() -> None:
     incumbent = comment(1, claim_comment(request(issue=72, scope=("frontend",))))
-    client = FakeComments({LEDGER_ISSUE: [incumbent]}, {72})
+    client = FakeForge({LEDGER_ISSUE: [incumbent]}, {72})
 
     raised_argument_1 = request("claim-b", "Grok 4.6", issue=72, scope=("src",))
     with pytest.raises(ClaimUnavailableError, match="issue #72"):
@@ -4419,7 +4491,7 @@ def test_same_issue_refuses_a_second_claim_even_with_disjoint_scope() -> None:
 
 
 def test_same_lane_refuses_a_second_claim_even_with_disjoint_scope() -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquire_claim(client, request(lane=True, branch="docs/lane-a", scope=("frontend",)))
 
     raised_argument_1 = request(
@@ -4433,7 +4505,7 @@ def test_same_lane_refuses_a_second_claim_even_with_disjoint_scope() -> None:
 
 
 def test_lane_and_issue_claim_with_overlapping_scope_both_stay_live() -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquire_claim(client, request(issue=72, scope=("shared",)))
 
     lane = acquire_claim(
@@ -4447,7 +4519,7 @@ def test_lane_and_issue_claim_with_overlapping_scope_both_stay_live() -> None:
 
 def test_acquire_claim_refuses_reusing_an_active_claim_id_before_posting() -> None:
     incumbent = comment(1, claim_comment(request("claim-a", issue=72, scope=("old",))))
-    client = FakeComments({LEDGER_ISSUE: [incumbent]}, {72})
+    client = FakeForge({LEDGER_ISSUE: [incumbent]}, {72})
 
     raised_argument_1 = request("claim-a", "Codex Sol", issue=72, scope=("old", "new"))
     with pytest.raises(ClaimUnavailableError, match="claim id 'claim-a' is already"):
@@ -4464,7 +4536,7 @@ def test_acquire_claim_refuses_reusing_a_released_claim_id_before_posting() -> N
     claimed = parse_claim_event(comment(1, claimed_body))
     assert claimed is not None
     entries = [comment(1, claimed_body), comment(2, release_event(claimed))]
-    client = FakeComments({LEDGER_ISSUE: list(entries)})
+    client = FakeForge({LEDGER_ISSUE: list(entries)})
 
     raised_argument_1 = request("claim-a", "Grok 4.6", issue=73, scope=("fresh",))
     with pytest.raises(ClaimUnavailableError, match="claim id 'claim-a' is already"):
@@ -4477,7 +4549,7 @@ def test_acquire_claim_refuses_reusing_a_released_claim_id_before_posting() -> N
 
 
 def test_acquire_claim_translates_a_same_claim_id_post_race_into_a_clear_error() -> None:
-    client = FakeComments()
+    client = FakeForge()
     client.inject_after_next_ledger_post = comment(
         2,
         claim_comment(request("claim-a", "Grok 4.6", issue=73, scope=("elsewhere",))),
@@ -4489,7 +4561,7 @@ def test_acquire_claim_translates_a_same_claim_id_post_race_into_a_clear_error()
 
 
 def test_cross_issue_scope_race_keeps_both_overlapping_claims() -> None:
-    client = FakeComments()
+    client = FakeForge()
     earlier = comment(
         100,
         claim_comment(request("earlier", "Grok 4.6", issue=72, scope=("shared/file.py",))),
@@ -4508,7 +4580,7 @@ def test_cross_issue_scope_race_keeps_both_overlapping_claims() -> None:
 
 
 def test_release_removes_projection_only_after_claim_is_gone() -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquired = acquire_claim(client, request(issue=72))
     projection_id = client.comments[72][0].identifier
 
@@ -4530,7 +4602,7 @@ def test_release_removes_projection_only_after_claim_is_gone() -> None:
 
 
 def test_release_reconciliation_keeps_a_successor_claim_projection_active() -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquired = acquire_claim(client, request(issue=72, scope=("old",)))
     successor = comment(
         4,
@@ -4557,7 +4629,7 @@ def test_release_reconciliation_keeps_a_successor_claim_projection_active() -> N
 
 
 def test_projection_is_minimal_and_reuses_one_trusted_comment() -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquired = acquire_claim(client, request(issue=72, scope=("private/path",)))
     first_projection = client.comments[72][0]
     duplicate = replace(first_projection, identifier=first_projection.identifier + 100)
@@ -4574,7 +4646,7 @@ def test_projection_is_minimal_and_reuses_one_trusted_comment() -> None:
 
 
 def test_reconcile_does_not_create_projection_for_never_claimed_issue() -> None:
-    client = FakeComments()
+    client = FakeForge()
 
     reconcile_issue_label(client, 999)
 
@@ -4594,7 +4666,7 @@ def test_successor_adopts_old_projection_but_old_helper_cannot_mutate_it(
     monkeypatch.setattr(protocol, "LEDGER_ISSUE", 71)
     old_projection = comment(1, issue_claim._unclaimed_projection())
     old_duplicate = replace(old_projection, identifier=2)
-    client = FakeComments({72: [old_projection, old_duplicate]})
+    client = FakeForge({72: [old_projection, old_duplicate]})
 
     monkeypatch.setattr(protocol, "LEDGER_ISSUE", 170)
     successor_body = issue_claim._active_projection(
@@ -4622,7 +4694,7 @@ def test_successor_adopts_old_projection_but_old_helper_cannot_mutate_it(
 
 
 def test_release_refuses_foreign_actor_without_explicit_override() -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquired = acquire_claim(client, request(issue=72))
 
     identity = IssueIdentity(72)
@@ -4788,7 +4860,7 @@ def test_release_claim_omitted_id_requires_branch_and_does_not_call_git(
 def test_release_claim_override_fails_before_ledger_without_the_coordinator_role(
     role: str | None,
 ) -> None:
-    client = FakeComments()
+    client = FakeForge()
 
     identity = IssueIdentity(72)
     with pytest.raises(ClaimUnavailableError, match="--role coordinator"):
@@ -4814,7 +4886,7 @@ def test_label_reconciliation_heals_claim_posted_during_release_remove() -> None
         3,
         claim_comment(request("new", issue=72, scope=("new",))),
     )
-    client = FakeComments(
+    client = FakeForge(
         {LEDGER_ISSUE: [comment(1, old_claim_body), comment(2, release_body)]},
         {72},
         inject_during_next_remove=new_claim_comment,
@@ -4829,7 +4901,7 @@ def test_label_reconciliation_heals_claim_posted_during_release_remove() -> None
 
 
 def test_label_failure_is_loud_while_comment_truth_remains() -> None:
-    client = FakeComments(fail_add_label=True)
+    client = FakeForge(fail_add_label=True)
 
     raised_argument_1 = request(issue=72)
     with pytest.raises(ClaimError, match="label add failed"):
@@ -4843,7 +4915,7 @@ def test_label_failure_is_loud_while_comment_truth_remains() -> None:
 
 def test_reconcile_all_repairs_active_and_stale_labels() -> None:
     active = comment(1, claim_comment(request(issue=72)))
-    client = FakeComments({LEDGER_ISSUE: [active]}, {73})
+    client = FakeForge({LEDGER_ISSUE: [active]}, {73})
 
     observed = reconcile_all_labels(client)
 
@@ -4854,7 +4926,7 @@ def test_reconcile_all_repairs_active_and_stale_labels() -> None:
 def test_reconcile_labels_the_ledger_when_it_carries_no_label_yet() -> None:
     """Discovery trusts LEDGER_LABEL on the ledger issue to answer atomically
     (#74); reconcile is what backfills it onto an older, unlabelled ledger."""
-    client = FakeComments()
+    client = FakeForge()
 
     reconcile_all_labels(client)
 
@@ -4866,7 +4938,7 @@ def test_reconcile_all_labels_ignores_lane_claims_on_a_mixed_ledger(
 ) -> None:
     """A lane claim owns no GitHub issue, so reconcile must never label or project
     it — only the issue claim on the same mixed ledger keeps its usual behaviour."""
-    client = FakeComments()
+    client = FakeForge()
     acquire_claim(client, request(issue=72, scope=("backend",)))
     acquire_claim(
         client,
@@ -4912,7 +4984,7 @@ def test_reconcile_all_labels_ignores_lane_claims_on_a_mixed_ledger(
 def test_reconcile_repairs_a_duplicate_claim_id_and_restores_strict_reads() -> None:
     older_body = claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("old",)))
     newer_body = claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("new",)))
-    client = FakeComments({LEDGER_ISSUE: [comment(1, older_body), comment(2, newer_body)]})
+    client = FakeForge({LEDGER_ISSUE: [comment(1, older_body), comment(2, newer_body)]})
 
     raised_argument_1 = client.list_protocol_candidates(LEDGER_ISSUE)
     with pytest.raises(InvalidClaimMarkerError, match="was reused"):
@@ -4961,7 +5033,7 @@ def test_repair_duplicate_claims_only_auto_resolves_the_safe_cases(
             claim_comment(request("claim-a", newer_agent, issue=72, scope=("new",))),
         )
     )
-    client = FakeComments({LEDGER_ISSUE: entries})
+    client = FakeForge({LEDGER_ISSUE: entries})
 
     if not expect_repaired:
         before = list(client.comments[LEDGER_ISSUE])
@@ -5004,7 +5076,7 @@ def test_repair_duplicate_claims_ignores_an_inert_ledger_supersede_as_a_release(
     reused = comment(
         4, claim_comment(request("claim-a", "Grok 4.6", issue=LEDGER_ISSUE, scope=("new",)))
     )
-    client = FakeComments({LEDGER_ISSUE: [original, other_active_claim, inert_supersede, reused]})
+    client = FakeForge({LEDGER_ISSUE: [original, other_active_claim, inert_supersede, reused]})
     before = list(client.comments[LEDGER_ISSUE])
 
     with pytest.raises(DuplicateClaimConflictError, match="claim id 'claim-a'"):
@@ -5022,7 +5094,7 @@ def test_repair_duplicate_claims_attributes_a_late_release_to_the_original_occur
     assert isinstance(original_claim, ActiveClaim)
     duplicate = comment(2, claim_comment(request("claim-a", "Grok 4.6", issue=73, scope=("new",))))
     late_release = comment(3, release_event(original_claim))
-    client = FakeComments({LEDGER_ISSUE: [original, duplicate, late_release]})
+    client = FakeForge({LEDGER_ISSUE: [original, duplicate, late_release]})
 
     repaired = repair_duplicate_claims(client)
 
@@ -5068,7 +5140,7 @@ def test_repair_duplicate_claims_neutralizes_every_honored_terminal_comment(
     first_release = comment(2, release_event(original_claim))
     second_release = comment(3, second_release_body(original_claim))
     reused = comment(4, claim_comment(request("claim-a", "Grok 4.6", issue=73, scope=("fresh",))))
-    client = FakeComments({LEDGER_ISSUE: [original, first_release, second_release, reused]})
+    client = FakeForge({LEDGER_ISSUE: [original, first_release, second_release, reused]})
 
     repaired = repair_duplicate_claims(client)
 
@@ -5087,7 +5159,7 @@ def test_repair_duplicate_claims_validates_every_lifecycle_before_writing_any() 
     first = comment(1, claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("old",))))
     middle = comment(2, claim_comment(request("claim-a", "Grok 4.6", issue=72, scope=("mid",))))
     newest = comment(3, claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("new",))))
-    client = FakeComments({LEDGER_ISSUE: [first, middle, newest]})
+    client = FakeForge({LEDGER_ISSUE: [first, middle, newest]})
     before = list(client.comments[LEDGER_ISSUE])
 
     with pytest.raises(DuplicateClaimConflictError, match="claim id 'claim-a'"):
@@ -5109,7 +5181,7 @@ def test_repair_duplicate_claims_leaves_other_duplicate_ids_untouched_when_one_c
     conflict_newer = comment(
         4, claim_comment(request("claim-b", "Grok 4.6", issue=73, scope=("y",)))
     )
-    client = FakeComments({LEDGER_ISSUE: [safe_older, safe_newer, conflict_older, conflict_newer]})
+    client = FakeForge({LEDGER_ISSUE: [safe_older, safe_newer, conflict_older, conflict_newer]})
     before = list(client.comments[LEDGER_ISSUE])
 
     with pytest.raises(DuplicateClaimConflictError, match="claim id 'claim-b'"):
@@ -5124,7 +5196,7 @@ def test_repair_duplicate_claims_same_agent_cross_issue_keeps_only_the_newer_lan
     lane; the older issue's still-active claim is silently ended, not preserved."""
     older = comment(1, claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("old",))))
     newer = comment(2, claim_comment(request("claim-a", "Codex Sol", issue=73, scope=("new",))))
-    client = FakeComments({LEDGER_ISSUE: [older, newer]}, {72, 73})
+    client = FakeForge({LEDGER_ISSUE: [older, newer]}, {72, 73})
 
     repaired = repair_duplicate_claims(client)
 
@@ -5154,7 +5226,7 @@ def test_stale_reconcile_removes_label_when_supersede_wins_midflight() -> None:
             "reviewed rollover ready",
         ),
     )
-    client = FakeComments(
+    client = FakeForge(
         {LEDGER_ISSUE: [comment(1, claimed_body)]},
         inject_during_next_add=frozen,
     )
@@ -5179,7 +5251,7 @@ def test_old_reconcile_clears_only_its_generation_label_after_freeze() -> None:
         "coordinator",
         "reviewed rollover ready",
     )
-    client = FakeComments(
+    client = FakeForge(
         {LEDGER_ISSUE: [comment(1, claimed_body), comment(2, frozen)]},
         {LEDGER_ISSUE, 72},
         {claim_label(170): {170}},
@@ -5201,7 +5273,7 @@ def test_paused_old_release_fails_frozen_without_mutating_successor_projection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(protocol, "LEDGER_ISSUE", 71)
-    client = FakeComments(valid_successors={170})
+    client = FakeForge(valid_successors={170})
     old_claim = acquire_claim(client, request("old", issue=72, scope=("old",)))
     client.post_comment(
         71,
@@ -5311,7 +5383,7 @@ def test_github_comment_reader_fetches_pages_concurrently_until_a_short_page(
         "author_association": "OWNER",
         "html_url": "https://github.com/example/agent-claim/issues/71#issuecomment-12",
     }
-    client = GitHubIssueComments("example/agent-claim")
+    client = GitHubForge(github._repository_id("example/agent-claim"))
     monkeypatch.setattr(github, "COMMENTS_PER_PAGE", 2)
     calls: list[list[str]] = []
 
@@ -5364,7 +5436,7 @@ def test_github_reads_blocker_state_and_pull_request_kind(
     expected_state: board.BlockerState,
     expected_closed_at: datetime | None,
 ) -> None:
-    client = GitHubIssueComments("example/agent-claim")
+    client = GitHubForge(github._repository_id("example/agent-claim"))
     observed: list[list[str]] = []
 
     def run(arguments: list[str]) -> str:
@@ -5402,7 +5474,7 @@ def test_github_reads_blocker_state_and_pull_request_kind(
 def test_github_rejects_blocker_states_the_api_cannot_return(
     monkeypatch: pytest.MonkeyPatch, state: str
 ) -> None:
-    client = GitHubIssueComments("example/agent-claim")
+    client = GitHubForge(github._repository_id("example/agent-claim"))
     monkeypatch.setattr(
         client,
         "_run",
@@ -5417,7 +5489,7 @@ def test_github_rejects_blocker_states_the_api_cannot_return(
 
 
 def test_github_marks_a_missing_blocker_only_after_a_404(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = GitHubIssueComments("example/agent-claim")
+    client = GitHubForge(github._repository_id("example/agent-claim"))
     monkeypatch.setattr(
         client,
         "_run",
@@ -5450,7 +5522,7 @@ def test_github_comment_reader_accepts_pretty_and_ansi_json(
     second = _comment_row(11, "ordinary prose")
     pretty = json.dumps(first, indent=2) + "\n" + json.dumps(second, indent=2)
     colored = f"\x1b[32m{pretty}\x1b[0m"
-    client = GitHubIssueComments("example/agent-claim")
+    client = GitHubForge(github._repository_id("example/agent-claim"))
     monkeypatch.setattr(client, "_run", lambda arguments: colored)
 
     observed = client.list_protocol_candidates(71)
@@ -5465,7 +5537,7 @@ def test_github_comment_reader_accepts_concatenated_pretty_json_objects(
     first = _comment_row(10, claim_comment(request()))
     second = _comment_row(11, claim_comment(request("claim-b", issue=72)))
     raw = json.dumps(first, indent=2) + json.dumps(second, indent=2)
-    client = GitHubIssueComments("example/agent-claim")
+    client = GitHubForge(github._repository_id("example/agent-claim"))
     monkeypatch.setattr(client, "_run", lambda arguments: raw)
 
     observed = client.list_protocol_candidates(71)
@@ -5486,6 +5558,10 @@ def test_bounded_command_sets_github_quiet_environment() -> None:
     assert observed.splitlines() == ["1", "1"]
 
 
+def _unreachable_remote_url() -> str:
+    pytest.fail("gh answered; the git remote fallback must not run")
+
+
 def test_repository_resolution_uses_github_quiet_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5499,12 +5575,27 @@ def test_repository_resolution_uses_github_quiet_environment(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert _repository(None) == "owner/repository"
+    resolved = github.discover_repository(None, remote_url=_unreachable_remote_url)
+
+    assert resolved == forge.RepositoryId(github.GITHUB_HOST, ("owner",), "repository")
     assert observed["command"][0] == "gh"
     env = observed["env"]
     assert isinstance(env, dict)
     assert env["NO_COLOR"] == "1"
     assert env["GH_NO_UPDATE_NOTIFIER"] == "1"
+
+
+def test_origin_remote_url_reads_the_git_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def git(arguments: list[str]) -> str:
+        calls.append(arguments)
+        return "git@github.com:owner/repository.git"
+
+    monkeypatch.setattr(checkout, "_git_output", git)
+
+    assert checkout.origin_remote_url() == "git@github.com:owner/repository.git"
+    assert calls == [["config", "--get", "remote.origin.url"]]
 
 
 def test_fake_and_github_adapters_expose_only_common_protocol_candidates(
@@ -5513,7 +5604,7 @@ def test_fake_and_github_adapters_expose_only_common_protocol_candidates(
     trusted = comment(1, claim_comment(request()))
     prose = comment(2, "ordinary prose")
     untrusted = comment(3, claim_comment(request("untrusted")), association="NONE")
-    fake = FakeComments({LEDGER_ISSUE: [trusted, prose, untrusted]})
+    fake = FakeForge({LEDGER_ISSUE: [trusted, prose, untrusted]})
     assert fake.list_protocol_candidates(LEDGER_ISSUE) == (trusted,)
 
     rows = [
@@ -5527,10 +5618,10 @@ def test_fake_and_github_adapters_expose_only_common_protocol_candidates(
         }
         for entry in (trusted, prose, untrusted)
     ]
-    github = GitHubIssueComments("example/agent-claim")
-    monkeypatch.setattr(github, "_run", lambda arguments: "\n".join(map(json.dumps, rows)))
+    real_client = GitHubForge(github._repository_id("example/agent-claim"))
+    monkeypatch.setattr(real_client, "_run", lambda arguments: "\n".join(map(json.dumps, rows)))
 
-    assert github.list_protocol_candidates(LEDGER_ISSUE) == (trusted,)
+    assert real_client.list_protocol_candidates(LEDGER_ISSUE) == (trusted,)
 
 
 def test_comment_size_is_bounded_before_any_adapter_post() -> None:
@@ -5544,7 +5635,7 @@ def test_comment_size_is_bounded_before_any_adapter_post() -> None:
 def test_github_comment_body_uses_stdin_instead_of_process_argument(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = GitHubIssueComments("example/agent-claim")
+    client = GitHubForge(github._repository_id("example/agent-claim"))
     observed: dict[str, object] = {}
 
     def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
@@ -5591,7 +5682,7 @@ def test_merged_pull_request_history_warns_when_it_reaches_the_result_cap(
         }
         for index in range(1, github.MAX_RECENT_MERGED_PULL_REQUESTS + 1)
     ]
-    client = GitHubIssueComments("example/agent-claim")
+    client = GitHubForge(github._repository_id("example/agent-claim"))
     monkeypatch.setattr(
         client, "_run", lambda arguments: "\n".join(json.dumps(row) for row in saturated_rows)
     )
@@ -5623,7 +5714,7 @@ def test_merged_pull_request_history_below_the_cap_warns_of_nothing(
         "headRefName": "codex/issue-1",
         "mergedAt": "2026-08-01T00:00:00Z",
     }
-    client = GitHubIssueComments("example/agent-claim")
+    client = GitHubForge(github._repository_id("example/agent-claim"))
     monkeypatch.setattr(client, "_run", lambda arguments: json.dumps(row))
 
     client.list_recent_merged_board_pull_requests(since)
@@ -5634,7 +5725,7 @@ def test_merged_pull_request_history_below_the_cap_warns_of_nothing(
 def test_github_projection_update_patches_one_comment_and_deletes_duplicates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = GitHubIssueComments("example/agent-claim")
+    client = GitHubForge(github._repository_id("example/agent-claim"))
     first = comment(10, issue_claim._unclaimed_projection())
     duplicate = replace(first, identifier=11)
     monkeypatch.setattr(client, "_projection_comments", lambda issue: (first, duplicate))
@@ -5682,7 +5773,7 @@ def test_github_projection_update_patches_one_comment_and_deletes_duplicates(
 def test_github_projection_update_does_not_create_on_a_never_claimed_issue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = GitHubIssueComments("example/agent-claim")
+    client = GitHubForge(github._repository_id("example/agent-claim"))
     monkeypatch.setattr(client, "_projection_comments", lambda issue: ())
     monkeypatch.setattr(
         client,
@@ -5696,7 +5787,7 @@ def test_github_projection_update_does_not_create_on_a_never_claimed_issue(
 def test_github_successor_adopts_stale_projection_but_old_generation_skips_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = GitHubIssueComments("example/agent-claim")
+    client = GitHubForge(github._repository_id("example/agent-claim"))
     monkeypatch.setattr(protocol, "LEDGER_ISSUE", 71)
     stale = comment(10, issue_claim._unclaimed_projection())
     monkeypatch.setattr(protocol, "LEDGER_ISSUE", 171)
@@ -5740,7 +5831,7 @@ def test_github_successor_adopts_stale_projection_but_old_generation_skips_it(
 def test_github_claimed_issue_query_is_scoped_to_this_ledger_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = GitHubIssueComments("example/agent-claim")
+    client = GitHubForge(github._repository_id("example/agent-claim"))
     observed: list[str] = []
 
     def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
@@ -5761,7 +5852,7 @@ def test_github_claimed_issue_query_is_scoped_to_this_ledger_generation(
 def test_github_successor_must_exist_open_empty_locked_and_not_be_a_pr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = GitHubIssueComments("example/agent-claim")
+    client = GitHubForge(github._repository_id("example/agent-claim"))
     valid = {
         "number": 170,
         "state": "open",
@@ -5807,7 +5898,7 @@ def test_github_successor_must_exist_open_empty_locked_and_not_be_a_pr(
 def test_github_comment_reader_wraps_invalid_json_and_schema(
     monkeypatch: pytest.MonkeyPatch, raw: str
 ) -> None:
-    client = GitHubIssueComments("example/agent-claim")
+    client = GitHubForge(github._repository_id("example/agent-claim"))
     monkeypatch.setattr(client, "_run", lambda arguments: raw)
 
     with pytest.raises(ClaimError):
@@ -5823,7 +5914,7 @@ def test_missing_gh_repository_resolution_is_a_controlled_error(
     monkeypatch.setattr(subprocess, "run", missing)
 
     with pytest.raises(ClaimError, match="gh is required"):
-        _repository(None)
+        github.discover_repository(None, remote_url=_unreachable_remote_url)
 
 
 def test_cli_version_exits_before_requiring_a_command(
@@ -5851,17 +5942,14 @@ def test_repository_falls_back_to_standard_github_remote(
     def failed_gh(*arguments, **kwargs):
         command = arguments[0]
         calls.append(command)
-        if command[0] == "gh":
-            return subprocess.CompletedProcess(command, 1, b"", b"not a gh repo")
-        return subprocess.CompletedProcess(command, 0, (remote + "\n").encode(), b"")
+        return subprocess.CompletedProcess(command, 1, b"", b"not a gh repo")
 
     monkeypatch.setattr(subprocess, "run", failed_gh)
 
-    assert _repository(None) == "owner/repository"
-    assert calls == [
-        ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
-        ["git", "config", "--get", "remote.origin.url"],
-    ]
+    resolved = github.discover_repository(None, remote_url=lambda: remote)
+
+    assert resolved == forge.RepositoryId(github.GITHUB_HOST, ("owner",), "repository")
+    assert calls == [["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]]
 
 
 def test_bounded_command_stops_before_unbounded_output(
@@ -6335,8 +6423,8 @@ def _forbid_github_construction(monkeypatch: pytest.MonkeyPatch) -> None:
     def unused(*args, **kwargs):
         pytest.fail("agent identity must be resolved before GitHub")
 
-    monkeypatch.setattr(github, "GitHubIssueComments", unused)
-    monkeypatch.setattr(checkout, "_repository", unused)
+    monkeypatch.setattr(github, "GitHubForge", unused)
+    monkeypatch.setattr(github, "discover_repository", unused)
     monkeypatch.setattr(discovery, "discover_ledger", unused)
 
 
@@ -6349,14 +6437,14 @@ def _forbid_git_fill(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _patch_release_session(
     monkeypatch: pytest.MonkeyPatch,
-    client: FakeComments,
+    client: FakeForge,
     *,
     agent: str = "Ada",
     branch: str | None = "lane-72",
     forbid_git: bool = False,
 ) -> None:
     _set_agent_identity_env(monkeypatch, {issue_claim.AGENT_CLAIM_AGENT_ENV: agent})
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     if forbid_git:
 
@@ -6507,8 +6595,8 @@ def test_cli_claim_omitted_role_posts_default_and_explicit_wins(
     role_flags: tuple[str, ...],
     role: str,
 ) -> None:
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -6543,8 +6631,8 @@ def test_cli_claim_empty_role_fails_closed_without_posting_builder(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -6665,8 +6753,8 @@ def test_request_and_cli_claim_fill_agent_from_documented_else_chain(
     parsed = issue_claim._parser().parse_args(command)
     assert issue_claim._request(parsed).agent == agent
 
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     assert issue_claim.main(["--repo", "example/agent-claim", *command]) == 0
     posted = parse_claim_event(client.comments[LEDGER_ISSUE][0])
@@ -6756,8 +6844,8 @@ def test_cli_same_filled_agent_can_claim_and_release_without_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _set_agent_identity_env(monkeypatch, {"GROK_SESSION_ID": "session-1"})
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -6807,8 +6895,8 @@ def test_cli_two_session_claimants_cannot_release_without_extra_comment(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _set_agent_identity_env(monkeypatch, {"GROK_SESSION_ID": "session-1"})
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -7059,9 +7147,9 @@ def test_cli_claim_omitted_base_and_branch_posts_filled_checkout(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
+    client = FakeForge()
     git_values = _git_checkout()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_git_output", lambda arguments: git_values[tuple(arguments)])
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -7096,8 +7184,8 @@ def test_cli_status_claim_release_and_adapter_error_exit_codes(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -7145,7 +7233,7 @@ def test_cli_status_claim_release_and_adapter_error_exit_codes(
 
     monkeypatch.setattr(
         github,
-        "GitHubIssueComments",
+        "GitHubForge",
         lambda repository: (_ for _ in ()).throw(ClaimError("adapter failed")),
     )
     assert issue_claim.main(["--repo", "example/agent-claim", "status"]) == 2
@@ -7184,7 +7272,7 @@ def _default_open_issue_reference(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         issue_claim,
         "_fetch_issue_reference",
-        lambda client, number: issue_claim._IssueReference(issue_claim.ReferenceState.OPEN, "", ""),
+        lambda client, number: forge.ItemReference(forge.ItemState.OPEN, "", ""),
     )
 
 
@@ -7244,11 +7332,11 @@ def _freeze_cli_now(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _patch_status_cli(
     monkeypatch: pytest.MonkeyPatch,
-    client: FakeComments,
+    client: FakeForge,
     *,
     ledger: int | None = LEDGER_ISSUE,
 ) -> None:
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: ledger)
     monkeypatch.setattr(
         checkout,
@@ -7269,7 +7357,7 @@ def test_cli_reconcile_repairs_a_poisoned_ledger_and_status_reads_it_afterwards(
 ) -> None:
     older_body = claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("old",)))
     newer_body = claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("new",)))
-    client = FakeComments({LEDGER_ISSUE: [comment(1, older_body), comment(2, newer_body)]})
+    client = FakeForge({LEDGER_ISSUE: [comment(1, older_body), comment(2, newer_body)]})
     _patch_status_cli(monkeypatch, client)
 
     assert issue_claim.main(["--repo", "example/agent-claim", "reconcile"]) == 0
@@ -7292,7 +7380,7 @@ def test_cli_reconcile_targeted_issue_succeeds_on_a_mixed_ledger(
     lane_body = claim_comment(
         request("lane-claim", "Grok 4.6", lane=True, branch="docs/lane-a", scope=("docs",))
     )
-    client = FakeComments({LEDGER_ISSUE: [comment(1, issue_body), comment(2, lane_body)]})
+    client = FakeForge({LEDGER_ISSUE: [comment(1, issue_body), comment(2, lane_body)]})
     _patch_status_cli(monkeypatch, client)
 
     assert issue_claim.main(["--repo", "example/agent-claim", "reconcile", "72"]) == 0
@@ -7306,7 +7394,7 @@ def test_cli_reconcile_refuses_a_cross_agent_duplicate_with_exit_code_two(
 ) -> None:
     older_body = claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("old",)))
     newer_body = claim_comment(request("claim-a", "Grok 4.6", issue=72, scope=("new",)))
-    client = FakeComments({LEDGER_ISSUE: [comment(1, older_body), comment(2, newer_body)]})
+    client = FakeForge({LEDGER_ISSUE: [comment(1, older_body), comment(2, newer_body)]})
     _patch_status_cli(monkeypatch, client)
 
     assert issue_claim.main(["--repo", "example/agent-claim", "reconcile"]) == 2
@@ -7323,7 +7411,7 @@ def test_cli_reconcile_still_clears_stale_labels_when_ledger_is_frozen(
     frozen_body = supersede_comment(
         claimed, 170, "Fleet Coordinator", "coordinator", "reviewed rollover ready"
     )
-    client = FakeComments(
+    client = FakeForge(
         {LEDGER_ISSUE: [comment(1, claimed_body), comment(2, frozen_body)]},
         {LEDGER_ISSUE, 72},
     )
@@ -7338,7 +7426,7 @@ def test_cli_status_empty_ledger_prints_ledger_then_unclaimed_repository(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _patch_status_cli(monkeypatch, FakeComments())
+    _patch_status_cli(monkeypatch, FakeForge())
 
     assert issue_claim.main(["--repo", "example/agent-claim", "status"]) == 0
     assert capsys.readouterr().out == (f"LEDGER #{LEDGER_ISSUE}\nUNCLAIMED repository\n")
@@ -7348,7 +7436,7 @@ def test_cli_status_issue_with_no_claim_prints_ledger_then_unclaimed_issue(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _patch_status_cli(monkeypatch, FakeComments())
+    _patch_status_cli(monkeypatch, FakeForge())
 
     assert issue_claim.main(["--repo", "example/agent-claim", "status", "72"]) == 0
     assert capsys.readouterr().out == (f"LEDGER #{LEDGER_ISSUE}\nUNCLAIMED issue #72\n")
@@ -7358,7 +7446,7 @@ def test_cli_status_after_claim_prints_ledger_then_claimed(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _patch_status_cli(monkeypatch, FakeComments())
+    _patch_status_cli(monkeypatch, FakeForge())
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
@@ -7404,7 +7492,7 @@ def test_cli_lane_claim_status_and_release_round_trip_without_issue_number(
     """The full `Done when` #1 story: a docs/ checkout claims, is visible in
     `status`, and releases again — all without ever passing an issue number."""
     _set_agent_identity_env(monkeypatch, {"AGENT_CLAIM_AGENT": "Codex Sol"})
-    client = FakeComments()
+    client = FakeForge()
     _patch_status_cli(monkeypatch, client)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -7455,7 +7543,7 @@ def test_cli_lane_mode_refuses_a_non_conventional_branch(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _set_agent_identity_env(monkeypatch, {"AGENT_CLAIM_AGENT": "Codex Sol"})
-    client = FakeComments()
+    client = FakeForge()
     _patch_status_cli(monkeypatch, client)
     monkeypatch.setattr(
         checkout, "_git_output", lambda arguments: "codex/issue-38-issueless-claims"
@@ -7491,7 +7579,7 @@ def test_cli_status_overlapping_protocol_comments_print_ledger_then_notes(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments(
+    client = FakeForge(
         {
             LEDGER_ISSUE: [
                 comment(1, claim_comment(request(issue=72, scope=("shared",)))),
@@ -7525,7 +7613,7 @@ def test_cli_status_without_ledger_errors_and_prints_no_ledger_line(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _patch_status_cli(monkeypatch, FakeComments(), ledger=None)
+    _patch_status_cli(monkeypatch, FakeForge(), ledger=None)
 
     assert issue_claim.main(["--repo", "example/agent-claim", "status"]) == 2
     captured = capsys.readouterr()
@@ -7546,7 +7634,7 @@ def test_cli_status_json_empty_ledger_prints_unclaimed_object(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _patch_status_cli(monkeypatch, FakeComments())
+    _patch_status_cli(monkeypatch, FakeForge())
 
     assert issue_claim.main(["--repo", "example/agent-claim", "status", "--json"]) == 0
     assert (
@@ -7567,7 +7655,7 @@ def test_cli_status_json_issue_with_no_claim_prints_unclaimed_object(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _patch_status_cli(monkeypatch, FakeComments())
+    _patch_status_cli(monkeypatch, FakeForge())
 
     assert issue_claim.main(["--repo", "example/agent-claim", "status", "72", "--json"]) == 0
     assert (
@@ -7588,7 +7676,7 @@ def test_cli_status_json_after_claim_prints_claimed_object(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _patch_status_cli(monkeypatch, FakeComments())
+    _patch_status_cli(monkeypatch, FakeForge())
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
 
@@ -7654,7 +7742,7 @@ def test_cli_status_json_overlapping_protocol_comments_print_claimed_object(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments(
+    client = FakeForge(
         {
             LEDGER_ISSUE: [
                 comment(1, claim_comment(request(issue=72, scope=("shared",)))),
@@ -7736,7 +7824,7 @@ def test_cli_status_json_issue_on_overlap_prints_related_claimed_object(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments(
+    client = FakeForge(
         {
             LEDGER_ISSUE: [
                 comment(1, claim_comment(request(issue=72, scope=("shared",)))),
@@ -7818,7 +7906,7 @@ def test_cli_status_json_without_ledger_errors_and_prints_no_stdout(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _patch_status_cli(monkeypatch, FakeComments(), ledger=None)
+    _patch_status_cli(monkeypatch, FakeForge(), ledger=None)
 
     assert issue_claim.main(["--repo", "example/agent-claim", "status", "--json"]) == 2
     captured = capsys.readouterr()
@@ -7850,8 +7938,8 @@ def test_cli_claim_without_json_prints_the_claimed_line(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -8114,8 +8202,8 @@ def test_cli_comma_joined_scope_is_stored_as_distinct_paths_and_overlaps(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -8180,8 +8268,8 @@ def test_cli_comma_joined_scope_is_stored_as_distinct_paths_and_overlaps(
 def test_cli_comma_joined_scope_flag_equals_repeated_scope_flags(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -8204,8 +8292,8 @@ def test_cli_comma_joined_scope_flag_equals_repeated_scope_flags(
             "joined",
         ]
     )
-    repeated_client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: repeated_client)
+    repeated_client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: repeated_client)
     repeated = issue_claim.main(
         [
             "--repo",
@@ -8239,12 +8327,12 @@ def test_cli_rescope_adds_a_path_without_matching_head_or_a_clean_tree(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquired = acquire_claim(
         client,
         request(issue=72, branch="codex/issue-72", scope=("src/widget.py",)),
     )
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     git_values = _git_checkout(head="b" * 40, dirty=" M file")
     monkeypatch.setattr(checkout, "_git_output", lambda arguments: git_values[tuple(arguments)])
@@ -8274,12 +8362,12 @@ def test_cli_rescope_json_prints_updated_scope_and_same_claim_id(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquire_claim(
         client,
         request("cli-claim", "Ada", issue=72, branch="codex/issue-72", scope=("src/widget.py",)),
     )
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     git_values = _git_checkout()
     monkeypatch.setattr(checkout, "_git_output", lambda arguments: git_values[tuple(arguments)])
@@ -8323,12 +8411,12 @@ def test_cli_rescope_without_add_or_drop_is_an_error(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquire_claim(
         client,
         request(issue=72, branch="codex/issue-72", scope=("src/widget.py",)),
     )
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     git_values = _git_checkout()
     monkeypatch.setattr(checkout, "_git_output", lambda arguments: git_values[tuple(arguments)])
@@ -8347,12 +8435,12 @@ def test_cli_rescope_refuses_primary_checkout(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquire_claim(
         client,
         request(issue=72, branch="codex/issue-72", scope=("src/widget.py",)),
     )
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     git_values = _git_checkout(git_directory="/repo/.git", common_directory="/repo/.git")
     monkeypatch.setattr(checkout, "_git_output", lambda arguments: git_values[tuple(arguments)])
@@ -8372,8 +8460,8 @@ def test_cli_claim_refuses_a_directory_scope_without_whole(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(
@@ -8411,8 +8499,8 @@ def test_cli_claim_refuses_a_directory_plus_child_scope_without_whole(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(
@@ -8498,12 +8586,12 @@ def test_cli_rescope_refuses_adding_a_directory_without_whole(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquire_claim(
         client,
         request(issue=72, branch="codex/issue-72", scope=("src/widget.py",)),
     )
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     git_values = _git_checkout()
     monkeypatch.setattr(checkout, "_git_output", lambda arguments: git_values[tuple(arguments)])
@@ -8525,8 +8613,8 @@ def test_cli_claim_share_above_a_quarter_requires_whole(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -8564,8 +8652,8 @@ def test_cli_claim_share_above_a_quarter_succeeds_with_whole(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -8607,8 +8695,8 @@ def test_cli_claim_share_at_a_quarter_does_not_need_whole(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -8648,8 +8736,8 @@ def test_cli_claim_reports_the_claim_when_the_post_claim_reconcile_fails(
     operator must see the claim id and an explicit "the claim exists"
     message, even under --json where there is no well-formed claim payload
     left to emit."""
-    client = FakeComments(fail_add_label=True)
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge(fail_add_label=True)
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -8687,7 +8775,7 @@ def test_cli_claim_touches_stay_empty_beside_a_disjoint_standing_claim(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     client = _claims_client(request("claim-a", "Ada", issue=73, scope=("LICENSE",)))
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -8765,7 +8853,7 @@ def test_status_and_board_show_claim_age_from_the_claim_comment(
 ) -> None:
     claimed = request("mine", "Ada", issue=72, branch="codex/issue-72", scope=("src",))
     fresh = comment(1, claim_comment(claimed), created_at="2026-08-20T23:30:00Z")
-    client = FakeComments({LEDGER_ISSUE: [fresh]})
+    client = FakeForge({LEDGER_ISSUE: [fresh]})
     client.board_issues = (board_issue(72, "Work", complete_contract("Claim #72.")),)
     _patch_status_cli(monkeypatch, client)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
@@ -8796,7 +8884,7 @@ def test_status_and_board_mark_a_claim_old_after_sixty_one_minutes(
 ) -> None:
     claimed = request("mine", "Ada", issue=72, branch="codex/issue-72", scope=("src",))
     old = comment(1, claim_comment(claimed), created_at="2026-08-20T22:59:00Z")
-    client = FakeComments({LEDGER_ISSUE: [old]})
+    client = FakeForge({LEDGER_ISSUE: [old]})
     client.board_issues = (board_issue(72, "Work", complete_contract("Claim #72.")),)
     _patch_status_cli(monkeypatch, client)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
@@ -8827,7 +8915,7 @@ def test_claim_age_uses_the_claim_comment_not_a_later_rescope(
         protocol.rescope_comment(parsed, ("src", "LICENSE"), "Ada", "builder"),
         created_at="2026-08-20T23:59:00Z",
     )
-    client = FakeComments({LEDGER_ISSUE: [claim_event, rescope_event]})
+    client = FakeForge({LEDGER_ISSUE: [claim_event, rescope_event]})
     _patch_status_cli(monkeypatch, client)
 
     assert issue_claim.main(["--repo", "example/agent-claim", "status", "72"]) == 0
@@ -8840,7 +8928,7 @@ def test_cli_claim_cut_does_not_exempt_a_directory_scope(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
+    client = FakeForge()
     client.board_issues = (
         board_issue(
             72,
@@ -8848,7 +8936,7 @@ def test_cli_claim_cut_does_not_exempt_a_directory_scope(
             complete_contract("Claim #72.") + "\n\n## Schnitt\n\n**Scheibe 1: Title**\n",
         ),
     )
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(
@@ -8886,7 +8974,7 @@ def test_cli_claim_refuses_a_schnitt_heading_without_a_scheibe_line(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
+    client = FakeForge()
     client.board_issues = (
         board_issue(
             72,
@@ -8894,7 +8982,7 @@ def test_cli_claim_refuses_a_schnitt_heading_without_a_scheibe_line(
             complete_contract("Claim #72.") + "\n\n## Schnitt\n\nNo slices yet.\n",
         ),
     )
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(
@@ -8932,8 +9020,8 @@ def test_cli_lane_directory_without_whole_is_wide(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _set_agent_identity_env(monkeypatch, {"AGENT_CLAIM_AGENT": "Ada"})
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(
@@ -8969,7 +9057,7 @@ def test_cli_claim_cut_directory_still_needs_whole_when_share_is_high(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
+    client = FakeForge()
     client.board_issues = (
         board_issue(
             72,
@@ -8977,7 +9065,7 @@ def test_cli_claim_cut_directory_still_needs_whole_when_share_is_high(
             complete_contract("Claim #72.") + "\n\n## Schnitt\n\n**Scheibe 1: Title**\n",
         ),
     )
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(
@@ -9020,12 +9108,12 @@ def test_cli_rescope_add_that_raises_combined_share_requires_whole(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquire_claim(
         client,
         request(issue=72, branch="codex/issue-72", scope=("src",)),
     )
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     git_values = _git_checkout()
     monkeypatch.setattr(checkout, "_git_output", lambda arguments: git_values[tuple(arguments)])
@@ -9057,12 +9145,12 @@ def test_cli_rescope_add_that_raises_combined_share_requires_whole(
 def test_cli_rescope_persists_whole_reason(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquire_claim(
         client,
         request(issue=72, branch="codex/issue-72", scope=("src/widget.py",)),
     )
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     git_values = _git_checkout()
     monkeypatch.setattr(checkout, "_git_output", lambda arguments: git_values[tuple(arguments)])
@@ -9124,8 +9212,8 @@ def test_scope_is_wide_for_more_than_three_paths_any_directory_or_a_share_above_
 def test_cli_claim_accepts_three_named_paths_without_whole(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -9164,8 +9252,8 @@ def test_cli_claim_refuses_four_named_paths_without_whole(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -9207,12 +9295,12 @@ def test_cli_rescope_widening_to_four_paths_refuses_without_whole(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquire_claim(
         client,
         request(issue=72, branch="codex/issue-72", scope=("new_a.py",)),
     )
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     git_values = _git_checkout()
     monkeypatch.setattr(checkout, "_git_output", lambda arguments: git_values[tuple(arguments)])
@@ -9247,8 +9335,8 @@ def test_cli_claim_persists_whole_reason_and_status_and_who_show_it(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -9308,8 +9396,8 @@ def test_cli_claim_persists_whole_reason_and_status_and_who_show_it(
 def test_cli_claim_allows_a_directory_scope_with_whole(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(
@@ -9377,8 +9465,8 @@ def test_cli_claim_json_prints_acquired_claim_object(
     branch: str,
     identity_fields: dict[str, object],
 ) -> None:
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -9587,7 +9675,7 @@ def test_cli_claim_and_release_json_errors_print_no_stdout(
     capsys: pytest.CaptureFixture[str],
     arguments: list[str],
 ) -> None:
-    _patch_status_cli(monkeypatch, FakeComments(), ledger=None)
+    _patch_status_cli(monkeypatch, FakeForge(), ledger=None)
 
     assert issue_claim.main(["--repo", "example/agent-claim", *arguments]) == 2
     captured = capsys.readouterr()
@@ -9601,7 +9689,7 @@ def test_cli_claim_json_conflict_errors_without_success_json(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     client = _claims_client(request(issue=72, scope=("src",)))
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -9640,8 +9728,8 @@ def test_cli_supersede_freezes_the_drained_ledger_and_prints_the_contract_line(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    client = FakeComments(valid_successors={170})
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge(valid_successors={170})
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda client: LEDGER_ISSUE)
     acquired = acquire_claim(client, request(issue=LEDGER_ISSUE))
 
@@ -9681,8 +9769,8 @@ def test_cli_supersede_fails_closed_without_mutating_protocol_candidates(
     capsys: pytest.CaptureFixture[str],
     failure: str,
 ) -> None:
-    client = FakeComments(valid_successors={170})
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge(valid_successors={170})
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda client: LEDGER_ISSUE)
     acquired = acquire_claim(client, request(issue=LEDGER_ISSUE))
     if failure == "drain":
@@ -9716,8 +9804,8 @@ def forbid_github_for_policy(monkeypatch: pytest.MonkeyPatch) -> None:
     def unused(*args, **kwargs):
         pytest.fail("policy must not use GitHub")
 
-    monkeypatch.setattr(github, "GitHubIssueComments", unused)
-    monkeypatch.setattr(checkout, "_repository", unused)
+    monkeypatch.setattr(github, "GitHubForge", unused)
+    monkeypatch.setattr(github, "discover_repository", unused)
     monkeypatch.setattr(discovery, "discover_ledger", unused)
 
 
@@ -9826,7 +9914,10 @@ def _patch_protect_claim(
     scope: tuple[str, ...] = ("src",),
     branch: str = "codex/issue-72-claims",
     lane: bool = False,
-) -> FakeComments:
+) -> FakeForge:
+    """The client is a `ReaderOnlyForge`: `protect` reads live claims and never
+    writes, so every test built on this helper is also proof of that.
+    """
     claimed = comment(
         1,
         claim_comment(
@@ -9836,8 +9927,8 @@ def _patch_protect_claim(
             )
         ),
     )
-    client = FakeComments({LEDGER_ISSUE: [claimed]}, {72})
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = ReaderOnlyForge({LEDGER_ISSUE: [claimed]}, {72})
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     return client
 
@@ -9848,8 +9939,8 @@ def _forbid_protect_git_github_and_identity(monkeypatch: pytest.MonkeyPatch) -> 
 
     monkeypatch.setattr(checkout, "_resolved_agent", unused)
     monkeypatch.setattr(checkout, "_git_output", unused)
-    monkeypatch.setattr(github, "GitHubIssueComments", unused)
-    monkeypatch.setattr(checkout, "_repository", unused)
+    monkeypatch.setattr(github, "GitHubForge", unused)
+    monkeypatch.setattr(github, "discover_repository", unused)
     monkeypatch.setattr(discovery, "discover_ledger", unused)
     monkeypatch.setattr(protocol, "configure_ledger", unused)
 
@@ -10031,7 +10122,7 @@ def test_protect_missing_ledger_denies_claim_first_without_configure(
     work = tmp_path / "work"
     _set_agent_identity_env(monkeypatch, {issue_claim.GROK_SESSION_ID_ENV: "sess-1"})
     _patch_protect_git(monkeypatch, work)
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: FakeComments())
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: FakeForge())
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: None)
 
     def unused_configure(issue: int) -> None:
@@ -10243,7 +10334,7 @@ def test_protect_ledger_error_denies_json_without_error_prefix(
     work = tmp_path / "work"
     _set_agent_identity_env(monkeypatch, {issue_claim.GROK_SESSION_ID_ENV: "sess-1"})
     _patch_protect_git(monkeypatch, work)
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: FakeComments())
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: FakeForge())
 
     def failed(_client):
         raise ClaimError("adapter failed")
@@ -10272,7 +10363,7 @@ def test_protect_non_claim_error_from_write_path_denies_json_without_traceback(
     work = tmp_path / "work"
     _set_agent_identity_env(monkeypatch, {issue_claim.GROK_SESSION_ID_ENV: "sess-1"})
     _patch_protect_git(monkeypatch, work)
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: FakeComments())
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: FakeForge())
 
     def crashed(_client):
         raise RuntimeError("write path crashed")
@@ -10296,7 +10387,7 @@ def test_protect_non_claim_error_from_write_path_denies_json_without_traceback(
 
 
 def test_two_lanes_may_claim_the_same_file() -> None:
-    client = FakeComments()
+    client = FakeForge()
     first = acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
     second = acquire_claim(
         client, request("claim-b", "Grok 4.6", issue=73, scope=("src/widget.py",))
@@ -10309,7 +10400,7 @@ def test_two_lanes_may_claim_the_same_file() -> None:
 
 
 def test_many_lanes_may_claim_the_same_directory() -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquired = [
         acquire_claim(
             client,
@@ -10324,7 +10415,7 @@ def test_many_lanes_may_claim_the_same_directory() -> None:
 
 
 def test_same_issue_still_refuses_a_second_live_claim() -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquire_claim(client, request(issue=72, scope=("src/a.py",)))
 
     raised_argument_1 = request("claim-b", "Grok 4.6", issue=72, scope=("src/b.py",))
@@ -10333,7 +10424,7 @@ def test_same_issue_still_refuses_a_second_live_claim() -> None:
 
 
 def test_resource_allocates_unique_values_in_sequence() -> None:
-    client = FakeComments()
+    client = FakeForge()
     first = acquire_claim(client, request(issue=72, scope=("src/a.py",), resource="schema-hop"))
     second = acquire_claim(
         client,
@@ -10349,7 +10440,7 @@ def test_resource_allocates_unique_values_in_sequence() -> None:
 
 
 def test_auto_resource_after_live_explicit_two_holds_one_not_none() -> None:
-    client = FakeComments()
+    client = FakeForge()
     explicit = acquire_claim(
         client,
         request(issue=72, scope=("src/a.py",), resource="schema-hop", resource_value=2),
@@ -10371,7 +10462,7 @@ def test_auto_resource_after_live_explicit_two_holds_one_not_none() -> None:
 
 
 def test_resource_refuses_a_second_live_hold_of_the_same_value() -> None:
-    client = FakeComments()
+    client = FakeForge()
     acquire_claim(
         client,
         request(issue=72, scope=("src/a.py",), resource="schema-hop", resource_value=4),
@@ -10393,7 +10484,7 @@ def test_resource_refuses_a_second_live_hold_of_the_same_value() -> None:
 
 
 def test_releasing_a_resource_drops_the_hold_and_keeps_later_values_unique() -> None:
-    client = FakeComments()
+    client = FakeForge()
     first = acquire_claim(client, request(issue=72, scope=("src/a.py",), resource="schema-hop"))
     release_claim(
         client,
@@ -10413,7 +10504,7 @@ def test_releasing_a_resource_drops_the_hold_and_keeps_later_values_unique() -> 
 
 
 def test_resource_race_later_auto_succeeds_with_the_next_value() -> None:
-    client = FakeComments()
+    client = FakeForge()
     earlier = comment(
         100,
         claim_comment(
@@ -10443,7 +10534,7 @@ def test_resource_race_later_auto_succeeds_with_the_next_value() -> None:
 
 
 def test_resource_race_explicit_value_still_fails_closed() -> None:
-    client = FakeComments()
+    client = FakeForge()
     earlier = comment(
         100,
         claim_comment(
@@ -10476,7 +10567,7 @@ def test_resource_race_explicit_value_still_fails_closed() -> None:
 
 
 def test_two_intents_for_the_same_value_leave_exactly_one_holder() -> None:
-    client = FakeComments(
+    client = FakeForge(
         {
             LEDGER_ISSUE: [
                 comment(
@@ -10514,7 +10605,7 @@ def test_two_intents_for_the_same_value_leave_exactly_one_holder() -> None:
 
 
 def test_resource_loser_that_dies_before_retry_is_not_a_holder() -> None:
-    client = FakeComments(
+    client = FakeForge(
         {
             LEDGER_ISSUE: [
                 comment(
@@ -10558,8 +10649,8 @@ def test_resource_loser_that_dies_before_retry_is_not_a_holder() -> None:
 def test_cli_claim_resource_prints_the_allocated_value(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    client = FakeComments()
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
+    client = FakeForge()
+    monkeypatch.setattr(github, "GitHubForge", lambda repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -10601,7 +10692,7 @@ def test_cli_claim_resource_prints_the_allocated_value(
 def test_cli_two_claims_of_the_same_directory_are_advisory(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    client = FakeComments()
+    client = FakeForge()
     _patch_status_cli(monkeypatch, client)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(
@@ -10679,7 +10770,7 @@ def test_cli_two_claims_of_the_same_directory_are_advisory(
 def test_cli_two_claims_of_the_same_file_are_advisory(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    client = FakeComments()
+    client = FakeForge()
     _patch_status_cli(monkeypatch, client)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -10747,7 +10838,7 @@ def test_cli_two_claims_of_the_same_file_are_advisory(
 def test_cli_two_resource_claims_allocate_one_then_two(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    client = FakeComments()
+    client = FakeForge()
     _patch_status_cli(monkeypatch, client)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -10806,7 +10897,7 @@ def test_cli_two_resource_claims_allocate_one_then_two(
 def test_cli_resource_race_still_yields_unique_live_holds(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    client = FakeComments()
+    client = FakeForge()
     _patch_status_cli(monkeypatch, client)
     monkeypatch.setattr(checkout, "_validate_checkout", lambda request: None)
     monkeypatch.setattr(checkout, "_scope_directories", lambda paths: ())
@@ -11313,7 +11404,7 @@ def test_next_names_an_old_ruling_when_the_item_is_pulled(
     monkeypatch.setattr(client, "list_open_board_issues", lambda: (issue,))
     monkeypatch.setattr(client, "list_open_board_pull_requests", lambda: ())
     monkeypatch.setattr(client, "list_recent_merged_board_pull_requests", lambda _since: ())
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(github, "GitHubForge", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     monkeypatch.setattr(checkout, "_git_output", lambda _arguments: str(tmp_path))
     monkeypatch.setattr(
@@ -11480,9 +11571,15 @@ def landing_pull_request(
     head_repository: str = REPOSITORY,
     author: str = "ada",
     merged: bool = False,
-) -> board.PullRequestDetail:
-    return board.PullRequestDetail(
-        number, body, base_ref_name, head_ref_name, head_repository, author, merged
+) -> forge.Landing:
+    return forge.Landing(
+        number,
+        author,
+        body,
+        github._repository_id(head_repository),
+        head_ref_name,
+        base_ref_name,
+        merged,
     )
 
 
@@ -11494,17 +11591,17 @@ def documentation_lane_claim(
 
 def pr_check_client(
     monkeypatch: pytest.MonkeyPatch,
-    detail: board.PullRequestDetail,
+    detail: forge.Landing,
     *,
     standing: tuple[ClaimRequest, ...] = (),
-) -> FakeComments:
+) -> FakeForge:
     """A client serving one pull request and the claims that back it."""
     claims = standing or (
         request("landing", issue=WORK_ITEM_ISSUE, branch=LANDING_BRANCH, scope=("src",)),
     )
     client = _claims_client(*claims)
-    client.pull_requests[detail.number] = detail
-    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    client.landings[detail.number] = detail
+    monkeypatch.setattr(github, "GitHubForge", lambda _repository: client)
     monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
     return client
 
@@ -11786,7 +11883,7 @@ def test_a_closing_reference_follows_githubs_own_syntax(body: str, closed: tuple
 def test_github_adapter_reads_a_pull_request_and_the_default_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = GitHubIssueComments(REPOSITORY)
+    client = GitHubForge(github._repository_id(REPOSITORY))
 
     def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
         if arguments[:2] == ["pr", "view"]:
@@ -11795,8 +11892,8 @@ def test_github_adapter_reads_a_pull_request_and_the_default_branch(
 
     monkeypatch.setattr(client, "_run", run)
 
-    assert client.pull_request_detail(12) == board.PullRequestDetail(
-        12, "Work-Item: #72", "main", LANDING_BRANCH, REPOSITORY, "ada", True
+    assert client.landing(12) == forge.Landing(
+        12, "ada", "Work-Item: #72", github._repository_id(REPOSITORY), LANDING_BRANCH, "main", True
     )
     assert client.default_branch() == "main"
 
@@ -11804,7 +11901,7 @@ def test_github_adapter_reads_a_pull_request_and_the_default_branch(
 def test_github_adapter_reads_a_fork_branch_as_its_own_repository(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = GitHubIssueComments(REPOSITORY)
+    client = GitHubForge(github._repository_id(REPOSITORY))
     monkeypatch.setattr(
         client,
         "_run",
@@ -11816,13 +11913,13 @@ def test_github_adapter_reads_a_fork_branch_as_its_own_repository(
         ),
     )
 
-    assert client.pull_request_detail(12).head_repository == "fork/agent-claim"
+    assert client.landing(12).source_repository == github._repository_id("fork/agent-claim")
 
 
 def test_github_adapter_fails_loud_when_github_answers_for_another_pull_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = GitHubIssueComments(REPOSITORY)
+    client = GitHubForge(github._repository_id(REPOSITORY))
     monkeypatch.setattr(
         client,
         "_run",
@@ -11830,7 +11927,7 @@ def test_github_adapter_fails_loud_when_github_answers_for_another_pull_request(
     )
 
     with pytest.raises(ClaimError, match="answered for pull request #13, not #12"):
-        client.pull_request_detail(12)
+        client.landing(12)
 
 
 @pytest.mark.parametrize(
@@ -11848,11 +11945,11 @@ def test_github_adapter_fails_loud_when_github_answers_for_another_pull_request(
 def test_github_adapter_fails_loud_on_a_malformed_pull_request(
     monkeypatch: pytest.MonkeyPatch, payload: dict[str, object]
 ) -> None:
-    client = GitHubIssueComments(REPOSITORY)
+    client = GitHubForge(github._repository_id(REPOSITORY))
     monkeypatch.setattr(client, "_run", lambda arguments, input_data=None: json.dumps(payload))
 
     with pytest.raises(ClaimError) as excinfo:
-        client.pull_request_detail(12)
+        client.landing(12)
 
     assert str(excinfo.value) == github.MALFORMED_PULL_REQUEST
 
@@ -11860,13 +11957,13 @@ def test_github_adapter_fails_loud_on_a_malformed_pull_request(
 def test_github_adapter_fails_loud_when_the_pull_request_payload_is_not_a_dict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = GitHubIssueComments(REPOSITORY)
+    client = GitHubForge(github._repository_id(REPOSITORY))
     monkeypatch.setattr(
         client, "_run", lambda arguments, input_data=None: json.dumps("not a pull request")
     )
 
     with pytest.raises(ClaimError) as excinfo:
-        client.pull_request_detail(12)
+        client.landing(12)
 
     assert str(excinfo.value) == github.MALFORMED_PULL_REQUEST
 
@@ -11874,7 +11971,7 @@ def test_github_adapter_fails_loud_when_the_pull_request_payload_is_not_a_dict(
 def test_github_adapter_fails_loud_when_github_answers_with_more_than_one_pull_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = GitHubIssueComments(REPOSITORY)
+    client = GitHubForge(github._repository_id(REPOSITORY))
     monkeypatch.setattr(
         client,
         "_run",
@@ -11884,7 +11981,7 @@ def test_github_adapter_fails_loud_when_github_answers_with_more_than_one_pull_r
     )
 
     with pytest.raises(ClaimError) as excinfo:
-        client.pull_request_detail(12)
+        client.landing(12)
 
     assert str(excinfo.value) == github.MALFORMED_PULL_REQUEST
 
@@ -11892,11 +11989,11 @@ def test_github_adapter_fails_loud_when_github_answers_with_more_than_one_pull_r
 def test_github_adapter_fails_loud_when_github_answers_with_no_pull_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = GitHubIssueComments(REPOSITORY)
+    client = GitHubForge(github._repository_id(REPOSITORY))
     monkeypatch.setattr(client, "_run", lambda arguments, input_data=None: "")
 
     with pytest.raises(ClaimError) as excinfo:
-        client.pull_request_detail(12)
+        client.landing(12)
 
     assert str(excinfo.value) == github.MALFORMED_PULL_REQUEST
 
@@ -11904,7 +12001,7 @@ def test_github_adapter_fails_loud_when_github_answers_with_no_pull_request(
 def test_github_adapter_fails_loud_on_a_malformed_default_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = GitHubIssueComments(REPOSITORY)
+    client = GitHubForge(github._repository_id(REPOSITORY))
     monkeypatch.setattr(client, "_run", lambda arguments, input_data=None: "not a branch")
 
     with pytest.raises(ClaimError, match="malformed default branch"):
@@ -11939,7 +12036,7 @@ def merged_release_client(
     merged: bool = True,
     base_ref_name: str = "main",
     lane: bool = False,
-) -> FakeComments:
+) -> FakeForge:
     """A session whose one claim can be released against pull request #12."""
     branch = LANE_BRANCH if lane else LANDING_BRANCH
     client = _claims_client(
@@ -11951,7 +12048,7 @@ def merged_release_client(
             scope=("src",),
         )
     )
-    client.pull_requests[12] = landing_pull_request(
+    client.landings[12] = landing_pull_request(
         body=body, merged=merged, base_ref_name=base_ref_name, head_ref_name=branch
     )
     _patch_release_session(monkeypatch, client, branch=branch)
@@ -12023,9 +12120,7 @@ def test_release_merged_refuses_a_landing_it_cannot_verify(
     reason: str,
 ) -> None:
     client = merged_release_client(monkeypatch, **scenario)
-    _stub_issue_reference(
-        monkeypatch, {WORK_ITEM_ISSUE: (issue_claim.ReferenceState.CLOSED, "", "")}
-    )
+    _stub_issue_reference(monkeypatch, {WORK_ITEM_ISSUE: (forge.ItemState.CLOSED, "", "")})
 
     assert issue_claim.main(["--repo", REPOSITORY, "release", "72", "--merged", "12"]) == 2
     assert capsys.readouterr().err == f"ERROR: {reason}\n"
@@ -12093,12 +12188,12 @@ def parented_pr_check_client(
     parent_body: str,
     open_children: tuple[board.IssueReference, ...],
     parent_repository: str = REPOSITORY,
-) -> FakeComments:
+) -> FakeForge:
     client = pr_check_client(monkeypatch, landing_pull_request(body=body))
     client.parents[WORK_ITEM_ISSUE] = board.ParentIssue(
         board.IssueReference(parent_repository, PARENT_ISSUE), parent_body
     )
-    client.open_children[PARENT_ISSUE] = open_children
+    client.children[PARENT_ISSUE] = open_children
     return client
 
 
@@ -12219,10 +12314,8 @@ def api_sub_issue(number: int, state: str) -> dict[str, object]:
     return {"number": number, "repository": API_REPOSITORY_URL, "state": state}
 
 
-def sub_issue_client(
-    monkeypatch: pytest.MonkeyPatch, *children: dict[str, object]
-) -> GitHubIssueComments:
-    client = GitHubIssueComments(REPOSITORY)
+def sub_issue_client(monkeypatch: pytest.MonkeyPatch, *children: dict[str, object]) -> GitHubForge:
+    client = GitHubForge(github._repository_id(REPOSITORY))
     monkeypatch.setattr(
         client,
         "_run",
@@ -12234,7 +12327,7 @@ def sub_issue_client(
 def test_github_adapter_reads_a_recorded_parent_and_its_open_children(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = GitHubIssueComments(REPOSITORY)
+    client = GitHubForge(github._repository_id(REPOSITORY))
 
     def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
         if arguments[1].endswith("/parent"):
@@ -12248,7 +12341,7 @@ def test_github_adapter_reads_a_recorded_parent_and_its_open_children(
     assert client.parent_issue(72) == board.ParentIssue(
         board.IssueReference(REPOSITORY, 79), "## Next\nCut."
     )
-    assert client.open_sub_issues(79) == (
+    assert client.open_children(79) == (
         board.IssueReference(REPOSITORY, 72),
         board.IssueReference(REPOSITORY, 73),
     )
@@ -12259,7 +12352,7 @@ def test_github_adapter_leaves_a_parents_closed_children_out(
 ) -> None:
     client = sub_issue_client(monkeypatch, api_sub_issue(72, "closed"), api_sub_issue(73, "open"))
 
-    assert client.open_sub_issues(79) == (board.IssueReference(REPOSITORY, 73),)
+    assert client.open_children(79) == (board.IssueReference(REPOSITORY, 73),)
 
 
 @pytest.mark.parametrize(
@@ -12275,13 +12368,13 @@ def test_github_adapter_fails_loud_on_a_sub_issue_state_it_cannot_read(
     client = sub_issue_client(monkeypatch, child)
 
     with pytest.raises(ClaimError, match="malformed sub-issue"):
-        client.open_sub_issues(79)
+        client.open_children(79)
 
 
 def test_github_adapter_reads_an_issue_without_a_parent_as_parentless(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = GitHubIssueComments(REPOSITORY)
+    client = GitHubForge(github._repository_id(REPOSITORY))
 
     def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
         raise forge.ForgeNotFoundError("gh: No parent issue found (HTTP 404)")

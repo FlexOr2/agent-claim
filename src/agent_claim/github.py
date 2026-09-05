@@ -1,4 +1,4 @@
-"""GitHub issue-comment adapter for the claim ledger."""
+"""GitHub adapter for the forge port."""
 
 from __future__ import annotations
 
@@ -69,6 +69,9 @@ MALFORMED_PULL_REQUEST = "GitHub returned a malformed pull request"
 # code but never its class, so any 5xx is matched by digit rather than by an
 # enumerated list of codes that would need to grow with the API.
 _HTTP_SERVER_ERROR_PATTERN = re.compile(r"HTTP 5\d\d")
+GITHUB_HOST = "github.com"
+# Accepts both pinned remote forms, the SCP one included.
+GITHUB_REMOTE_PATTERN = re.compile(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?$")
 
 
 def github_command_environment() -> dict[str, str]:
@@ -77,10 +80,47 @@ def github_command_environment() -> dict[str, str]:
     return environment
 
 
-def _head_repository(pull_request: dict[str, object]) -> str | None:
-    """`OWNER/REPOSITORY` of the branch a pull request proposes, or None when
-    GitHub does not name both halves — a fork deleted after the pull request
-    opened, say.
+def _repository_id(text: str) -> forge.RepositoryId:
+    if re.fullmatch(REPOSITORY_PATTERN, text) is None:
+        raise ClaimError("repository must be OWNER/REPO")
+    namespace, _, name = text.partition("/")
+    return forge.RepositoryId(GITHUB_HOST, (namespace,), name)
+
+
+def discover_repository(
+    explicit: str | None, *, remote_url: Callable[[], str]
+) -> forge.RepositoryId:
+    """Resolve the repository `--repo` did not name.
+
+    Reads `gh repo view`'s stdout alone -- a separate-stream result, so a
+    stderr warning can neither corrupt a good answer nor suppress the
+    fall-back to the git remote below.
+    """
+    if explicit:
+        return _repository_id(explicit)
+    try:
+        result = process.run_captured(
+            ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+            env=github_command_environment(),
+            timeout=GH_TIMEOUT_SECONDS,
+        )
+    except process.ExecutableMissingError:
+        raise ClaimError("gh is required for issue claims") from None
+    except process.ProcessTimedOutError:
+        raise ClaimError("gh timed out while resolving the repository") from None
+    cleaned = strip_ansi(result.stdout.decode("utf-8")).strip()
+    if result.exit_status == 0 and cleaned:
+        return _repository_id(cleaned)
+    match = GITHUB_REMOTE_PATTERN.search(remote_url())
+    if match is None:
+        raise ClaimError("cannot resolve GitHub repository; pass --repo OWNER/REPO")
+    return _repository_id(f"{match.group(1)}/{match.group(2)}")
+
+
+def _head_repository(pull_request: dict[str, object]) -> forge.RepositoryId | None:
+    """The identity of the repository whose branch a pull request proposes,
+    or None when GitHub does not name both halves — a fork deleted after the
+    pull request opened, say.
     """
     repository = pull_request.get("headRepository")
     owner = pull_request.get("headRepositoryOwner")
@@ -88,8 +128,9 @@ def _head_repository(pull_request: dict[str, object]) -> str | None:
     login = owner.get("login") if isinstance(owner, dict) else None
     if not isinstance(name, str) or not isinstance(login, str):
         return None
-    full_name = f"{login}/{name}"
-    return full_name if re.fullmatch(REPOSITORY_PATTERN, full_name) else None
+    if re.fullmatch(REPOSITORY_PATTERN, f"{login}/{name}") is None:
+        return None
+    return forge.RepositoryId(GITHUB_HOST, (login,), name)
 
 
 def strip_ansi(text: str) -> str:
@@ -182,23 +223,80 @@ def _bounded_command(command: list[str], *, purpose: str, input_data: bytes | No
     return decoded
 
 
-class GitHubIssueComments:
-    def __init__(self, repository: str):
-        if re.fullmatch(REPOSITORY_PATTERN, repository) is None:
-            raise ClaimError("repository must be OWNER/REPO")
+_READ_ONLY_OPERATIONS = (
+    forge.ForgeOperation.LIST_PROTOCOL_CANDIDATES,
+    forge.ForgeOperation.LIST_CLAIMED_ISSUES,
+    forge.ForgeOperation.VALIDATE_SUCCESSOR,
+    forge.ForgeOperation.ITEM_REFERENCE,
+    forge.ForgeOperation.LANDING,
+    forge.ForgeOperation.PARENT_ISSUE,
+    forge.ForgeOperation.OPEN_CHILDREN,
+    forge.ForgeOperation.DEFAULT_BRANCH,
+    forge.ForgeOperation.LIST_OPEN_BOARD_ISSUES,
+    forge.ForgeOperation.LIST_BOARD_BLOCKERS,
+    forge.ForgeOperation.LIST_OPEN_BOARD_PULL_REQUESTS,
+    forge.ForgeOperation.LIST_RECENT_MERGED_BOARD_PULL_REQUESTS,
+)
+_READ_WRITE_OPERATIONS = (
+    forge.ForgeOperation.POST_COMMENT,
+    forge.ForgeOperation.ADD_LABEL,
+    forge.ForgeOperation.REMOVE_LABEL,
+    forge.ForgeOperation.UPSERT_PROJECTION,
+    forge.ForgeOperation.NEUTRALIZE_CLAIM_COMMENT,
+)
+# The GitHub adapter never refuses an operation: every member answers
+# READ_ONLY or READ_WRITE, never UNSUPPORTED (decision record 0001 §2).
+GITHUB_CAPABILITIES: dict[forge.ForgeOperation, forge.Capability] = {
+    **dict.fromkeys(_READ_ONLY_OPERATIONS, forge.Capability.READ_ONLY),
+    **dict.fromkeys(_READ_WRITE_OPERATIONS, forge.Capability.READ_WRITE),
+}
+
+
+class GitHubForge:
+    def __init__(
+        self,
+        repository: forge.RepositoryId,
+        *,
+        run: Callable[..., str] | None = None,
+    ) -> None:
         self.repository = repository
+        self._run = run if run is not None else self._gh
         self._rollover_warning_printed = False
 
-    def _run(self, arguments: list[str], *, input_data: bytes | None = None) -> str:
+    def _gh(self, arguments: list[str], *, input_data: bytes | None = None) -> str:
         return _bounded_command(
             ["gh", *arguments],
             purpose="GitHub issue coordination",
             input_data=input_data,
         )
 
-    def issue_reference_json(self, number: int) -> str:
-        return self._run(
-            ["api", f"repos/{self.repository}/issues/{number}", "--jq", "{state,title,body}"]
+    def capability(self, operation: forge.ForgeOperation) -> forge.Capability:
+        return GITHUB_CAPABILITIES[operation]
+
+    def item_reference(self, number: int) -> forge.ItemReference:
+        try:
+            raw = self._run(
+                ["api", f"repos/{self.repository}/issues/{number}", "--jq", "{state,title,body}"]
+            )
+        except forge.ForgeNotFoundError:
+            return forge.ItemReference(forge.ItemState.MISSING)
+        values = self._json_lines(raw, "issue reference")
+        if len(values) != 1 or not isinstance(values[0], dict):
+            raise forge.ForgeMalformedResponseError("GitHub returned a malformed issue reference")
+        value = values[0]
+        state = value.get("state")
+        title = value.get("title")
+        body = value.get("body")
+        if (
+            state not in {"open", "closed"}
+            or not isinstance(title, str)
+            or (body is not None and not isinstance(body, str))
+        ):
+            raise forge.ForgeMalformedResponseError("GitHub returned a malformed issue reference")
+        return forge.ItemReference(
+            forge.ItemState.OPEN if state == "open" else forge.ItemState.CLOSED,
+            title,
+            body or "",
         )
 
     def _json_lines(self, raw: str, description: str) -> tuple[object, ...]:
@@ -391,7 +489,7 @@ class GitHubIssueComments:
             )
         return board.PullRequest(number, title, body, head_ref_name, merged_at)
 
-    def _pull_request_detail(self, value: object) -> board.PullRequestDetail:
+    def _landing(self, value: object) -> forge.Landing:
         if not isinstance(value, dict):
             raise forge.ForgeMalformedResponseError(MALFORMED_PULL_REQUEST)
         number = value.get("number")
@@ -400,7 +498,7 @@ class GitHubIssueComments:
             body = ""
         base_ref_name = value.get("baseRefName")
         head_ref_name = value.get("headRefName")
-        head_repository = _head_repository(value)
+        source_repository = _head_repository(value)
         author = value.get("author")
         login = author.get("login") if isinstance(author, dict) else None
         merged_at = value.get("mergedAt")
@@ -411,31 +509,31 @@ class GitHubIssueComments:
             or not isinstance(body, str)
             or not isinstance(base_ref_name, str)
             or not isinstance(head_ref_name, str)
-            or head_repository is None
+            or source_repository is None
             or not isinstance(login, str)
             or not login
             or (merged_at is not None and not isinstance(merged_at, str))
             or (isinstance(merged_at, str) and TIMESTAMP_PATTERN.fullmatch(merged_at) is None)
         ):
             raise forge.ForgeMalformedResponseError(MALFORMED_PULL_REQUEST)
-        return board.PullRequestDetail(
+        return forge.Landing(
             number,
-            body,
-            base_ref_name,
-            head_ref_name,
-            head_repository,
             login,
+            body,
+            source_repository,
+            head_ref_name,
+            base_ref_name,
             merged_at is not None,
         )
 
-    def pull_request_detail(self, number: int) -> board.PullRequestDetail:
+    def landing(self, number: int) -> forge.Landing:
         raw = self._run(
             [
                 "pr",
                 "view",
                 str(number),
                 "--repo",
-                self.repository,
+                self.repository.path,
                 "--json",
                 "number,body,baseRefName,headRefName,headRepository,"
                 "headRepositoryOwner,author,mergedAt",
@@ -446,10 +544,10 @@ class GitHubIssueComments:
         values = self._json_lines(raw, "pull request")
         if len(values) != 1:
             raise forge.ForgeMalformedResponseError(MALFORMED_PULL_REQUEST)
-        detail = self._pull_request_detail(values[0])
-        if detail.number != number:
-            raise ClaimError(f"GitHub answered for pull request #{detail.number}, not #{number}")
-        return detail
+        landing = self._landing(values[0])
+        if landing.number != number:
+            raise ClaimError(f"GitHub answered for pull request #{landing.number}, not #{number}")
+        return landing
 
     def _issue_reference(self, value: object, description: str) -> board.IssueReference:
         if not isinstance(value, dict):
@@ -500,7 +598,7 @@ class GitHubIssueComments:
             raise forge.ForgeMalformedResponseError("GitHub returned a malformed parent issue")
         return board.ParentIssue(self._issue_reference(values[0], "parent issue"), body)
 
-    def open_sub_issues(self, number: int) -> tuple[board.IssueReference, ...]:
+    def open_children(self, number: int) -> tuple[board.IssueReference, ...]:
         """The parent's children GitHub still holds open.
 
         Every child's state is read here rather than filtered by `--jq`: a
@@ -619,7 +717,7 @@ class GitHubIssueComments:
                 "pr",
                 "list",
                 "--repo",
-                self.repository,
+                self.repository.path,
                 "--state",
                 "open",
                 "--limit",
@@ -641,7 +739,7 @@ class GitHubIssueComments:
                 "pr",
                 "list",
                 "--repo",
-                self.repository,
+                self.repository.path,
                 "--state",
                 "merged",
                 "--search",
@@ -825,12 +923,16 @@ class GitHubIssueComments:
     def post_comment(self, issue: int, body: str) -> str:
         encoded = _validated_comment(body).encode("utf-8")
         return self._run(
-            ["issue", "comment", str(issue), "--repo", self.repository, "--body-file", "-"],
+            ["issue", "comment", str(issue), "--repo", self.repository.path, "--body-file", "-"],
             input_data=encoded,
         )
 
     def add_label(self, issue: int, label: str) -> None:
-        self._run(["issue", "edit", str(issue), "--repo", self.repository, "--add-label", label])
+        self._run(
+            ["issue", "edit", str(issue), "--repo", self.repository.path, "--add-label", label]
+        )
 
     def remove_label(self, issue: int, label: str) -> None:
-        self._run(["issue", "edit", str(issue), "--repo", self.repository, "--remove-label", label])
+        self._run(
+            ["issue", "edit", str(issue), "--repo", self.repository.path, "--remove-label", label]
+        )
