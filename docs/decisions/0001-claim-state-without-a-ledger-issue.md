@@ -3,9 +3,11 @@
 Status: accepted as direction, not yet implementable. Each §4 criterion is gated by the §5
 step that resolves it: the state-ref cut (step 5) resolves criteria 1–6 and 10 (criterion 8
 is already tied there to fencing v0.9 clients); port extraction (step 3) resolves criterion 9,
-the complete Landing candidate (already tied there); and criterion 7, the GitLab
-state-transport preflight, must be re-run before the first GitLab adapter. No slice may be
-dispatched before its gating step's criteria are satisfied.
+the complete Landing candidate (already tied there); criterion 7, the GitLab
+state-transport preflight, must be re-run before the first GitLab adapter; and criterion 11,
+the live GitHub custom-ref probe, must be re-run before port extraction (step 3) and the
+state-ref cut (step 5) are dispatched. No slice may be dispatched before its gating step's
+criteria are satisfied.
 
 Date: 05.09.2026. Baseline: `origin/main` = `2bcf3f3` (v0.9.0 plus the #109/#110 Sonar
 cleanup, which changed no contract), tag `v0.9.0`.
@@ -163,7 +165,8 @@ As ruled by the round-2 counter-check. Strictly sequential.
    kind mapping exists.
 3. **Port extraction** — `ForgeReader` / `ForgeWriter`, the GitHub adapter, typed errors. A
    pure extraction against the current call set, with no behaviour change, and it must
-   already satisfy criterion 9.
+   already satisfy criterion 9. Criterion 11's live GitHub custom-ref probe must also be
+   re-run before this step is dispatched.
 4. **One body and relation migration** — the typed block, blockers and parentage from
    structured relations, and the conversion command, in one slice. Blockers never pass
    through the body on GitHub.
