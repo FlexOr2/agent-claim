@@ -14,9 +14,6 @@ authors = [{name = "agent-claim contributors"}]
 [project.scripts]
 agent-claim = "agent_claim.cli:main"
 
-[project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.8", "build>=1"]
-
 [tool.setuptools.packages.find]
 where = ["src"]
 
@@ -38,9 +35,57 @@ target-version = "py311"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "I"]
+# PLR0911 (too-many-return-statements), PLR0912 (too-many-branches) and
+# PLR0915 (too-many-statements) stay unselected: the functions they flag
+# today are open complexity work, split across owners --
+#   main, _parser, _protect_write: #119
+#   _bounded_command: #117
+#   build_board, parse_pull_request_classification,
+#   _acquire_claim_with_observed: the protocol/board complexity slice of
+#   distributor #103 (not yet its own item)
+# -- re-enable once the last of these lands.
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF", "PL", "FURB", "N"]
+ignore = [
+    "PLR0911",
+    "PLR0912",
+    "PLR0915",
+    # `configure_ledger` binds the process-wide ledger issue number once, at
+    # startup, before any CLI action runs -- the one deliberate module-level
+    # configuration global in the codebase, not a state bug awaiting a
+    # refactor. Permanent policy, unlike the PLR091x exclusions above.
+    "PLW0603",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test literals are scenario data, not domain magic numbers; a pytest test
+# function's parameter list is shaped by fixture injection and
+# `parametrize`, not a free design choice, so its argument count isn't a
+# design smell the way a production function's is. This is a standing
+# policy for fixture-shaped signatures, not a per-finding exception, so it
+# stays a file-wide ignore rather than a line marker.
+"tests/**" = ["PLR2004", "PLR0913", "PLR0917"]
+
+[tool.importlinter]
+root_package = "agent_claim"
+
+[[tool.importlinter.contracts]]
+name = "Layers"
+type = "layers"
+containers = ["agent_claim"]
+layers = [
+    "cli",
+    "checkout | discovery",
+    "github",
+    "board",
+    "protocol",
+]
 
 [dependency-groups]
 dev = [
+    "pytest>=8",
     "pytest-cov>=7.1.0",
+    "build>=1",
+    "ruff==0.16.2",
+    "vulture==2.16",
+    "import-linter==2.13",
 ]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -11,7 +12,7 @@ import sys
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from typing import TypeVar
 
 from . import board, protocol
@@ -22,7 +23,7 @@ from .protocol import (
     REPOSITORY_PATTERN,
     TRUSTED_ASSOCIATIONS,
     ClaimError,
-    ClaimUnavailable,
+    ClaimUnavailableError,
     IssueComment,
     _projection_ledger,
     _projection_marker,
@@ -117,15 +118,11 @@ def _close_process_streams(process: subprocess.Popen[bytes]) -> None:
     for stream in (process.stdin, process.stdout, process.stderr):
         if stream is None or stream.closed:
             continue
-        try:
+        with contextlib.suppress(OSError, ValueError):
             stream.close()
-        except (OSError, ValueError):
-            pass
 
 
-def _bounded_command(
-    command: list[str], *, purpose: str, input_data: bytes | None = None
-) -> str:
+def _bounded_command(command: list[str], *, purpose: str, input_data: bytes | None = None) -> str:
     try:
         process = subprocess.Popen(
             command,
@@ -266,10 +263,7 @@ class GitHubIssueComments:
                 ".[] | {id,created_at,updated_at,body,author_association,html_url}",
             ]
         )
-        return tuple(
-            self._parse_comment(value)
-            for value in self._json_lines(raw, "issue-comment")
-        )
+        return tuple(self._parse_comment(value) for value in self._json_lines(raw, "issue-comment"))
 
     def _fetch_pages(
         self, page: Callable[[int], tuple[_Page, ...]], *, per_page: int
@@ -328,8 +322,7 @@ class GitHubIssueComments:
             protocol_bytes += len(parsed.body.encode("utf-8"))
             if len(comments) >= MAX_PROTOCOL_EVENTS or protocol_bytes > MAX_PROTOCOL_BYTES:
                 raise ClaimError(
-                    "claim ledger protocol limit reached; perform the "
-                    "documented ledger rollover"
+                    "claim ledger protocol limit reached; perform the documented ledger rollover"
                 )
             comments.append(parsed)
         return tuple(comments)
@@ -342,10 +335,7 @@ class GitHubIssueComments:
                 comment
                 for comment in page_comments
                 if comment.author_association in TRUSTED_ASSOCIATIONS
-                and PROJECTION_MARKER_PATTERN.fullmatch(
-                    comment.body.partition("\n")[0]
-                )
-                is not None
+                and PROJECTION_MARKER_PATTERN.fullmatch(comment.body.partition("\n")[0]) is not None
             )
             if len(page_comments) < COMMENTS_PER_PAGE:
                 return tuple(projections)
@@ -481,9 +471,7 @@ class GitHubIssueComments:
             raise ClaimError("GitHub returned a malformed pull request")
         detail = self._pull_request_detail(values[0])
         if detail.number != number:
-            raise ClaimError(
-                f"GitHub answered for pull request #{detail.number}, not #{number}"
-            )
+            raise ClaimError(f"GitHub answered for pull request #{detail.number}, not #{number}")
         return detail
 
     def _issue_reference(self, value: object, description: str) -> board.IssueReference:
@@ -562,9 +550,7 @@ class GitHubIssueComments:
         return tuple(children)
 
     def default_branch(self) -> str:
-        branch = self._run(
-            ["api", f"repos/{self.repository}", "--jq", ".default_branch"]
-        )
+        branch = self._run(["api", f"repos/{self.repository}", "--jq", ".default_branch"])
         if protocol.BRANCH_PATTERN.fullmatch(branch) is None:
             raise ClaimError("GitHub returned a malformed default branch")
         return branch
@@ -582,7 +568,7 @@ class GitHubIssueComments:
                     # still correctly signals "no more pages" even when some of
                     # its items are pull requests, filtered out below instead.
                     '.[] | {number,title,labels:(.labels | map(.name)),body:(.body // ""),'
-                    'createdAt:.created_at,updatedAt:.updated_at,'
+                    "createdAt:.created_at,updatedAt:.updated_at,"
                     'isPullRequest:has("pull_request")}'
                 ),
             ]
@@ -628,22 +614,19 @@ class GitHubIssueComments:
             or blocker_state is None
             or not isinstance(is_pull_request, bool)
             or (closed_at is not None and not isinstance(closed_at, str))
-            or (
-                isinstance(closed_at, str)
-                and TIMESTAMP_PATTERN.fullmatch(closed_at) is None
-            )
+            or (isinstance(closed_at, str) and TIMESTAMP_PATTERN.fullmatch(closed_at) is None)
             or (blocker_state is board.BlockerState.CLOSED and closed_at is None)
         ):
             raise ClaimError(self.MALFORMED_BOARD_BLOCKER)
         parsed_closed_at = None
         if closed_at is not None:
             try:
-                parsed_closed_at = datetime.fromisoformat(closed_at.replace("Z", "+00:00"))
+                parsed_closed_at = datetime.fromisoformat(closed_at)
             except ValueError as error:
                 raise ClaimError(self.MALFORMED_BOARD_BLOCKER) from error
             if parsed_closed_at.tzinfo is None:
                 raise ClaimError(self.MALFORMED_BOARD_BLOCKER)
-            parsed_closed_at = parsed_closed_at.astimezone(timezone.utc)
+            parsed_closed_at = parsed_closed_at.astimezone(UTC)
         return board.BlockerReference(
             number,
             blocker_state,
@@ -651,14 +634,10 @@ class GitHubIssueComments:
             parsed_closed_at,
         )
 
-    def list_board_blockers(
-        self, numbers: frozenset[int]
-    ) -> tuple[board.BlockerReference, ...]:
+    def list_board_blockers(self, numbers: frozenset[int]) -> tuple[board.BlockerReference, ...]:
         if not numbers:
             return ()
-        with ThreadPoolExecutor(
-            max_workers=min(len(numbers), PARALLEL_FETCH_CONCURRENCY)
-        ) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(numbers), PARALLEL_FETCH_CONCURRENCY)) as pool:
             return tuple(pool.map(self._board_blocker, sorted(numbers)))
 
     def list_open_board_pull_requests(self) -> tuple[board.PullRequest, ...]:
@@ -710,8 +689,8 @@ class GitHubIssueComments:
     def list_recent_merged_board_pull_requests(
         self, since: datetime
     ) -> tuple[board.PullRequest, ...]:
-        cutoff = since.astimezone(timezone.utc)
-        days = _query_days(cutoff.date(), datetime.now(timezone.utc).date())
+        cutoff = since.astimezone(UTC)
+        days = _query_days(cutoff.date(), datetime.now(UTC).date())
         with ThreadPoolExecutor(max_workers=min(len(days), PARALLEL_FETCH_CONCURRENCY)) as pool:
             shards = list(pool.map(self._merged_pull_requests_for_day, days))
         # GitHub's search date qualifier is an exact UTC day, so slicing the
@@ -723,7 +702,9 @@ class GitHubIssueComments:
         # single query's cap instead truncated the *whole* window), so that is
         # what the residual warning below watches for.
         saturated_days = tuple(
-            day for day, shard in zip(days, shards) if len(shard) >= MAX_RECENT_MERGED_PULL_REQUESTS
+            day
+            for day, shard in zip(days, shards, strict=True)
+            if len(shard) >= MAX_RECENT_MERGED_PULL_REQUESTS
         )
         if saturated_days:
             print(
@@ -738,7 +719,7 @@ class GitHubIssueComments:
             if pull_request.merged_at is None:
                 continue
             try:
-                merged_at = datetime.fromisoformat(pull_request.merged_at.replace("Z", "+00:00"))
+                merged_at = datetime.fromisoformat(pull_request.merged_at)
             except ValueError as error:
                 raise ClaimError("GitHub returned a malformed merged board pull request") from error
             if merged_at >= cutoff:
@@ -752,7 +733,7 @@ class GitHubIssueComments:
                 "--paginate",
                 f"repos/{self.repository}/issues?state=all&labels={claim_label()}&per_page=100",
                 "--jq",
-                ".[] | select(has(\"pull_request\") | not) | .number",
+                '.[] | select(has("pull_request") | not) | .number',
             ]
         )
         issues: list[int] = []
@@ -786,7 +767,7 @@ class GitHubIssueComments:
             or comments != 0
             or successor.get("is_pull_request") is not False
         ):
-            raise ClaimUnavailable(
+            raise ClaimUnavailableError(
                 f"successor #{issue} must be an open, empty, collaborator-locked issue"
             )
 
@@ -832,9 +813,7 @@ class GitHubIssueComments:
             projections = adoptable_projections
         if not projections:
             if has_newer_projection:
-                raise ClaimError(
-                    "owning issue has a projection from a newer ledger generation"
-                )
+                raise ClaimError("owning issue has a projection from a newer ledger generation")
             if not create:
                 return False
             self.post_comment(issue, validated)
@@ -877,6 +856,4 @@ class GitHubIssueComments:
         self._run(["issue", "edit", str(issue), "--repo", self.repository, "--add-label", label])
 
     def remove_label(self, issue: int, label: str) -> None:
-        self._run(
-            ["issue", "edit", str(issue), "--repo", self.repository, "--remove-label", label]
-        )
+        self._run(["issue", "edit", str(issue), "--repo", self.repository, "--remove-label", label])

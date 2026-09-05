@@ -12,7 +12,7 @@ from .protocol import (
     MARKER_SUFFIX,
     TRUSTED_ASSOCIATIONS,
     ClaimError,
-    ClaimUnavailable,
+    ClaimUnavailableError,
     claim_label,
 )
 
@@ -113,7 +113,9 @@ def _select_ledger(rows: tuple[_LedgerIssue, ...]) -> int | None:
         if _issue_first_line(issue) != LEDGER_BODY_MARKER or issue.state == "closed":
             continue
         if not issue.locked:
-            raise ClaimUnavailable(f"ledger candidate #{issue.number} is not locked; run bootstrap")
+            raise ClaimUnavailableError(
+                f"ledger candidate #{issue.number} is not locked; run bootstrap"
+            )
         ledgers.append(issue.number)
     if foreign:
         raise ClaimError(
