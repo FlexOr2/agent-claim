@@ -195,7 +195,7 @@ def test_discovery_refuses_absence_over_a_multi_page_fallback_scan() -> None:
     live open-issue count happens to match; a listing the adapter itself
     reports as spanning more than one page can never prove absence, so this
     must fail loud regardless of what the counts say."""
-    client = FakeForge(ledger_page_count=2)
+    client = FakeForge(ledger_pages_fetched=2)
 
     with pytest.raises(ClaimError, match="could not establish ledger absence") as excinfo:
         issue_claim.discover_ledger(client)
@@ -203,7 +203,7 @@ def test_discovery_refuses_absence_over_a_multi_page_fallback_scan() -> None:
 
 
 def test_discovery_reports_absence_after_a_single_page_fallback_scan() -> None:
-    client = FakeForge(ledger_page_count=1)
+    client = FakeForge(ledger_pages_fetched=1)
     assert issue_claim.discover_ledger(client) is None
 
 
@@ -314,7 +314,7 @@ class FakeForge:
     issue_reference_lookups: list[int] = field(default_factory=list)
     ledger_items: list[forge.LedgerItem] = field(default_factory=list)
     live_open_item_count: int | None = None
-    ledger_page_count: int = 1
+    ledger_pages_fetched: int = 1
     item_labels: dict[int, frozenset[str]] = field(default_factory=dict)
     list_items_calls: list[tuple[forge.ItemState | None, str | None]] = field(default_factory=list)
     list_items_error: Exception | None = None
@@ -334,7 +334,7 @@ class FakeForge:
             if (state is None or item.state is state)
             and (label is None or label in self.item_labels.get(item.number, frozenset()))
         )
-        return forge.Listing(items, self.ledger_page_count)
+        return forge.Listing(items, self.ledger_pages_fetched)
 
     def open_item_count(self) -> int:
         if self.live_open_item_count is not None:
@@ -637,12 +637,63 @@ def test_github_adapter_lists_items_with_state_and_label_filters() -> None:
     assert observed == [
         [
             "api",
-            "--paginate",
-            f"repos/{REPOSITORY}/issues?state=open&labels={issue_claim.LEDGER_LABEL}&per_page=100",
+            f"repos/{REPOSITORY}/issues?state=open&labels={issue_claim.LEDGER_LABEL}"
+            "&per_page=100&page=1",
             "--jq",
             '.[] | {number,state,locked,body,author_association,is_landing:has("pull_request")}',
         ]
     ]
+
+
+@pytest.mark.parametrize(
+    ("total_items", "expected_pages_fetched", "expect_absence_confirmed"),
+    [
+        pytest.param(99, 1, True, id="99-items-one-page-confirms-absence"),
+        pytest.param(100, 2, False, id="100-items-exact-multiple-still-costs-a-second-page"),
+        pytest.param(101, 2, False, id="101-items-two-pages-cannot-confirm-absence"),
+    ],
+)
+def test_github_adapter_reports_truthful_pages_fetched_and_discovery_decides_on_it(
+    total_items: int, expected_pages_fetched: int, expect_absence_confirmed: bool
+) -> None:
+    """`pages_fetched` must never lie at an exact per-page multiple: 100 items
+    still cost a second, empty page to prove nothing follows, and discovery's
+    absence decision rests on exactly that count, not on a derived guess."""
+
+    def ordinary_row(number: int) -> dict[str, object]:
+        return {
+            "number": number,
+            "state": "open",
+            "locked": False,
+            "body": "ordinary open issue",
+            "author_association": "OWNER",
+            "is_landing": False,
+        }
+
+    def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
+        endpoint = arguments[1]
+        if "/issues?" not in endpoint:
+            return str(total_items)
+        if "labels=" in endpoint:
+            return ""
+        page = int(endpoint.rsplit("page=", 1)[1])
+        start = (page - 1) * github.ISSUES_PER_PAGE
+        end = min(start + github.ISSUES_PER_PAGE, total_items)
+        rows = [ordinary_row(number) for number in range(start + 1, end + 1)]
+        return "\n".join(json.dumps(row) for row in rows)
+
+    client = GitHubForge(github._repository_id(REPOSITORY), run=run)
+
+    listing = client.list_items(state=forge.ItemState.OPEN)
+
+    assert listing.pages_fetched == expected_pages_fetched
+    assert len(listing.items) == total_items
+
+    if expect_absence_confirmed:
+        assert issue_claim.discover_ledger(client) is None
+    else:
+        with pytest.raises(ClaimError, match="could not establish ledger absence"):
+            issue_claim.discover_ledger(client)
 
 
 def test_github_adapter_reads_the_open_item_count() -> None:
@@ -5571,14 +5622,10 @@ def test_github_reads_blocker_state_and_pull_request_kind(
 
 
 @pytest.mark.parametrize("state", ["missing", "unknown"])
-def test_github_rejects_blocker_states_the_api_cannot_return(
-    monkeypatch: pytest.MonkeyPatch, state: str
-) -> None:
-    client = GitHubForge(github._repository_id("example/agent-claim"))
-    monkeypatch.setattr(
-        client,
-        "_run",
-        lambda _arguments: json.dumps(
+def test_github_rejects_blocker_states_the_api_cannot_return(state: str) -> None:
+    client = GitHubForge(
+        github._repository_id("example/agent-claim"),
+        run=lambda _arguments: json.dumps(
             {"number": 86, "state": state, "closedAt": None, "isPullRequest": False}
         ),
     )
@@ -5588,12 +5635,10 @@ def test_github_rejects_blocker_states_the_api_cannot_return(
         client.list_board_blockers(raised_argument_1)
 
 
-def test_github_marks_a_missing_blocker_only_after_a_404(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = GitHubForge(github._repository_id("example/agent-claim"))
-    monkeypatch.setattr(
-        client,
-        "_run",
-        lambda _arguments: (_ for _ in ()).throw(
+def test_github_marks_a_missing_blocker_only_after_a_404() -> None:
+    client = GitHubForge(
+        github._repository_id("example/agent-claim"),
+        run=lambda _arguments: (_ for _ in ()).throw(
             forge.ForgeNotFoundError("GitHub API failed: HTTP 404")
         ),
     )
@@ -5775,9 +5820,9 @@ def test_merged_pull_request_history_warns_when_it_reaches_the_result_cap(
         }
         for index in range(1, github.MAX_RECENT_MERGED_PULL_REQUESTS + 1)
     ]
-    client = GitHubForge(github._repository_id("example/agent-claim"))
-    monkeypatch.setattr(
-        client, "_run", lambda arguments: "\n".join(json.dumps(row) for row in saturated_rows)
+    client = GitHubForge(
+        github._repository_id("example/agent-claim"),
+        run=lambda arguments: "\n".join(json.dumps(row) for row in saturated_rows),
     )
 
     pull_requests = client.list_recent_merged_board_pull_requests(since)

@@ -67,7 +67,7 @@ def discover_ledger(client: forge.ForgeReader) -> int | None:
     Only when the labelled query comes back empty — an unlabelled legacy
     ledger, or a genuine absence — does discovery fall back to scanning every
     open issue. That scan can only report absence (return `None`) when the
-    listing's own `page_count` says it was one snapshot; the adapter owns
+    listing's own `pages_fetched` says it was one snapshot; the adapter owns
     what "one page" means for its provider, so this reads only that
     provenance, never a duplicated page-size constant. A fallback the
     listing itself reports as spanning more than one page can never prove
@@ -92,9 +92,9 @@ def discover_ledger(client: forge.ForgeReader) -> int | None:
     ledger = _select_ledger(listing.items)
     if ledger is not None:
         return ledger
-    if listing.page_count > 1:
+    if listing.pages_fetched > 1:
         raise ClaimError(
-            f"could not establish ledger absence over {listing.page_count} pages of "
+            f"could not establish ledger absence over {listing.pages_fetched} pages of "
             "open issues; retry, do not bootstrap"
         )
     if len(listing.items) != client.open_item_count():

@@ -106,16 +106,18 @@ class LedgerItem:
 class Listing:
     """A `list_items` result, plus the provenance discovery needs to judge it.
 
-    `page_count` is the number of paginated fetches the adapter needed to
-    read `items`; only the adapter knows its own page size, so it reports
-    this fact rather than letting a caller infer it from `len(items)` against
-    a duplicated constant. `page_count > 1` means the fetch spanned more than
-    one round trip and can never be trusted to prove absence -- a concurrent
+    `pages_fetched` is the number of paginated requests the adapter actually
+    made to read `items` -- counted in its own paging loop, never inferred
+    from `len(items)` against a duplicated per-page constant (a result sized
+    at an exact multiple of the real page size would otherwise lie: a full
+    page is never assumed to be the last one, so confirming absence costs one
+    more request). `pages_fetched > 1` means the fetch spanned more than one
+    round trip and can never be trusted to prove absence -- a concurrent
     open/close could have shifted an item across the page boundary.
     """
 
     items: tuple[LedgerItem, ...]
-    page_count: int
+    pages_fetched: int
 
 
 class Capability(StrEnum):

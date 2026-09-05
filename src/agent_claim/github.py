@@ -954,17 +954,41 @@ class GitHubForge:
             ["issue", "edit", str(issue), "--repo", self.repository.path, "--remove-label", label]
         )
 
-    def list_items(
-        self, *, state: forge.ItemState | None = None, label: str | None = None
-    ) -> forge.Listing:
-        query_state = "all" if state is None else state.value
-        label_filter = f"&labels={label}" if label else ""
+    def _ledger_item(self, value: object) -> forge.LedgerItem:
+        if not isinstance(value, dict):
+            raise forge.ForgeMalformedResponseError("GitHub returned a malformed ledger issue")
+        number = value.get("number")
+        author_association = value.get("author_association")
+        raw_state = value.get("state")
+        item_state = _LEDGER_ITEM_STATES.get(raw_state) if isinstance(raw_state, str) else None
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, int)
+            or number < 1
+            or item_state is None
+            or not isinstance(value.get("locked"), bool)
+            or not isinstance(value.get("body"), str)
+            or not isinstance(author_association, str)
+            or not isinstance(value.get("is_landing"), bool)
+        ):
+            raise forge.ForgeMalformedResponseError("GitHub returned a malformed ledger issue")
+        return forge.LedgerItem(
+            number,
+            item_state,
+            value["locked"],
+            value["body"],
+            author_association in TRUSTED_ASSOCIATIONS,
+            value["is_landing"],
+        )
+
+    def _ledger_items_page(
+        self, page_number: int, *, query_state: str, label_filter: str
+    ) -> tuple[object, ...]:
         raw = self._run(
             [
                 "api",
-                "--paginate",
                 f"repos/{self.repository}/issues?state={query_state}{label_filter}"
-                f"&per_page={ISSUES_PER_PAGE}",
+                f"&per_page={ISSUES_PER_PAGE}&page={page_number}",
                 "--jq",
                 (
                     ".[] | {number,state,locked,body,author_association,"
@@ -972,44 +996,34 @@ class GitHubForge:
                 ),
             ]
         )
+        return self._json_lines(raw, "ledger-issue")
+
+    def list_items(
+        self, *, state: forge.ItemState | None = None, label: str | None = None
+    ) -> forge.Listing:
+        """Every matching issue, plus the true count of pages this fetch took.
+
+        Fetched one page at a time (never `--paginate`, which would hide that
+        count inside `gh`) so `pages_fetched` is the fact it claims to be, not
+        a guess derived from `len(items)` against the per-page size: a full
+        page is never assumed to be the last one, so an exact multiple of
+        `ISSUES_PER_PAGE` still costs the extra page that proves nothing
+        follows.
+        """
+        query_state = "all" if state is None else state.value
+        label_filter = f"&labels={label}" if label else ""
         items: list[forge.LedgerItem] = []
-        for value in self._json_lines(raw, "ledger-issue"):
-            if not isinstance(value, dict):
-                raise forge.ForgeMalformedResponseError("GitHub returned a malformed ledger issue")
-            number = value.get("number")
-            author_association = value.get("author_association")
-            raw_state = value.get("state")
-            item_state = _LEDGER_ITEM_STATES.get(raw_state) if isinstance(raw_state, str) else None
-            if (
-                isinstance(number, bool)
-                or not isinstance(number, int)
-                or number < 1
-                or item_state is None
-                or not isinstance(value.get("locked"), bool)
-                or not isinstance(value.get("body"), str)
-                or not isinstance(author_association, str)
-                or not isinstance(value.get("is_landing"), bool)
-            ):
-                raise forge.ForgeMalformedResponseError("GitHub returned a malformed ledger issue")
-            items.append(
-                forge.LedgerItem(
-                    number,
-                    item_state,
-                    value["locked"],
-                    value["body"],
-                    author_association in TRUSTED_ASSOCIATIONS,
-                    value["is_landing"],
-                )
+        pages_fetched = 0
+        page_number = 1
+        while True:
+            page_values = self._ledger_items_page(
+                page_number, query_state=query_state, label_filter=label_filter
             )
-        # `--paginate` already followed every page GitHub offered; a result at
-        # or past the per-page cap could only have come from more than one
-        # HTTP round trip (GitHub still probes for a next page after a full
-        # one), so that is the only signal available for "provably one
-        # snapshot" -- the exact page count is diagnostic text, not a
-        # contract, so this floor need not match GitHub's request count byte
-        # for byte.
-        page_count = len(items) // ISSUES_PER_PAGE + 1
-        return forge.Listing(tuple(items), page_count)
+            pages_fetched += 1
+            items.extend(self._ledger_item(value) for value in page_values)
+            if len(page_values) < ISSUES_PER_PAGE:
+                return forge.Listing(tuple(items), pages_fetched)
+            page_number += 1
 
     def open_item_count(self) -> int:
         raw = self._run(["api", f"repos/{self.repository}", "--jq", ".open_issues_count"])
