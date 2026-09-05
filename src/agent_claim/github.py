@@ -122,9 +122,11 @@ def _close_process_streams(process: subprocess.Popen[bytes]) -> None:
             stream.close()
 
 
-def _bounded_command(command: list[str], *, purpose: str, input_data: bytes | None = None) -> str:
+def _start_bounded_process(
+    command: list[str], *, purpose: str, input_data: bytes | None
+) -> subprocess.Popen[bytes]:
     try:
-        process = subprocess.Popen(
+        return subprocess.Popen(
             command,
             stdin=subprocess.PIPE if input_data is not None else None,
             stdout=subprocess.PIPE,
@@ -135,75 +137,134 @@ def _bounded_command(command: list[str], *, purpose: str, input_data: bytes | No
         if isinstance(error, FileNotFoundError):
             raise ClaimError(f"{command[0]} is required for issue claims") from error
         raise ClaimError(f"cannot start {purpose}: {error}") from error
+
+
+def _register_process_streams(
+    selector: selectors.BaseSelector,
+    process: subprocess.Popen[bytes],
+    input_data: bytes | None,
+) -> memoryview | None:
+    assert process.stdout is not None
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    if input_data is None:
+        return None
+    assert process.stdin is not None
+    os.set_blocking(process.stdin.fileno(), False)
+    selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+    return memoryview(input_data)
+
+
+def _await_process_io_events(
+    selector: selectors.BaseSelector,
+    process: subprocess.Popen[bytes],
+    deadline: float,
+    purpose: str,
+) -> list[tuple[selectors.SelectorKey, int]]:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        _stop_process(process)
+        raise ClaimError(f"{purpose} timed out")
+    try:
+        events = selector.select(remaining)
+    except OSError as error:
+        raise ClaimError(f"{purpose} failed while waiting for I/O: {error}") from error
+    if not events:
+        _stop_process(process)
+        raise ClaimError(f"{purpose} timed out")
+    return events
+
+
+def _write_process_input(
+    key: selectors.SelectorKey,
+    pending_input: memoryview,
+    selector: selectors.BaseSelector,
+    process: subprocess.Popen[bytes],
+    purpose: str,
+) -> memoryview:
+    try:
+        written = os.write(key.fileobj.fileno(), pending_input)
+    except BrokenPipeError:
+        written = len(pending_input)
+    except OSError as error:
+        _stop_process(process)
+        raise ClaimError(f"{purpose} failed while sending bounded input: {error}") from error
+    remaining_input = pending_input[written:]
+    if not remaining_input:
+        selector.unregister(key.fileobj)
+        key.fileobj.close()
+    return remaining_input
+
+
+def _read_process_output(
+    key: selectors.SelectorKey,
+    selector: selectors.BaseSelector,
+    output: bytearray,
+    process: subprocess.Popen[bytes],
+    purpose: str,
+) -> None:
+    try:
+        chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+    except OSError as error:
+        raise ClaimError(f"{purpose} failed while reading output: {error}") from error
+    if not chunk:
+        selector.unregister(key.fileobj)
+        return
+    output.extend(chunk)
+    if len(output) > MAX_COMMAND_OUTPUT_BYTES:
+        _stop_process(process)
+        raise ClaimError(f"{purpose} exceeded its output limit")
+
+
+def _wait_for_process_exit(process: subprocess.Popen[bytes], purpose: str) -> int:
+    try:
+        return process.wait(timeout=1)
+    except subprocess.TimeoutExpired as error:
+        _stop_process(process)
+        raise ClaimError(f"{purpose} did not exit after closing its output") from error
+
+
+def _reap_bounded_process(
+    selector: selectors.BaseSelector | None,
+    process: subprocess.Popen[bytes],
+) -> None:
+    try:
+        if selector is not None:
+            selector.close()
+    except OSError:
+        pass
+    finally:
+        _close_process_streams(process)
+        if process.poll() is None:
+            _stop_process(process)
+
+
+def _exchange_bounded_io(
+    process: subprocess.Popen[bytes], *, purpose: str, input_data: bytes | None
+) -> tuple[bytes, int]:
     selector: selectors.BaseSelector | None = None
     try:
-        assert process.stdout is not None
         deadline = time.monotonic() + GH_TIMEOUT_SECONDS
         output = bytearray()
         selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
-        pending_input = memoryview(input_data) if input_data is not None else None
-        if pending_input is not None:
-            assert process.stdin is not None
-            os.set_blocking(process.stdin.fileno(), False)
-            selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+        pending_input = _register_process_streams(selector, process, input_data)
         while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                _stop_process(process)
-                raise ClaimError(f"{purpose} timed out")
-            try:
-                events = selector.select(remaining)
-            except OSError as error:
-                raise ClaimError(f"{purpose} failed while waiting for I/O: {error}") from error
-            if not events:
-                _stop_process(process)
-                raise ClaimError(f"{purpose} timed out")
+            events = _await_process_io_events(selector, process, deadline, purpose)
             for key, _ in events:
                 if key.data == "stdin":
                     assert pending_input is not None
-                    try:
-                        written = os.write(key.fileobj.fileno(), pending_input)
-                    except BrokenPipeError:
-                        written = len(pending_input)
-                    except OSError as error:
-                        _stop_process(process)
-                        raise ClaimError(
-                            f"{purpose} failed while sending bounded input: {error}"
-                        ) from error
-                    pending_input = pending_input[written:]
-                    if not pending_input:
-                        selector.unregister(key.fileobj)
-                        key.fileobj.close()
+                    pending_input = _write_process_input(
+                        key, pending_input, selector, process, purpose
+                    )
                     continue
-                try:
-                    chunk = os.read(key.fileobj.fileno(), 64 * 1024)
-                except OSError as error:
-                    raise ClaimError(f"{purpose} failed while reading output: {error}") from error
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                output.extend(chunk)
-                if len(output) > MAX_COMMAND_OUTPUT_BYTES:
-                    _stop_process(process)
-                    raise ClaimError(f"{purpose} exceeded its output limit")
-        try:
-            return_code = process.wait(timeout=1)
-        except subprocess.TimeoutExpired as error:
-            _stop_process(process)
-            raise ClaimError(f"{purpose} did not exit after closing its output") from error
+                _read_process_output(key, selector, output, process, purpose)
+        return bytes(output), _wait_for_process_exit(process, purpose)
     except OSError as error:
         raise ClaimError(f"{purpose} failed while coordinating I/O: {error}") from error
     finally:
-        try:
-            if selector is not None:
-                selector.close()
-        except OSError:
-            pass
-        finally:
-            _close_process_streams(process)
-            if process.poll() is None:
-                _stop_process(process)
+        _reap_bounded_process(selector, process)
+
+
+def _decoded_command_output(output: bytes, return_code: int, *, purpose: str) -> str:
     try:
         decoded = strip_ansi(output.decode("utf-8")).strip()
     except UnicodeDecodeError as error:
@@ -211,6 +272,12 @@ def _bounded_command(command: list[str], *, purpose: str, input_data: bytes | No
     if return_code != 0:
         raise ClaimError(decoded or f"{purpose} failed with exit {return_code}")
     return decoded
+
+
+def _bounded_command(command: list[str], *, purpose: str, input_data: bytes | None = None) -> str:
+    process = _start_bounded_process(command, purpose=purpose, input_data=input_data)
+    output, return_code = _exchange_bounded_io(process, purpose=purpose, input_data=input_data)
+    return _decoded_command_output(output, return_code, purpose=purpose)
 
 
 class GitHubIssueComments:

@@ -242,9 +242,7 @@ def _create_ledger(client: GitHubIssueComments) -> int:
     return number
 
 
-def bootstrap_ledger(client: GitHubIssueComments) -> int:
-    """Create/adopt one ledger and make racing first starts converge to the earliest issue."""
-    rows = _ledger_issue_rows(client)
+def _refuse_competing_contracts(rows: tuple[_LedgerIssue, ...]) -> None:
     foreign = [
         issue.number
         for issue in rows
@@ -257,21 +255,10 @@ def bootstrap_ledger(client: GitHubIssueComments) -> int:
         raise ClaimError(
             f"another coordination contract exists on issue(s) {foreign}; refusing to compete"
         )
-    candidates: list[_LedgerIssue] = []
-    for issue in rows:
-        if (
-            issue.is_pull_request
-            or issue.state != "open"
-            or _issue_first_line(issue) != LEDGER_BODY_MARKER
-            or not _trusted_ledger_issue(issue)
-        ):
-            continue
-        if issue.locked or issue.author_association in TRUSTED_ASSOCIATIONS:
-            candidates.append(issue)
-    if not candidates:
-        _create_ledger(client)
-    rows = _ledger_issue_rows(client)
-    candidates = [
+
+
+def _trusted_ledger_candidates(rows: tuple[_LedgerIssue, ...]) -> tuple[_LedgerIssue, ...]:
+    return tuple(
         issue
         for issue in rows
         if not issue.is_pull_request
@@ -279,9 +266,12 @@ def bootstrap_ledger(client: GitHubIssueComments) -> int:
         and _issue_first_line(issue) == LEDGER_BODY_MARKER
         and _trusted_ledger_issue(issue)
         and (issue.locked or issue.author_association in TRUSTED_ASSOCIATIONS)
-    ]
-    if not candidates:
-        raise ClaimError("bootstrap did not expose a trusted ledger candidate; retry")
+    )
+
+
+def _converge_on_canonical_ledger(
+    client: GitHubIssueComments, candidates: tuple[_LedgerIssue, ...]
+) -> int:
     canonical = min(issue.number for issue in candidates)
     for issue in candidates:
         if not issue.locked:
@@ -300,3 +290,15 @@ def bootstrap_ledger(client: GitHubIssueComments) -> int:
         )
         client._run(["issue", "close", str(issue.number), "--repo", client.repository])
     return canonical
+
+
+def bootstrap_ledger(client: GitHubIssueComments) -> int:
+    """Create/adopt one ledger and make racing first starts converge to the earliest issue."""
+    rows = _ledger_issue_rows(client)
+    _refuse_competing_contracts(rows)
+    if not _trusted_ledger_candidates(rows):
+        _create_ledger(client)
+    candidates = _trusted_ledger_candidates(_ledger_issue_rows(client))
+    if not candidates:
+        raise ClaimError("bootstrap did not expose a trusted ledger candidate; retry")
+    return _converge_on_canonical_ledger(client, candidates)
