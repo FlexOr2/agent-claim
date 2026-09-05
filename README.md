@@ -7,8 +7,8 @@ Codex, Claude, Grok, people, and future agents use the same contract.
 ## Install and maintain
 
 ```bash
-uv tool install git+https://github.com/FlexOr2/agent-claim.git@v0.9.0
-# or: pipx install git+https://github.com/FlexOr2/agent-claim.git@v0.9.0
+uv tool install git+https://github.com/FlexOr2/agent-claim.git@v0.10.0
+# or: pipx install git+https://github.com/FlexOr2/agent-claim.git@v0.10.0
 uv tool upgrade agent-claim
 uv tool uninstall agent-claim
 ```
