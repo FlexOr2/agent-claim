@@ -4399,11 +4399,11 @@ def test_rescope_refuses_dropping_a_path_it_does_not_hold() -> None:
     client = FakeComments()
     acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
 
-    raised_argument_1 = IssueIdentity(72)
+    identity = IssueIdentity(72)
     with pytest.raises(ClaimUnavailableError, match=re.escape("cannot drop 'docs/PRODUCT.md'")):
         rescope_claim(
             client,
-            raised_argument_1,
+            identity,
             "Codex Sol",
             (),
             ("docs/PRODUCT.md",),
@@ -4415,21 +4415,21 @@ def test_rescope_refuses_an_empty_or_unchanged_scope() -> None:
     client = FakeComments()
     acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
 
-    raised_argument_1 = IssueIdentity(72)
+    identity = IssueIdentity(72)
     with pytest.raises(ClaimUnavailableError, match="non-empty scope"):
         rescope_claim(
             client,
-            raised_argument_1,
+            identity,
             "Codex Sol",
             (),
             ("src/widget.py",),
             "claim-a",
         )
-    raised_argument_1 = IssueIdentity(72)
+    identity = IssueIdentity(72)
     with pytest.raises(ClaimUnavailableError, match="does not change"):
         rescope_claim(
             client,
-            raised_argument_1,
+            identity,
             "Codex Sol",
             ("src/widget.py",),
             (),
@@ -4441,11 +4441,11 @@ def test_rescope_refuses_a_foreign_agent() -> None:
     client = FakeComments()
     acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
 
-    raised_argument_1 = IssueIdentity(72)
+    identity = IssueIdentity(72)
     with pytest.raises(ClaimUnavailableError, match="only the original claimant"):
         rescope_claim(
             client,
-            raised_argument_1,
+            identity,
             "Grok 4.6",
             ("src/new.py",),
             (),
@@ -4773,15 +4773,15 @@ def test_release_refuses_foreign_actor_without_explicit_override() -> None:
     client = FakeComments()
     acquired = acquire_claim(client, request(issue=72))
 
-    raised_argument_1 = IssueIdentity(72)
-    raised_argument_2 = protocol.AbandonedRelease("takeover")
+    identity = IssueIdentity(72)
+    takeover_release = protocol.AbandonedRelease("takeover")
     with pytest.raises(ClaimUnavailableError, match="original claimant"):
         release_claim(
             client,
-            raised_argument_1,
+            identity,
             "Other",
             "builder",
-            raised_argument_2,
+            takeover_release,
             acquired.claim_id,
         )
 
@@ -4887,9 +4887,9 @@ def test_release_claim_omitted_id_fails_closed_for_wrong_agent_branch_or_two_mat
     client = _claims_client(*standing)
     protocol_count = len(client.list_protocol_candidates(LEDGER_ISSUE))
 
-    raised_argument_1 = IssueIdentity(72)
+    identity = IssueIdentity(72)
     with pytest.raises(ClaimUnavailableError, match="pass --claim-id") as raised:
-        release_claim(client, raised_argument_1, agent, None, LANDED, None, branch=branch)
+        release_claim(client, identity, agent, None, LANDED, None, branch=branch)
 
     assert "conflicting claims" not in str(raised.value)
     assert len(client.list_protocol_candidates(LEDGER_ISSUE)) == protocol_count
@@ -4923,9 +4923,9 @@ def test_release_claim_omitted_id_requires_branch_and_does_not_call_git(
         request("mine", "Ada", issue=72, role="reviewer", branch="lane-72", scope=("src",))
     )
 
-    raised_argument_1 = IssueIdentity(72)
+    identity = IssueIdentity(72)
     with pytest.raises(ClaimUnavailableError, match="current branch"):
-        release_claim(client, raised_argument_1, "Ada", None, LANDED, None)
+        release_claim(client, identity, "Ada", None, LANDED, None)
     assert len(client.list_protocol_candidates(LEDGER_ISSUE)) == 1
 
     released = release_claim(client, IssueIdentity(72), "Ada", None, LANDED, None, branch="lane-72")
@@ -4938,11 +4938,11 @@ def test_release_claim_override_fails_before_ledger_without_the_coordinator_role
 ) -> None:
     client = FakeComments()
 
-    raised_argument_1 = IssueIdentity(72)
+    identity = IssueIdentity(72)
     with pytest.raises(ClaimUnavailableError, match="--role coordinator"):
         release_claim(
             client,
-            raised_argument_1,
+            identity,
             "Ada",
             role,
             LANDED,
@@ -6621,9 +6621,9 @@ def test_claim_request_binds_omitted_base_and_branch_to_checkout(
 def test_claim_still_requires_scope_and_supersede_still_requires_role(
     arguments: list[str],
 ) -> None:
-    raised_argument_1 = issue_claim._parser()
+    parser = issue_claim._parser()
     with pytest.raises(SystemExit) as exited:
-        raised_argument_1.parse_args(arguments)
+        parser.parse_args(arguments)
 
     assert exited.value.code == 2
 
@@ -6746,9 +6746,9 @@ def test_claim_and_release_parse_omitted_agent(
 
 def test_supersede_still_requires_agent(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_agent_identity_env(monkeypatch)
-    raised_argument_1 = issue_claim._parser()
+    parser = issue_claim._parser()
     with pytest.raises(SystemExit) as exited:
-        raised_argument_1.parse_args(
+        parser.parse_args(
             [
                 "supersede",
                 "170",
@@ -7987,9 +7987,9 @@ def test_cli_claim_and_release_accept_json_while_parent_and_bootstrap_reject_it(
     assert omitted_claim.json is False
     assert omitted_release.json is False
     for arguments in (["--json", "status"], ["bootstrap", "--json"]):
-        raised_argument_1 = issue_claim._parser()
+        parser = issue_claim._parser()
         with pytest.raises(SystemExit) as exited:
-            raised_argument_1.parse_args(arguments)
+            parser.parse_args(arguments)
         assert exited.value.code == 2
 
 
@@ -11926,9 +11926,9 @@ def test_release_abandoned_records_why_the_lane_stopped(
     ],
 )
 def test_release_requires_exactly_one_landing_outcome(arguments: list[str]) -> None:
-    raised_argument_1 = issue_claim._parser()
+    parser = issue_claim._parser()
     with pytest.raises(SystemExit) as exited:
-        raised_argument_1.parse_args(arguments)
+        parser.parse_args(arguments)
 
     assert exited.value.code == 2
 
