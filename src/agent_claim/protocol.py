@@ -842,6 +842,49 @@ class ClaimLedgerAggregate:
     terminated_by: Mapping[str, tuple[IssueComment, ...]]
 
 
+def _record_claim_occurrence(
+    event: ActiveClaim,
+    active: dict[str, ActiveClaim],
+    acquired: dict[str, ActiveClaim],
+    occurrences: dict[str, list[ActiveClaim]],
+    duplicate_claim_ids: list[str],
+) -> None:
+    occurrences.setdefault(event.claim_id, []).append(event)
+    if event.claim_id in acquired:
+        if event.claim_id not in duplicate_claim_ids:
+            duplicate_claim_ids.append(event.claim_id)
+        return
+    acquired[event.claim_id] = event
+    active[event.claim_id] = event
+
+
+def _apply_claim_rescope_event(
+    event: ClaimRescope, active: dict[str, ActiveClaim], acquired: dict[str, ActiveClaim]
+) -> None:
+    current = active.get(event.claim_id)
+    if current is None:
+        if event.claim_id in acquired:
+            raise InvalidClaimMarkerError(
+                f"claim id {event.claim_id!r} was rescoped after it was released"
+            )
+        raise InvalidClaimMarkerError(
+            f"claim id {event.claim_id!r} was rescoped before it was acquired"
+        )
+    if current.identity != event.identity:
+        raise InvalidClaimMarkerError(
+            f"claim id {event.claim_id!r} rescope targets the wrong claim"
+        )
+    if (current.agent, current.role) != (event.agent, event.role):
+        raise InvalidClaimMarkerError(
+            f"claim id {event.claim_id!r} can only be rescoped by its claimant"
+        )
+    active[event.claim_id] = replace(
+        current,
+        scope=event.scope,
+        whole_reason=(current.whole_reason if event.whole_reason is None else event.whole_reason),
+    )
+
+
 def _aggregate_claim_events(comments: tuple[IssueComment, ...]) -> ClaimLedgerAggregate:
     """Walk the ledger once, tolerating a reused claim id instead of raising on sight.
 
@@ -860,39 +903,10 @@ def _aggregate_claim_events(comments: tuple[IssueComment, ...]) -> ClaimLedgerAg
         if event is None:
             continue
         if isinstance(event, ActiveClaim):
-            occurrences.setdefault(event.claim_id, []).append(event)
-            if event.claim_id in acquired:
-                if event.claim_id not in duplicate_claim_ids:
-                    duplicate_claim_ids.append(event.claim_id)
-                continue
-            acquired[event.claim_id] = event
-            active[event.claim_id] = event
+            _record_claim_occurrence(event, active, acquired, occurrences, duplicate_claim_ids)
             continue
         if isinstance(event, ClaimRescope):
-            current = active.get(event.claim_id)
-            if current is None:
-                if event.claim_id in acquired:
-                    raise InvalidClaimMarkerError(
-                        f"claim id {event.claim_id!r} was rescoped after it was released"
-                    )
-                raise InvalidClaimMarkerError(
-                    f"claim id {event.claim_id!r} was rescoped before it was acquired"
-                )
-            if current.identity != event.identity:
-                raise InvalidClaimMarkerError(
-                    f"claim id {event.claim_id!r} rescope targets the wrong claim"
-                )
-            if (current.agent, current.role) != (event.agent, event.role):
-                raise InvalidClaimMarkerError(
-                    f"claim id {event.claim_id!r} can only be rescoped by its claimant"
-                )
-            active[event.claim_id] = replace(
-                current,
-                scope=event.scope,
-                whole_reason=(
-                    current.whole_reason if event.whole_reason is None else event.whole_reason
-                ),
-            )
+            _apply_claim_rescope_event(event, active, acquired)
             continue
         if _apply_terminal_event(event, active, acquired):
             terminated_by.setdefault(event.claim_id, []).append(event.comment)
@@ -918,6 +932,56 @@ def _aggregate_claim_events(comments: tuple[IssueComment, ...]) -> ClaimLedgerAg
     )
 
 
+def _assign_resource_values(
+    derived: dict[str, ActiveClaim], first_occurrences: list[ActiveClaim], name: str
+) -> None:
+    """Occupy `name`'s posted values, then fill auto intents with the next free integer."""
+    intents = sorted(
+        (event for event in first_occurrences if event.requested_resource == name),
+        key=lambda event: (event.comment.created_at, event.comment.identifier),
+    )
+    occupied: set[int] = set()
+    for intent in intents:
+        if intent.resource is not None:
+            occupied.add(intent.resource.value)
+            continue
+        value = 1
+        while value in occupied:
+            value += 1
+        occupied.add(value)
+        current = derived.get(intent.claim_id)
+        if current is None:
+            continue
+        derived[intent.claim_id] = replace(current, resource=ResourceHold(name, value))
+
+
+def _group_active_holders(
+    derived: dict[str, ActiveClaim],
+) -> dict[tuple[str, int], list[ActiveClaim]]:
+    holders: dict[tuple[str, int], list[ActiveClaim]] = {}
+    for claim in derived.values():
+        if claim.resource is not None:
+            holders.setdefault((claim.resource.name, claim.resource.value), []).append(claim)
+    return holders
+
+
+def _strip_duplicate_holders(
+    derived: dict[str, ActiveClaim],
+    holders: dict[tuple[str, int], list[ActiveClaim]],
+    first_by_id: dict[str, ActiveClaim],
+) -> None:
+    """Among claims that live for the same (name, value), keep only the earliest holder."""
+    for held in holders.values():
+        ordered = sorted(
+            held, key=lambda claim: (claim.comment.created_at, claim.comment.identifier)
+        )
+        for loser in ordered[1:]:
+            first = first_by_id.get(loser.claim_id)
+            if first is None or first.resource is None:
+                continue
+            derived[loser.claim_id] = replace(loser, resource=None)
+
+
 def _apply_derived_resource_holds(
     active: dict[str, ActiveClaim],
     occurrences: Mapping[str, tuple[ActiveClaim, ...]],
@@ -940,37 +1004,10 @@ def _apply_derived_resource_holds(
         }
     )
     for name in names:
-        intents = sorted(
-            (event for event in first_occurrences if event.requested_resource == name),
-            key=lambda event: (event.comment.created_at, event.comment.identifier),
-        )
-        occupied: set[int] = set()
-        for intent in intents:
-            if intent.resource is not None:
-                occupied.add(intent.resource.value)
-                continue
-            value = 1
-            while value in occupied:
-                value += 1
-            occupied.add(value)
-            current = derived.get(intent.claim_id)
-            if current is None:
-                continue
-            derived[intent.claim_id] = replace(current, resource=ResourceHold(name, value))
-    holders: dict[tuple[str, int], list[ActiveClaim]] = {}
+        _assign_resource_values(derived, first_occurrences, name)
     first_by_id = {event.claim_id: event for event in first_occurrences}
-    for claim in derived.values():
-        if claim.resource is not None:
-            holders.setdefault((claim.resource.name, claim.resource.value), []).append(claim)
-    for held in holders.values():
-        ordered = sorted(
-            held, key=lambda claim: (claim.comment.created_at, claim.comment.identifier)
-        )
-        for loser in ordered[1:]:
-            first = first_by_id.get(loser.claim_id)
-            if first is None or first.resource is None:
-                continue
-            derived[loser.claim_id] = replace(loser, resource=None)
+    holders = _group_active_holders(derived)
+    _strip_duplicate_holders(derived, holders, first_by_id)
     return derived
 
 
@@ -1625,23 +1662,8 @@ class ClaimPostedReconcileFailedError(ClaimError):
         super().__init__(str(error))
 
 
-def _acquire_claim_with_observed(
-    client: IssueComments, request: ClaimRequest
-) -> tuple[ActiveClaim, tuple[ActiveClaim, ...]]:
-    """`acquire_claim`, plus the active claims its own post-mutation race check already read.
-
-    The caller's advisory "touches" note (`conflicting_claims`) needs exactly
-    that same post-mutation ledger snapshot; returning it here lets the CLI
-    reuse it instead of paying for another full ledger-comments fetch right
-    after this one (the wait `claim` was reported hanging on, since it landed
-    after the mutating post was already visible on the ledger).
-    """
-    aggregate = _aggregate_claim_events(client.list_protocol_candidates(LEDGER_ISSUE))
-    _reject_duplicate_claim_ids(aggregate)
-    request = _assigned_request(request)
-    replayed = matching_claim_retry(aggregate.active, request)
-    if replayed is not None:
-        return replayed, aggregate.active
+def _reject_unavailable_claim(aggregate: ClaimLedgerAggregate, request: ClaimRequest) -> None:
+    """Raise if `request` cannot be posted against the ledger's current standing."""
     if request.claim_id in aggregate.seen_claim_ids:
         raise ClaimUnavailableError(
             f"claim id {request.claim_id!r} is already on this ledger, active or "
@@ -1666,6 +1688,8 @@ def _acquire_claim_with_observed(
                 f"{_identity_summary(owner.identity, owner.branch)}"
             )
 
+
+def _post_claim_and_observe(client: IssueComments, request: ClaimRequest) -> ClaimLedgerAggregate:
     client.post_comment(LEDGER_ISSUE, claim_comment(request))
     post_aggregate = _aggregate_claim_events(client.list_protocol_candidates(LEDGER_ISSUE))
     if request.claim_id in post_aggregate.duplicate_claim_ids:
@@ -1675,6 +1699,90 @@ def _acquire_claim_with_observed(
             "again with a fresh --claim-id"
         )
     _reject_duplicate_claim_ids(post_aggregate)
+    return post_aggregate
+
+
+def _resolve_identity_race(
+    client: IssueComments,
+    request: ClaimRequest,
+    own: ActiveClaim,
+    observed: tuple[ActiveClaim, ...],
+) -> None:
+    identity_competitors = blocking_claims(observed, own)
+    if not identity_competitors:
+        return
+    winner = min(
+        (own, *identity_competitors),
+        key=lambda claim: (claim.comment.created_at, claim.comment.identifier),
+    )
+    if winner.claim_id == request.claim_id:
+        return
+    client.post_comment(
+        LEDGER_ISSUE, release_comment(own, request.agent, request.role, "claim race lost")
+    )
+    _reconcile_identity(client, request.identity)
+    _reconcile_identity(client, winner.identity)
+    raise ClaimUnavailableError(
+        f"{_identity_summary(request.identity, request.branch)} claim race lost to "
+        f"{winner.agent} ({winner.role}) on "
+        f"{_identity_summary(winner.identity, winner.branch)} branch {winner.branch}"
+    )
+
+
+def _resolve_resource_race(
+    client: IssueComments,
+    request: ClaimRequest,
+    own: ActiveClaim,
+    observed: tuple[ActiveClaim, ...],
+) -> None:
+    if request.resource is None:
+        return
+    if request.resource_value is None:
+        hold = own.resource
+        if hold is None or hold.name != request.resource:
+            raise ClaimError(
+                f"{_identity_summary(request.identity, request.branch)} requested "
+                f"{request.resource} but derivation produced no hold"
+            )
+        return
+    expected = ResourceHold(request.resource, request.resource_value)
+    if own.resource == expected:
+        return
+    holder = next((claim for claim in observed if claim.resource == expected), None)
+    client.post_comment(
+        LEDGER_ISSUE, release_comment(own, request.agent, request.role, "claim race lost")
+    )
+    _reconcile_identity(client, request.identity)
+    if holder is not None:
+        _reconcile_identity(client, holder.identity)
+        raise ClaimUnavailableError(
+            f"{expected.name} {expected.value} is held by "
+            f"{holder.agent} ({holder.role}) on "
+            f"{_identity_summary(holder.identity, holder.branch)}"
+        )
+    raise ClaimUnavailableError(f"{expected.name} {expected.value} is held by another claim")
+
+
+def _acquire_claim_with_observed(
+    client: IssueComments, request: ClaimRequest
+) -> tuple[ActiveClaim, tuple[ActiveClaim, ...]]:
+    """`acquire_claim`, plus the active claims its own post-mutation race check already read.
+
+    The caller's advisory "touches" note (`conflicting_claims`) needs exactly
+    that same post-mutation ledger snapshot; returning it here lets the CLI
+    reuse it instead of paying for another full ledger-comments fetch right
+    after this one (the wait `claim` was reported hanging on, since it landed
+    after the mutating post was already visible on the ledger).
+    """
+    aggregate = _aggregate_claim_events(client.list_protocol_candidates(LEDGER_ISSUE))
+    _reject_duplicate_claim_ids(aggregate)
+    request = _assigned_request(request)
+    replayed = matching_claim_retry(aggregate.active, request)
+    if replayed is not None:
+        return replayed, aggregate.active
+    _reject_unavailable_claim(aggregate, request)
+
+    post_aggregate = _post_claim_and_observe(client, request)
     observed = post_aggregate.active
     own = next((claim for claim in observed if claim.claim_id == request.claim_id), None)
     if own is None:
@@ -1682,53 +1790,8 @@ def _acquire_claim_with_observed(
             f"{_identity_summary(request.identity, request.branch)} did not expose "
             "the posted claim id"
         )
-    identity_competitors = blocking_claims(observed, own)
-    if identity_competitors:
-        winner = min(
-            (own, *identity_competitors),
-            key=lambda claim: (claim.comment.created_at, claim.comment.identifier),
-        )
-        if winner.claim_id != request.claim_id:
-            client.post_comment(
-                LEDGER_ISSUE,
-                release_comment(own, request.agent, request.role, "claim race lost"),
-            )
-            _reconcile_identity(client, request.identity)
-            _reconcile_identity(client, winner.identity)
-            raise ClaimUnavailableError(
-                f"{_identity_summary(request.identity, request.branch)} claim race lost to "
-                f"{winner.agent} ({winner.role}) on "
-                f"{_identity_summary(winner.identity, winner.branch)} branch {winner.branch}"
-            )
-    if request.resource is not None and request.resource_value is not None:
-        expected = ResourceHold(request.resource, request.resource_value)
-        if own.resource != expected:
-            holder = next(
-                (claim for claim in observed if claim.resource == expected),
-                None,
-            )
-            client.post_comment(
-                LEDGER_ISSUE,
-                release_comment(own, request.agent, request.role, "claim race lost"),
-            )
-            _reconcile_identity(client, request.identity)
-            if holder is not None:
-                _reconcile_identity(client, holder.identity)
-                raise ClaimUnavailableError(
-                    f"{expected.name} {expected.value} is held by "
-                    f"{holder.agent} ({holder.role}) on "
-                    f"{_identity_summary(holder.identity, holder.branch)}"
-                )
-            raise ClaimUnavailableError(
-                f"{expected.name} {expected.value} is held by another claim"
-            )
-    elif request.resource is not None:
-        hold = own.resource
-        if hold is None or hold.name != request.resource:
-            raise ClaimError(
-                f"{_identity_summary(request.identity, request.branch)} requested "
-                f"{request.resource} but derivation produced no hold"
-            )
+    _resolve_identity_race(client, request, own, observed)
+    _resolve_resource_race(client, request, own, observed)
 
     try:
         _reconcile_identity(client, request.identity)
@@ -1779,6 +1842,45 @@ def _observe_rescoped_claim(
     return observed, own
 
 
+@dataclass(frozen=True)
+class _ClaimLookup:
+    """Which single active claim a rescope or release names: by id, or the caller's
+    one claim for this identity on the checkout branch."""
+
+    identity: ClaimIdentity
+    agent: str
+    claim_id: str | None
+    branch: str | None
+
+
+def _selected_claim(
+    standing: tuple[ActiveClaim, ...], lookup: _ClaimLookup, *, action: str
+) -> ActiveClaim:
+    if lookup.claim_id is None:
+        if not lookup.branch:
+            raise ClaimUnavailableError(
+                f"{action} without --claim-id requires a non-empty current branch; pass --claim-id"
+            )
+        matches = tuple(
+            claim
+            for claim in standing
+            if claim.agent == lookup.agent and claim.branch == lookup.branch
+        )
+        if len(matches) != 1:
+            raise ClaimUnavailableError(
+                f"{_identity_summary(lookup.identity, lookup.branch)} has no unique claim "
+                f"for this session on branch {lookup.branch!r}; pass --claim-id"
+            )
+        return matches[0]
+    selected = next((claim for claim in standing if claim.claim_id == lookup.claim_id), None)
+    if selected is None:
+        raise ClaimUnavailableError(
+            f"{_identity_summary(lookup.identity, lookup.branch or '')} has no active "
+            f"claim {lookup.claim_id!r}"
+        )
+    return selected
+
+
 def _select_rescope_claim(
     claims: tuple[ActiveClaim, ...],
     identity: ClaimIdentity,
@@ -1792,29 +1894,9 @@ def _select_rescope_claim(
         raise ClaimUnavailableError(
             f"{_identity_summary(identity, branch or '')} has no active build claim"
         )
-    if claim_id is None:
-        if not branch:
-            raise ClaimUnavailableError(
-                "rescope without --claim-id requires a non-empty current branch; pass --claim-id"
-            )
-        matches = tuple(
-            claim for claim in standing if claim.agent == agent and claim.branch == branch
-        )
-        if len(matches) != 1:
-            raise ClaimUnavailableError(
-                f"{_identity_summary(identity, branch)} has no unique claim for this "
-                f"session on branch {branch!r}; pass --claim-id"
-            )
-        selected = matches[0]
-    else:
-        selected = next(
-            (claim for claim in standing if claim.claim_id == claim_id),
-            None,
-        )
-        if selected is None:
-            raise ClaimUnavailableError(
-                f"{_identity_summary(identity, branch or '')} has no active claim {claim_id!r}"
-            )
+    selected = _selected_claim(
+        standing, _ClaimLookup(identity, agent, claim_id, branch), action="rescope"
+    )
     if agent != selected.agent:
         raise ClaimUnavailableError("only the original claimant may rescope")
     if branch and selected.branch != branch:
@@ -1909,29 +1991,9 @@ def release_claim(  # noqa: PLR0913, PLR0917  # protocol/board slice, #103
         raise ClaimUnavailableError(
             f"{_identity_summary(identity, branch or '')} has no active build claim"
         )
-    if claim_id is None:
-        if not branch:
-            raise ClaimUnavailableError(
-                "release without --claim-id requires a non-empty current branch; pass --claim-id"
-            )
-        matches = tuple(
-            claim for claim in standing if claim.agent == agent and claim.branch == branch
-        )
-        if len(matches) != 1:
-            raise ClaimUnavailableError(
-                f"{_identity_summary(identity, branch)} has no unique claim for this "
-                f"session on branch {branch!r}; pass --claim-id"
-            )
-        selected = matches[0]
-    else:
-        selected = next(
-            (claim for claim in standing if claim.claim_id == claim_id),
-            None,
-        )
-        if selected is None:
-            raise ClaimUnavailableError(
-                f"{_identity_summary(identity, branch or '')} has no active claim {claim_id!r}"
-            )
+    selected = _selected_claim(
+        standing, _ClaimLookup(identity, agent, claim_id, branch), action="release"
+    )
     if role is None:
         role = selected.role
     if not coordinator_override and (agent, role) != (selected.agent, selected.role):

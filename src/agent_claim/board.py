@@ -418,34 +418,37 @@ def load_config(path: Path = CONFIG_PATH) -> BoardConfig:
     return BoardConfig(priority_labels, idea_label)
 
 
-def parse_contract(body: str) -> Contract:
-    live_body = _live_text(body)
+def _contract_field_value(
+    live_body: str, matches: list[re.Match[str]], index: int, match: re.Match[str]
+) -> tuple[str, str]:
+    if match.re is CONTRACT_HEADING_PATTERN:
+        name = match.group("name")
+        next_heading = MARKDOWN_HEADING_PATTERN.search(live_body, match.end())
+        next_field = matches[index + 1] if index + 1 < len(matches) else None
+        end = min(
+            next_heading.start() if next_heading is not None else len(live_body),
+            next_field.start() if next_field is not None else len(live_body),
+        )
+        return name, live_body[match.end() : end].strip()
+    name = match.group("bold_name") or match.group("plain_name")
+    return name, match.group("value").strip()
+
+
+def _collect_contract_sections(
+    live_body: str, matches: list[re.Match[str]]
+) -> tuple[dict[str, str], list[ContractDefect]]:
     sections: dict[str, str] = {}
     defects: list[ContractDefect] = []
-    matches = sorted(
-        (
-            *CONTRACT_HEADING_PATTERN.finditer(live_body),
-            *CONTRACT_FIELD_PATTERN.finditer(live_body),
-        ),
-        key=re.Match.start,
-    )
     for index, match in enumerate(matches):
-        if match.re is CONTRACT_HEADING_PATTERN:
-            name = match.group("name")
-            next_heading = MARKDOWN_HEADING_PATTERN.search(live_body, match.end())
-            next_field = matches[index + 1] if index + 1 < len(matches) else None
-            end = min(
-                next_heading.start() if next_heading is not None else len(live_body),
-                next_field.start() if next_field is not None else len(live_body),
-            )
-            value = live_body[match.end() : end].strip()
-        else:
-            name = match.group("bold_name") or match.group("plain_name")
-            value = match.group("value").strip()
+        name, value = _contract_field_value(live_body, matches, index, match)
         if name in sections:
             defects.append(ContractDefect(name, f"duplicate {name} projection field"))
             continue
         sections[name] = value
+    return sections, defects
+
+
+def _validate_blocked_by(sections: dict[str, str], defects: list[ContractDefect]) -> str | None:
     blocked_by = sections.get(BLOCKED_BY)
     if (
         blocked_by is not None
@@ -458,6 +461,20 @@ def parse_contract(body: str) -> Contract:
                 f"{BLOCKED_BY} must be exactly nichts or a comma-separated #N list",
             )
         )
+    return blocked_by
+
+
+def parse_contract(body: str) -> Contract:
+    live_body = _live_text(body)
+    matches = sorted(
+        (
+            *CONTRACT_HEADING_PATTERN.finditer(live_body),
+            *CONTRACT_FIELD_PATTERN.finditer(live_body),
+        ),
+        key=re.Match.start,
+    )
+    sections, defects = _collect_contract_sections(live_body, matches)
+    blocked_by = _validate_blocked_by(sections, defects)
     return Contract(
         now=sections.get("Now") or None,
         next=sections.get("Next") or None,
@@ -691,6 +708,42 @@ def _looks_like_slice_table_header(cells: tuple[str, ...]) -> bool:
     )
 
 
+def _slice_table_header_at(lines: list[str], line_index: int) -> tuple[bool, bool] | None:
+    """Whether the candidate header at `line_index` is well-formed and separated.
+
+    None when the line is not even a `#`-first slice-table attempt.
+    """
+    header_cells = _table_row_cells(lines[line_index])
+    if header_cells is None or not _looks_like_slice_table_header(header_cells):
+        return None
+    well_formed_header = (
+        len(header_cells) == len(SLICE_TABLE_HEADER_CELLS)
+        and tuple(cell.casefold() for cell in header_cells) == SLICE_TABLE_HEADER_CELLS
+    )
+    has_separator = line_index + 1 < len(lines) and _is_slice_table_separator(lines[line_index + 1])
+    return well_formed_header, has_separator
+
+
+def _slice_table_rows(lines: list[str], start: int) -> tuple[tuple[SliceTableEntry, ...], int]:
+    """The row block following a well-formed header, and the line index after it."""
+    entries: list[SliceTableEntry] = []
+    line_index = start
+    while line_index < len(lines):
+        row_cells = _table_row_cells(lines[line_index])
+        if row_cells is None:
+            break
+        if (
+            len(row_cells) != len(SLICE_TABLE_HEADER_CELLS)
+            or _SLICE_TABLE_INDEX_PATTERN.match(row_cells[0]) is None
+        ):
+            entries.append(MalformedSliceRow(lines[line_index].strip()))
+            line_index += 1
+            continue
+        entries.append(_slice_table_row(*row_cells[:3]))
+        line_index += 1
+    return tuple(entries), line_index
+
+
 def parse_slice_table(body: str) -> tuple[SliceTableEntry, ...]:
     """Every slice table entry in `body` (`#79`'s grammar): a well-formed
     row, or a `MalformedSliceTable`/`MalformedSliceRow` marking a near-miss.
@@ -708,35 +761,17 @@ def parse_slice_table(body: str) -> tuple[SliceTableEntry, ...]:
     entries: list[SliceTableEntry] = []
     line_index = 0
     while line_index < len(lines):
-        header_cells = _table_row_cells(lines[line_index])
-        if header_cells is None or not _looks_like_slice_table_header(header_cells):
+        header = _slice_table_header_at(lines, line_index)
+        if header is None:
             line_index += 1
             continue
-        well_formed_header = (
-            len(header_cells) == len(SLICE_TABLE_HEADER_CELLS)
-            and tuple(cell.casefold() for cell in header_cells) == SLICE_TABLE_HEADER_CELLS
-        )
-        has_separator = line_index + 1 < len(lines) and _is_slice_table_separator(
-            lines[line_index + 1]
-        )
+        well_formed_header, has_separator = header
         if not well_formed_header or not has_separator:
             entries.append(MalformedSliceTable(lines[line_index].strip()))
             line_index += 1
             continue
-        line_index += 2
-        while line_index < len(lines):
-            row_cells = _table_row_cells(lines[line_index])
-            if row_cells is None:
-                break
-            if (
-                len(row_cells) != len(SLICE_TABLE_HEADER_CELLS)
-                or _SLICE_TABLE_INDEX_PATTERN.match(row_cells[0]) is None
-            ):
-                entries.append(MalformedSliceRow(lines[line_index].strip()))
-                line_index += 1
-                continue
-            entries.append(_slice_table_row(*row_cells[:3]))
-            line_index += 1
+        row_entries, line_index = _slice_table_rows(lines, line_index + 2)
+        entries.extend(row_entries)
     return tuple(entries)
 
 
@@ -762,16 +797,10 @@ def closing_references(text: str, repository: str) -> frozenset[IssueReference]:
     return _references_matching(CLOSING_REFERENCE_PATTERN, text, repository)
 
 
-def parse_pull_request_classification(
-    body: str, repository: str
-) -> Classification | ClassificationDefect:
-    """The one `Work-Item:`/`No-Item:` line a pull request body must carry.
-
-    A pull request either lands one work item and closes it, or declares
-    itself issue-less documentation or a fix. Nothing else in a body names an
-    item: a dispatched slice is its own item, and its pull request closes it.
-    """
-    matches = tuple(CLASSIFICATION_LINE_PATTERN.finditer(_live_text(body)))
+def _single_classification_match(
+    matches: tuple[re.Match[str], ...],
+) -> re.Match[str] | ClassificationDefect:
+    """The one classification line a body must carry, or why it doesn't have one."""
     if not matches:
         return ClassificationDefect("carries no `Work-Item:` or `No-Item:` line")
     work_items = tuple(match for match in matches if match.group("kind").lower() == WORK_ITEM_KIND)
@@ -782,19 +811,43 @@ def parse_pull_request_classification(
         return ClassificationDefect(
             f"carries {len(matches)} classification lines; exactly one is required"
         )
-    value = matches[0].group("value").strip(" \t")
-    if work_items:
-        reference = WORK_ITEM_VALUE_PATTERN.fullmatch(value)
-        if reference is None:
-            return ClassificationDefect(
-                f"carries `Work-Item: {value}`; a work item reads OWNER/REPO#n or #n"
-            )
-        return WorkItemClassification(_issue_reference(reference, repository))
+    return matches[0]
+
+
+def _work_item_classification(value: str, repository: str) -> Classification | ClassificationDefect:
+    reference = WORK_ITEM_VALUE_PATTERN.fullmatch(value)
+    if reference is None:
+        return ClassificationDefect(
+            f"carries `Work-Item: {value}`; a work item reads OWNER/REPO#n or #n"
+        )
+    return WorkItemClassification(_issue_reference(reference, repository))
+
+
+def _no_item_classification(value: str) -> Classification | ClassificationDefect:
     if value.lower() not in {kind.value for kind in NoItemKind}:
         return ClassificationDefect(
             f"carries `No-Item: {value}`; an issue-less pull request is docs or fix"
         )
     return NoItemClassification(NoItemKind(value.lower()))
+
+
+def parse_pull_request_classification(
+    body: str, repository: str
+) -> Classification | ClassificationDefect:
+    """The one `Work-Item:`/`No-Item:` line a pull request body must carry.
+
+    A pull request either lands one work item and closes it, or declares
+    itself issue-less documentation or a fix. Nothing else in a body names an
+    item: a dispatched slice is its own item, and its pull request closes it.
+    """
+    matches = tuple(CLASSIFICATION_LINE_PATTERN.finditer(_live_text(body)))
+    selected = _single_classification_match(matches)
+    if isinstance(selected, ClassificationDefect):
+        return selected
+    value = selected.group("value").strip(" \t")
+    if selected.group("kind").lower() == WORK_ITEM_KIND:
+        return _work_item_classification(value, repository)
+    return _no_item_classification(value)
 
 
 def declared_work_items(pull_requests: tuple[PullRequest, ...], repository: str) -> frozenset[int]:
@@ -1052,20 +1105,17 @@ def board_rank(item: BoardItem) -> tuple[int, int, int]:
     return (item.priority_category, -item.score, item.number)
 
 
-def build_board(  # noqa: PLR0913  # protocol/board slice, #103
+def _validated_blocker_by_number(
     issues: tuple[Issue, ...],
     open_pull_requests: tuple[PullRequest, ...],
-    recent_merged_pull_requests: tuple[PullRequest, ...],
-    claims: tuple[protocol.ActiveClaim, ...],
-    config: BoardConfig,
-    *,
-    repository: str,
-    blocker_references: tuple[BlockerReference, ...] | None = None,
-    now: datetime | None = None,
-    trunk_landings: tuple[datetime, ...] = (),
-) -> Board:
-    observed_at = (now or datetime.now(UTC)).astimezone(UTC)
-    contracts = {issue.number: parse_contract(issue.body) for issue in issues}
+    contracts: dict[int, Contract],
+    blocker_references: tuple[BlockerReference, ...] | None,
+) -> tuple[dict[int, BlockerReference], tuple[BlockerReference, ...]]:
+    """The by-number blocker map, and the resolved `blocker_references` behind it.
+
+    Raises when GitHub did not return every blocker a contract names, or omitted
+    `closed_at` for one it reports closed.
+    """
     referenced_blockers = frozenset(
         blocker for contract in contracts.values() for blocker in contract.blocker_issues
     )
@@ -1091,6 +1141,135 @@ def build_board(  # noqa: PLR0913  # protocol/board slice, #103
         raise protocol.ClaimError(
             f"GitHub did not return closed_at for blocker #{min(invalid_closed_blockers)}"
         )
+    return blocker_by_number, blocker_references
+
+
+@dataclass(frozen=True)
+class _BoardBuildContext:
+    """Per-run board state that every issue's `BoardItem` is derived against."""
+
+    contracts: dict[int, Contract]
+    blockers: dict[int, tuple[int, ...]]
+    freed_on: dict[int, datetime | None]
+    unblocks: dict[int, int]
+    claims_by_issue: dict[int, protocol.ActiveClaim]
+    in_flight_references: frozenset[int]
+    landed_references: frozenset[int]
+    open_branches: frozenset[str]
+    trunk_landings: tuple[datetime, ...]
+
+
+def _board_stage(
+    issue: Issue,
+    claim: protocol.ActiveClaim | None,
+    *,
+    in_flight_references: frozenset[int],
+    landed_references: frozenset[int],
+    open_branches: frozenset[str],
+) -> Stage:
+    in_flight = issue.number in in_flight_references or (
+        claim is not None and claim.branch in open_branches
+    )
+    if in_flight:
+        return Stage.IN_FLIGHT
+    if issue.number in landed_references:
+        return Stage.CODE_LANDED
+    return Stage.TEXT_ONLY
+
+
+def _claim_projection(
+    claim: protocol.ActiveClaim | None, observed_at: datetime
+) -> tuple[str | None, str | None, bool]:
+    """The (active_claim, claim_age, claim_old) trio a `BoardItem` shows for `claim`."""
+    if claim is None:
+        return None, None, False
+    age = claim_age(claim.comment.created_at, observed_at)
+    return f"{claim.agent} ({claim.role})", format_claim_age(age), claim_is_old(age)
+
+
+def _board_score(stage: Stage, unblocks_count: int, single_next: bool) -> int:
+    score = 20 * unblocks_count
+    score += {Stage.IN_FLIGHT: 30, Stage.CODE_LANDED: 20, Stage.TEXT_ONLY: -20}[stage]
+    score += 10 if single_next else 0
+    return score
+
+
+def _board_item(
+    issue: Issue, context: _BoardBuildContext, config: BoardConfig, observed_at: datetime
+) -> BoardItem:
+    contract = context.contracts[issue.number]
+    freed_at = context.freed_on[issue.number]
+    ruling_landings, ruling_old = ruling_freshness(issue.body, context.trunk_landings)
+    frozen = frozen_trigger(issue.body)
+    claim = context.claims_by_issue.get(issue.number)
+    stage = _board_stage(
+        issue,
+        claim,
+        in_flight_references=context.in_flight_references,
+        landed_references=context.landed_references,
+        open_branches=context.open_branches,
+    )
+    single_next = _single_concrete_next(contract.next)
+    projectionless_idea = contract.projectionless and _has_label(issue.labels, config.idea_label)
+    next_step = IDEA_REFINEMENT_STEP if projectionless_idea else contract.next
+    unblocks_count = context.unblocks[issue.number]
+    priority_category, priority_bucket = _priority_bucket(issue.labels, config, unblocks_count)
+    active_claim, claim_age_text, claim_old = _claim_projection(claim, observed_at)
+    open_blockers = context.blockers[issue.number]
+    actionable_reason = _actionable_reason(
+        frozen_trigger=frozen,
+        active_claim=active_claim,
+        open_blockers=open_blockers,
+        contract_complete=contract.complete,
+        projectionless_idea=projectionless_idea,
+    )
+    return BoardItem(
+        number=issue.number,
+        title=issue.title,
+        labels=issue.labels,
+        priority_category=priority_category,
+        priority_bucket=priority_bucket,
+        contract=contract,
+        next_step=next_step,
+        contract_complete=contract.complete,
+        expectation_state=expectation_state(issue.body),
+        expectation_progress=expectation_progress(issue.body),
+        ruling_landings=ruling_landings,
+        ruling_old=ruling_old,
+        frozen_trigger=frozen,
+        open_blockers=open_blockers,
+        freed_on=freed_at,
+        freed_days=(None if freed_at is None else max(0, (observed_at - freed_at).days)),
+        stage=stage,
+        age_days=max(0, (observed_at - _timestamp(issue.created_at)).days),
+        idle_days=max(0, (observed_at - _timestamp(issue.updated_at)).days),
+        active_claim=active_claim,
+        claim_age=claim_age_text,
+        claim_old=claim_old,
+        unblocks_count=unblocks_count,
+        score=_board_score(stage, unblocks_count, single_next),
+        actionable=actionable_reason is None,
+        actionable_reason=actionable_reason,
+    )
+
+
+def build_board(  # noqa: PLR0913  # protocol/board slice, #103
+    issues: tuple[Issue, ...],
+    open_pull_requests: tuple[PullRequest, ...],
+    recent_merged_pull_requests: tuple[PullRequest, ...],
+    claims: tuple[protocol.ActiveClaim, ...],
+    config: BoardConfig,
+    *,
+    repository: str,
+    blocker_references: tuple[BlockerReference, ...] | None = None,
+    now: datetime | None = None,
+    trunk_landings: tuple[datetime, ...] = (),
+) -> Board:
+    observed_at = (now or datetime.now(UTC)).astimezone(UTC)
+    contracts = {issue.number: parse_contract(issue.body) for issue in issues}
+    blocker_by_number, blocker_references = _validated_blocker_by_number(
+        issues, open_pull_requests, contracts, blocker_references
+    )
     contracts = {
         issue.number: _with_blocker_defects(contracts[issue.number], blocker_by_number)
         for issue in issues
@@ -1098,102 +1277,32 @@ def build_board(  # noqa: PLR0913  # protocol/board slice, #103
     blockers = {
         issue.number: _open_blockers(contracts[issue.number], blocker_by_number) for issue in issues
     }
-    freed_on = {
-        issue.number: _freed_on(contracts[issue.number], blocker_by_number) for issue in issues
-    }
     unblocks = {
         issue.number: sum(issue.number in other_blockers for other_blockers in blockers.values())
         for issue in issues
     }
-    claims_by_issue = _claim_by_issue(claims)
-    in_flight_references = _associated_issues(
-        open_pull_requests, repository
-    ) | _touched_without_closing(open_pull_requests)
-    landed_references = _associated_issues(
-        recent_merged_pull_requests, repository
-    ) | _touched_without_closing(recent_merged_pull_requests)
+    context = _BoardBuildContext(
+        contracts=contracts,
+        blockers=blockers,
+        freed_on={
+            issue.number: _freed_on(contracts[issue.number], blocker_by_number) for issue in issues
+        },
+        unblocks=unblocks,
+        claims_by_issue=_claim_by_issue(claims),
+        in_flight_references=_associated_issues(open_pull_requests, repository)
+        | _touched_without_closing(open_pull_requests),
+        landed_references=_associated_issues(recent_merged_pull_requests, repository)
+        | _touched_without_closing(recent_merged_pull_requests),
+        open_branches=frozenset(pr.head_ref_name for pr in open_pull_requests),
+        trunk_landings=trunk_landings,
+    )
     landed_work_items = declared_work_items(recent_merged_pull_requests, repository)
-    open_branches = frozenset(pr.head_ref_name for pr in open_pull_requests)
-
-    items: list[BoardItem] = []
-    for issue in issues:
-        contract = contracts[issue.number]
-        freed_at = freed_on[issue.number]
-        expectations = expectation_state(issue.body)
-        progress = expectation_progress(issue.body)
-        ruling_landings, ruling_old = ruling_freshness(issue.body, trunk_landings)
-        frozen = frozen_trigger(issue.body)
-        claim = claims_by_issue.get(issue.number)
-        in_flight = issue.number in in_flight_references or (
-            claim is not None and claim.branch in open_branches
+    ordered = tuple(
+        sorted(
+            (_board_item(issue, context, config, observed_at) for issue in issues),
+            key=board_rank,
         )
-        if in_flight:
-            stage = Stage.IN_FLIGHT
-        elif issue.number in landed_references:
-            stage = Stage.CODE_LANDED
-        else:
-            stage = Stage.TEXT_ONLY
-        age_days = max(0, (observed_at - _timestamp(issue.created_at)).days)
-        idle_days = max(0, (observed_at - _timestamp(issue.updated_at)).days)
-        single_next = _single_concrete_next(contract.next)
-        projectionless_idea = contract.projectionless and _has_label(
-            issue.labels, config.idea_label
-        )
-        next_step = IDEA_REFINEMENT_STEP if projectionless_idea else contract.next
-        priority_category, priority_bucket = _priority_bucket(
-            issue.labels, config, unblocks[issue.number]
-        )
-        score = 0
-        score += 20 * unblocks[issue.number]
-        score += {Stage.IN_FLIGHT: 30, Stage.CODE_LANDED: 20, Stage.TEXT_ONLY: -20}[stage]
-        score += 10 if single_next else 0
-        if claim is None:
-            active_claim = None
-            claim_age_text = None
-            claim_old = False
-        else:
-            active_claim = f"{claim.agent} ({claim.role})"
-            age = claim_age(claim.comment.created_at, observed_at)
-            claim_age_text = format_claim_age(age)
-            claim_old = claim_is_old(age)
-        actionable_reason = _actionable_reason(
-            frozen_trigger=frozen,
-            active_claim=active_claim,
-            open_blockers=blockers[issue.number],
-            contract_complete=contract.complete,
-            projectionless_idea=projectionless_idea,
-        )
-        items.append(
-            BoardItem(
-                number=issue.number,
-                title=issue.title,
-                labels=issue.labels,
-                priority_category=priority_category,
-                priority_bucket=priority_bucket,
-                contract=contract,
-                next_step=next_step,
-                contract_complete=contract.complete,
-                expectation_state=expectations,
-                expectation_progress=progress,
-                ruling_landings=ruling_landings,
-                ruling_old=ruling_old,
-                frozen_trigger=frozen,
-                open_blockers=blockers[issue.number],
-                freed_on=freed_at,
-                freed_days=(None if freed_at is None else max(0, (observed_at - freed_at).days)),
-                stage=stage,
-                age_days=age_days,
-                idle_days=idle_days,
-                active_claim=active_claim,
-                claim_age=claim_age_text,
-                claim_old=claim_old,
-                unblocks_count=unblocks[issue.number],
-                score=score,
-                actionable=actionable_reason is None,
-                actionable_reason=actionable_reason,
-            )
-        )
-    ordered = tuple(sorted(items, key=board_rank))
+    )
     return Board(
         items=ordered,
         ready_now=tuple(item for item in ordered if item.actionable),
