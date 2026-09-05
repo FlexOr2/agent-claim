@@ -22,7 +22,7 @@ git+https://github.com/FlexOr2/agent-claim.git@v0.6.0`.
 agent-claim bootstrap
 agent-claim status
 agent-claim claim 42 --agent "Ada" --scope src/widget.py
-agent-claim release 42
+agent-claim release 42 --merged 57
 agent-claim reconcile
 ```
 
@@ -40,11 +40,17 @@ Omitted `--claim-id` on `release` selects the unique active claim on that issue
 or lane whose agent is this session and whose branch is the current checkout;
 otherwise it fails closed.
 Omitted `--role` on `release` uses that selected claim's role; an explicit
-`--role` must still match unless `--coordinator-override`. Omitted `--reason` on
-`release` is `landed`. `--coordinator-override` still requires `--role coordinator` and
-`--reason`. `supersede` still requires `--agent` and `--role`. A `--claim-id` already
-present on the ledger, active or released, is refused before anything is posted;
-release the old claim and pass a fresh `--claim-id` instead.
+`--role` must still match unless `--coordinator-override`, which still requires
+`--role coordinator`. `release` takes exactly one outcome, never a free-form
+reason: `--merged <pull request>` or `--abandoned "<reason>"`. `--merged` is
+verified against GitHub before anything is posted — the pull request must be
+merged into the default branch, its `Work-Item:` line must name this claim's
+item (or it must carry `No-Item:` for an issue-less lane), and that item must be
+closed; otherwise the release is refused, naming what is missing. The ledger
+records `merged #<n>` or `abandoned: <reason>`. `supersede` still requires
+`--agent` and `--role`. A `--claim-id` already present on the ledger, active or
+released, is refused before anything is posted; release the old claim and pass a
+fresh `--claim-id` instead.
 `rescope <issue> --add <path> [--drop <path>]` changes a live claim's scope
 without releasing it: the claim id and base stay, added paths are advisory
 like `claim`, `--add` of a directory or a combined share above a quarter uses
@@ -224,7 +230,7 @@ silent, unlabeled claim:
 git worktree add ../repo-worktrees/docs-tidy-readme -b docs/tidy-readme
 cd ../repo-worktrees/docs-tidy-readme
 agent-claim claim --agent "Ada" --scope README.md
-agent-claim release
+agent-claim release --merged 58
 ```
 
 Like an issue claim, a lane claim must begin from a clean linked worktree
@@ -243,7 +249,7 @@ coordinator override — always runs from a checkout of that same lane branch.
 If the original worktree is gone or held by another session, re-create a
 worktree on that branch (`git worktree add <path> <lane-branch>`) and run
 `agent-claim release --claim-id <id> --coordinator-override --role coordinator
---reason "..."` from inside it, where `<id>` comes from `agent-claim status`
+--abandoned "..."` from inside it, where `<id>` comes from `agent-claim status`
 (omitting `--claim-id` still filters by the releasing agent, coordinator
 override or not, so a foreign stuck claim needs the id).
 

@@ -328,7 +328,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     release.add_argument("--agent")
     release.add_argument("--role")
-    release.add_argument("--reason")
+    outcome = release.add_mutually_exclusive_group(required=True)
+    outcome.add_argument(
+        "--merged",
+        type=int,
+        metavar="PULL_REQUEST",
+        help="the pull request that landed this claim's item on the default branch",
+    )
+    outcome.add_argument(
+        "--abandoned",
+        metavar="REASON",
+        help="why this claim ends without a landing",
+    )
     release.add_argument("--claim-id")
     release.add_argument("--coordinator-override", action="store_true")
     release.add_argument("--json", action="store_true")
@@ -628,7 +639,10 @@ def _claim_json(
 
 
 def _release_json(
-    released: protocol.ActiveClaim, agent: str, role: str | None, reason: str | None
+    released: protocol.ActiveClaim,
+    agent: str,
+    role: str | None,
+    outcome: protocol.ReleaseOutcome,
 ) -> int:
     print(
         json.dumps(
@@ -638,7 +652,7 @@ def _release_json(
                 "claim_id": released.claim_id,
                 "agent": agent,
                 "role": role if role is not None else released.role,
-                "reason": reason if reason is not None else protocol.DEFAULT_RELEASE_REASON,
+                "reason": outcome.reason,
             }
         )
     )
@@ -1165,6 +1179,58 @@ def _pull_request_check(
     return 0
 
 
+def _release_outcome(arguments: argparse.Namespace) -> protocol.ReleaseOutcome:
+    if arguments.merged is not None:
+        return protocol.MergedRelease(arguments.merged)
+    return protocol.AbandonedRelease(
+        protocol._outbound_text(arguments.abandoned, "abandoned reason", maximum=512)
+    )
+
+
+def _verify_merged_release(
+    client: github.GitHubIssueComments,
+    repository: str,
+    identity: protocol.ClaimIdentity,
+    merged: protocol.MergedRelease,
+) -> None:
+    """Refuse a `--merged` release the landing itself does not support."""
+    detail = client.pull_request_detail(merged.pull_request)
+    if not detail.merged:
+        raise protocol.ClaimUnavailable(f"pull request #{detail.number} is not merged")
+    default_branch = client.default_branch()
+    if detail.base_ref_name != default_branch:
+        raise protocol.ClaimUnavailable(
+            f"pull request #{detail.number} merged into {detail.base_ref_name!r}, "
+            f"not the default branch {default_branch!r}"
+        )
+    classification = board.parse_pull_request_classification(detail.body, repository)
+    if isinstance(classification, board.ClassificationDefect):
+        raise protocol.ClaimUnavailable(
+            f"pull request #{detail.number} {classification.message}"
+        )
+    if isinstance(identity, protocol.LaneIdentity):
+        if isinstance(classification, board.WorkItemClassification):
+            raise protocol.ClaimUnavailable(
+                f"pull request #{detail.number} names {classification.item}; "
+                "an issue-less lane needs a No-Item line"
+            )
+        return
+    item = board.IssueReference(repository, identity.issue)
+    if (
+        not isinstance(classification, board.WorkItemClassification)
+        or classification.item != item
+    ):
+        raise protocol.ClaimUnavailable(
+            f"pull request #{detail.number} names {classification}, "
+            f"not work item #{identity.issue}"
+        )
+    reference = _fetch_issue_reference(repository, identity.issue)
+    if reference.state is not ReferenceState.CLOSED:
+        raise protocol.ClaimUnavailable(
+            f"work item #{identity.issue} is {reference.state.value}, not closed"
+        )
+
+
 MUTATING_HOOK_TOOLS = frozenset({"Edit", "MultiEdit", "Write", "search_replace", "write"})
 
 
@@ -1275,7 +1341,7 @@ def main(arguments: list[str] | None = None) -> int:
         release_branch: str | None = None
         if parsed.command == "release":
             if parsed.coordinator_override:
-                protocol._require_coordinator_override(parsed.role, parsed.reason)
+                protocol._require_coordinator_override(parsed.role)
             if parsed.issue is None or parsed.claim_id is None:
                 release_branch = checkout._git_output(["branch", "--show-current"])
                 if not release_branch:
@@ -1465,18 +1531,21 @@ def main(arguments: list[str] | None = None) -> int:
             return 0
         if parsed.command == "release":
             identity = _resolved_identity(parsed.issue, release_branch or "")
+            outcome = _release_outcome(parsed)
+            if isinstance(outcome, protocol.MergedRelease):
+                _verify_merged_release(client, repository, identity, outcome)
             released = protocol.release_claim(
                 client,
                 identity,
                 parsed.agent,
                 parsed.role,
-                parsed.reason,
+                outcome,
                 parsed.claim_id,
                 branch=release_branch,
                 coordinator_override=parsed.coordinator_override,
             )
             if parsed.json:
-                return _release_json(released, parsed.agent, parsed.role, parsed.reason)
+                return _release_json(released, parsed.agent, parsed.role, outcome)
             print(f"RELEASED {_claim_subject(released)}: {released.claim_id}")
             return 0
         if parsed.command == "supersede":
