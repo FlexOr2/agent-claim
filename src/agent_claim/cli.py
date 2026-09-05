@@ -6,6 +6,7 @@ import argparse
 import json
 import sys
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -527,11 +528,11 @@ def _status_json(
     return 2 if state == "CONFLICT" else 0
 
 
-def _who(claims: tuple[protocol.ActiveClaim, ...], path: str) -> int:
+def _who(claims: tuple[protocol.ActiveClaim, ...], path: str) -> None:
     holders = protocol.claims_holding_path(claims, path)
     if not holders:
         print(f"UNCLAIMED {path}")
-        return 0
+        return
     for claim in holders:
         print(
             f"CLAIMED {path} {_claim_subject(claim)}: {claim.agent} ({claim.role}) "
@@ -542,7 +543,6 @@ def _who(claims: tuple[protocol.ActiveClaim, ...], path: str) -> int:
             "overlap: "
             + ", ".join(f"{_claim_subject(claim)} ({claim.claim_id})" for claim in holders)
         )
-    return 0
 
 
 def _who_json(claims: tuple[protocol.ActiveClaim, ...], path: str, ledger: int) -> int:
@@ -701,7 +701,7 @@ def _board(
     )
 
 
-def _rulings(projected: board.Board, issues: tuple[board.Issue, ...], *, as_json: bool) -> int:
+def _rulings(projected: board.Board, issues: tuple[board.Issue, ...], *, as_json: bool) -> None:
     progress_by_issue = {issue.number: board.expectation_progress(issue.body) for issue in issues}
     items = tuple(
         sorted(
@@ -731,17 +731,16 @@ def _rulings(projected: board.Board, issues: tuple[board.Issue, ...], *, as_json
                 ]
             )
         )
-        return 0
+        return
     if not items:
         print("No open expectation lines.")
-        return 0
+        return
     print(
         "\n".join(
             f"#{item.number} {progress.open}/{progress.total}: {item.title}"
             for item, progress in items
         )
     )
-    return 0
 
 
 def _ruling_pull_hint(item: board.BoardItem) -> str | None:
@@ -1088,14 +1087,13 @@ def _slice_rule_checks(
     return tuple(checks)
 
 
-def _refuse_claim(json_mode: bool, issue: int | None, checks: tuple[SliceCheck, ...]) -> int:
+def _refuse_claim(json_mode: bool, issue: int | None, checks: tuple[SliceCheck, ...]) -> None:
     if json_mode:
         payload = {"refused": True, "issue": issue, "checks": [c.as_json() for c in checks]}
         print(json.dumps(payload))
-        return 2
+        return
     for check in checks:
         print(check.render(), file=sys.stderr)
-    return 2
 
 
 def _claim_defect(
@@ -1421,6 +1419,311 @@ def _optional_issue_number(value: int | None) -> int | None:
     return None if value is None else int(value)
 
 
+@dataclass(frozen=True)
+class _CommandSession:
+    """What a dispatched subcommand needs beyond its own parsed arguments."""
+
+    client: github.GitHubIssueComments
+    ledger: int
+    release_branch: str | None
+
+
+def _cmd_pull_request_check(parsed: argparse.Namespace, session: _CommandSession) -> int:
+    pull_request_number = int(parsed.pr)
+    return _pull_request_check(session.client, session.client.repository, pull_request_number)
+
+
+def _cmd_status(parsed: argparse.Namespace, session: _CommandSession) -> int:
+    issue = _optional_issue_number(parsed.issue)
+    comments = session.client.list_protocol_candidates(protocol.LEDGER_ISSUE)
+    claims = protocol.active_claims(comments)
+    now = datetime.now(UTC)
+    if parsed.json:
+        return _status_json(claims, issue, session.ledger, now=now)
+    print(f"LEDGER #{session.ledger}")
+    return _status(claims, issue, now=now)
+
+
+def _cmd_board(parsed: argparse.Namespace, session: _CommandSession) -> None:
+    comments = session.client.list_protocol_candidates(protocol.LEDGER_ISSUE)
+    projected = _board(session.client, protocol.active_claims(comments))
+    print(board.board_json(projected) if parsed.json else board.render(projected))
+
+
+def _cmd_rulings(parsed: argparse.Namespace, session: _CommandSession) -> None:
+    comments = session.client.list_protocol_candidates(protocol.LEDGER_ISSUE)
+    issues = session.client.list_open_board_issues()
+    projected = _board(session.client, protocol.active_claims(comments), issues=issues)
+    _rulings(projected, issues, as_json=parsed.json)
+
+
+def _cmd_next(parsed: argparse.Namespace, session: _CommandSession) -> int:
+    comments = session.client.list_protocol_candidates(protocol.LEDGER_ISSUE)
+    projected = _board(session.client, protocol.active_claims(comments))
+    item = board.highest_scored_actionable(projected)
+    skipped = _unworkable(projected)
+    recovery = projected.recovery
+    if item is None:
+        if skipped or recovery:
+            if parsed.json:
+                _next_json(None, skipped, recovery)
+            else:
+                _next(None, skipped, recovery)
+        return 3
+    return _next_json(item, skipped, recovery) if parsed.json else _next(item, skipped, recovery)
+
+
+def _cmd_who(parsed: argparse.Namespace, session: _CommandSession) -> None:
+    claims = protocol._ledger_claims(session.client)
+    if parsed.json:
+        _who_json(claims, parsed.path, session.ledger)
+        return
+    print(f"LEDGER #{session.ledger}")
+    _who(claims, parsed.path)
+
+
+def _cmd_rescope(parsed: argparse.Namespace, session: _CommandSession) -> None:
+    client = session.client
+    issue = _optional_issue_number(parsed.issue)
+    rescope_branch = checkout._git_output(["branch", "--show-current"])
+    if not rescope_branch:
+        raise protocol.ClaimUnavailableError(
+            "rescope requires a non-empty current branch; "
+            "check out the claim branch, or pass an issue number"
+        )
+    checkout._validate_worktree_branch(rescope_branch)
+    identity = _resolved_identity(issue, rescope_branch)
+    add = protocol._valid_scope(parsed.add) if parsed.add else ()
+    drop = protocol._valid_scope(parsed.drop) if parsed.drop else ()
+    allow_directory_reason = parsed.allow_directory
+    if allow_directory_reason is not None:
+        allow_directory_reason = protocol._outbound_text(
+            allow_directory_reason, "allow-directory reason", maximum=512
+        )
+    if add:
+        versioned = checkout.versioned_paths()
+        _reject_uncut_directory_scope(client, identity, add, allow_directory_reason)
+        selected = protocol._select_rescope_claim(
+            protocol._ledger_claims(client),
+            identity,
+            parsed.agent,
+            parsed.claim_id,
+            branch=rescope_branch,
+        )
+        _reject_oversized_scope(
+            protocol._combined_scope(selected.scope, add, drop),
+            allow_directory_reason,
+            versioned,
+        )
+    rescoped = protocol.rescope_claim(
+        client,
+        identity,
+        parsed.agent,
+        add,
+        drop,
+        parsed.claim_id,
+        branch=rescope_branch,
+        allow_directory_reason=allow_directory_reason,
+    )
+    if parsed.json:
+        _rescope_json(rescoped)
+        return
+    print(f"RESCOPED {_claim_subject(rescoped)}: {rescoped.claim_id}")
+
+
+def _cmd_claim(parsed: argparse.Namespace, session: _CommandSession) -> int:
+    client = session.client
+    requested = _request(parsed)
+    versioned = checkout.versioned_paths()
+    _reject_uncut_directory_scope(
+        client,
+        requested.identity,
+        requested.scope,
+        requested.allow_directory_reason,
+    )
+    n, total, share = _reject_oversized_scope(
+        requested.scope, requested.allow_directory_reason, versioned
+    )
+    checks: tuple[SliceCheck, ...] = ()
+    target_issue: int | None = None
+    if isinstance(requested.identity, protocol.IssueIdentity):
+        target_issue = requested.identity.issue
+        replayed = protocol.matching_claim_retry(protocol._ledger_claims(client), requested)
+        if replayed is None:
+            open_issues = client.list_open_board_issues()
+            open_by_number = {issue.number: issue for issue in open_issues}
+            projected = _board(client, protocol._ledger_claims(client), issues=open_issues)
+            checks = _slice_rule_checks(
+                BoardReferenceLookup(client, client.repository, open_by_number),
+                target_issue,
+                projected,
+                requested.out_of_order_reason,
+            )
+    if any(check.level == "error" for check in checks):
+        _refuse_claim(parsed.json, target_issue, checks)
+        return 2
+    for check in checks:
+        print(check.render(), file=sys.stderr if parsed.json else sys.stdout)
+    # `_acquire_claim_with_observed` already reads the ledger once,
+    # right after posting, to detect a claim race; that same snapshot
+    # is what the "touches" note below needs, so reusing it (instead
+    # of a fresh `protocol._ledger_claims(client)` call) removes the
+    # slowest step of `claim` — the wait was reported as a hang that
+    # landed after the mutation was already visible on the ledger.
+    try:
+        claimed, observed = protocol._acquire_claim_with_observed(client, requested)
+    except protocol.ClaimPostedReconcileFailedError as error:
+        # The claim comment already exists and already won the
+        # ledger; a failure in the post-claim label/projection
+        # reconcile must never read as a refusal — that would leave
+        # the operator believing nothing happened while a live claim
+        # sits on the ledger. Print the claim plainly even under
+        # --json: there is no well-formed claim payload to emit when
+        # the reconcile itself is what failed.
+        print(
+            f"CLAIMED {_claim_subject(error.claim)}: "
+            f"{error.claim.claim_id} {error.claim.comment.url}"
+        )
+        print(
+            f"ERROR: the claim above exists, but the post-claim "
+            f"reconcile failed: {error.reconcile_error}",
+            file=sys.stderr,
+        )
+        return 2
+    touches = protocol.conflicting_claims(observed, claimed)
+    if parsed.json:
+        return _claim_json(
+            claimed,
+            versioning=ScopeVersioning(n, total, share),
+            touches=touches,
+            checks=checks,
+        )
+    print(f"CLAIMED {_claim_subject(claimed)}: {claimed.claim_id} {claimed.comment.url}")
+    print(_claim_cost_line(n, total, touches))
+    return 0
+
+
+def _cmd_release(parsed: argparse.Namespace, session: _CommandSession) -> None:
+    client = session.client
+    issue = _optional_issue_number(parsed.issue)
+    identity = _resolved_identity(issue, session.release_branch or "")
+    outcome = _release_outcome(parsed)
+    if isinstance(outcome, protocol.MergedRelease):
+        _verify_merged_release(client, client.repository, identity, outcome)
+    released = protocol.release_claim(
+        client,
+        identity,
+        parsed.agent,
+        parsed.role,
+        outcome,
+        parsed.claim_id,
+        branch=session.release_branch,
+        coordinator_override=parsed.coordinator_override,
+    )
+    if parsed.json:
+        _release_json(released, parsed.agent, parsed.role, outcome)
+        return
+    print(f"RELEASED {_claim_subject(released)}: {released.claim_id}")
+
+
+def _cmd_supersede(parsed: argparse.Namespace, session: _CommandSession) -> None:
+    successor_issue = _optional_issue_number(parsed.successor_issue)
+    frozen = protocol.supersede_ledger(
+        session.client,
+        successor_issue,
+        parsed.agent,
+        parsed.role,
+        parsed.reason,
+        parsed.claim_id,
+    )
+    print(
+        f"SUPERSEDED ledger #{protocol.LEDGER_ISSUE} successor "
+        f"#{successor_issue}: {frozen.claim_id}"
+    )
+
+
+def _cmd_reconcile(parsed: argparse.Namespace, session: _CommandSession) -> None:
+    client = session.client
+    try:
+        for repair in protocol.repair_duplicate_claims(client):
+            superseded = ", ".join(f"#{cid}" for cid in repair.superseded_comment_ids)
+            print(
+                f"REPAIRED claim {repair.claim_id!r}: superseded {superseded} "
+                f"-> survivor #{repair.survivor_comment_id}"
+            )
+    except protocol.LedgerSupersededError:
+        # A frozen ledger has nothing left for duplicate repair to fix; let the
+        # label reconciliation below observe the freeze and run its own cleanup.
+        pass
+    issue = _optional_issue_number(parsed.issue)
+    if issue is None:
+        reconciled = protocol.reconcile_all_labels(client)
+    else:
+        protocol.reconcile_issue_label(client, issue)
+        reconciled = tuple(
+            claim.identity.issue
+            for claim in protocol._ledger_claims(client)
+            if isinstance(claim.identity, protocol.IssueIdentity) and claim.identity.issue == issue
+        )
+    print("RECONCILED " + (", ".join(f"#{issue}" for issue in reconciled) or "no claims"))
+
+
+_COMMAND_HANDLERS: dict[str, Callable[[argparse.Namespace, _CommandSession], int | None]] = {
+    "pr-check": _cmd_pull_request_check,
+    "status": _cmd_status,
+    "board": _cmd_board,
+    "rulings": _cmd_rulings,
+    "next": _cmd_next,
+    "who": _cmd_who,
+    "rescope": _cmd_rescope,
+    "claim": _cmd_claim,
+    "release": _cmd_release,
+    "supersede": _cmd_supersede,
+    "reconcile": _cmd_reconcile,
+}
+
+
+def _release_branch_for(parsed: argparse.Namespace) -> str | None:
+    if parsed.coordinator_override:
+        protocol._require_coordinator_override(parsed.role)
+    if parsed.issue is not None and parsed.claim_id is not None:
+        return None
+    release_branch = checkout._git_output(["branch", "--show-current"])
+    if release_branch:
+        return release_branch
+    if parsed.issue is None:
+        raise protocol.ClaimUnavailableError(
+            "lane release requires a non-empty current branch; "
+            "check out the docs/ or fix/ lane branch, or pass "
+            "an issue number"
+        )
+    raise protocol.ClaimUnavailableError(
+        "release without --claim-id requires a non-empty current branch; pass --claim-id"
+    )
+
+
+def _dispatch(parsed: argparse.Namespace) -> int:
+    if parsed.command in {"claim", "release", "rescope"}:
+        parsed.agent = checkout._resolved_agent(parsed.agent)
+    release_branch = _release_branch_for(parsed) if parsed.command == "release" else None
+    repository = checkout._repository(parsed.repo)
+    client = github.GitHubIssueComments(repository)
+    if parsed.command == "bootstrap":
+        ledger = discovery.bootstrap_ledger(client)
+        protocol.configure_ledger(ledger)
+        print(f"LEDGER #{ledger}")
+        return 0
+    ledger = discovery.discover_ledger(client)
+    if ledger is None:
+        raise protocol.ClaimUnavailableError(
+            "no agent-claim ledger exists; run agent-claim bootstrap"
+        )
+    protocol.configure_ledger(ledger)
+    session = _CommandSession(client=client, ledger=ledger, release_branch=release_branch)
+    result = _COMMAND_HANDLERS[parsed.command](parsed, session)
+    return 0 if result is None else result
+
+
 def main(arguments: list[str] | None = None) -> int:
     parsed = _parser().parse_args(arguments)
     if parsed.command == "policy":
@@ -1429,257 +1732,7 @@ def main(arguments: list[str] | None = None) -> int:
     if parsed.command == "protect":
         return _protect(parsed.repo)
     try:
-        if parsed.command in {"claim", "release", "rescope"}:
-            parsed.agent = checkout._resolved_agent(parsed.agent)
-        release_branch: str | None = None
-        if parsed.command == "release":
-            if parsed.coordinator_override:
-                protocol._require_coordinator_override(parsed.role)
-            if parsed.issue is None or parsed.claim_id is None:
-                release_branch = checkout._git_output(["branch", "--show-current"])
-                if not release_branch:
-                    if parsed.issue is None:
-                        raise protocol.ClaimUnavailableError(
-                            "lane release requires a non-empty current branch; "
-                            "check out the docs/ or fix/ lane branch, or pass "
-                            "an issue number"
-                        )
-                    raise protocol.ClaimUnavailableError(
-                        "release without --claim-id requires a non-empty current branch; "
-                        "pass --claim-id"
-                    )
-        repository = checkout._repository(parsed.repo)
-        client = github.GitHubIssueComments(repository)
-        if parsed.command == "bootstrap":
-            ledger = discovery.bootstrap_ledger(client)
-            protocol.configure_ledger(ledger)
-            print(f"LEDGER #{ledger}")
-            return 0
-        ledger = discovery.discover_ledger(client)
-        if ledger is None:
-            raise protocol.ClaimUnavailableError(
-                "no agent-claim ledger exists; run agent-claim bootstrap"
-            )
-        protocol.configure_ledger(ledger)
-        if parsed.command == "pr-check":
-            pull_request_number = int(parsed.pr)
-            return _pull_request_check(client, repository, pull_request_number)
-        if parsed.command == "status":
-            issue = _optional_issue_number(parsed.issue)
-            comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
-            claims = protocol.active_claims(comments)
-            now = datetime.now(UTC)
-            if parsed.json:
-                return _status_json(claims, issue, ledger, now=now)
-            print(f"LEDGER #{ledger}")
-            return _status(claims, issue, now=now)
-        if parsed.command == "board":
-            comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
-            projected = _board(client, protocol.active_claims(comments))
-            print(board.board_json(projected) if parsed.json else board.render(projected))
-            return 0
-        if parsed.command == "rulings":
-            comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
-            issues = client.list_open_board_issues()
-            projected = _board(client, protocol.active_claims(comments), issues=issues)
-            return _rulings(projected, issues, as_json=parsed.json)
-        if parsed.command == "next":
-            comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
-            projected = _board(client, protocol.active_claims(comments))
-            item = board.highest_scored_actionable(projected)
-            skipped = _unworkable(projected)
-            recovery = projected.recovery
-            if item is None:
-                if skipped or recovery:
-                    if parsed.json:
-                        _next_json(None, skipped, recovery)
-                    else:
-                        _next(None, skipped, recovery)
-                return 3
-            return (
-                _next_json(item, skipped, recovery)
-                if parsed.json
-                else _next(item, skipped, recovery)
-            )
-        if parsed.command == "who":
-            claims = protocol._ledger_claims(client)
-            if parsed.json:
-                return _who_json(claims, parsed.path, ledger)
-            print(f"LEDGER #{ledger}")
-            return _who(claims, parsed.path)
-        if parsed.command == "rescope":
-            issue = _optional_issue_number(parsed.issue)
-            rescope_branch = checkout._git_output(["branch", "--show-current"])
-            if not rescope_branch:
-                raise protocol.ClaimUnavailableError(
-                    "rescope requires a non-empty current branch; "
-                    "check out the claim branch, or pass an issue number"
-                )
-            checkout._validate_worktree_branch(rescope_branch)
-            identity = _resolved_identity(issue, rescope_branch)
-            add = protocol._valid_scope(parsed.add) if parsed.add else ()
-            drop = protocol._valid_scope(parsed.drop) if parsed.drop else ()
-            allow_directory_reason = parsed.allow_directory
-            if allow_directory_reason is not None:
-                allow_directory_reason = protocol._outbound_text(
-                    allow_directory_reason, "allow-directory reason", maximum=512
-                )
-            if add:
-                versioned = checkout.versioned_paths()
-                _reject_uncut_directory_scope(client, identity, add, allow_directory_reason)
-                selected = protocol._select_rescope_claim(
-                    protocol._ledger_claims(client),
-                    identity,
-                    parsed.agent,
-                    parsed.claim_id,
-                    branch=rescope_branch,
-                )
-                _reject_oversized_scope(
-                    protocol._combined_scope(selected.scope, add, drop),
-                    allow_directory_reason,
-                    versioned,
-                )
-            rescoped = protocol.rescope_claim(
-                client,
-                identity,
-                parsed.agent,
-                add,
-                drop,
-                parsed.claim_id,
-                branch=rescope_branch,
-                allow_directory_reason=allow_directory_reason,
-            )
-            if parsed.json:
-                return _rescope_json(rescoped)
-            print(f"RESCOPED {_claim_subject(rescoped)}: {rescoped.claim_id}")
-            return 0
-        if parsed.command == "claim":
-            requested = _request(parsed)
-            versioned = checkout.versioned_paths()
-            _reject_uncut_directory_scope(
-                client,
-                requested.identity,
-                requested.scope,
-                requested.allow_directory_reason,
-            )
-            n, total, share = _reject_oversized_scope(
-                requested.scope, requested.allow_directory_reason, versioned
-            )
-            checks: tuple[SliceCheck, ...] = ()
-            target_issue: int | None = None
-            if isinstance(requested.identity, protocol.IssueIdentity):
-                target_issue = requested.identity.issue
-                replayed = protocol.matching_claim_retry(protocol._ledger_claims(client), requested)
-                if replayed is None:
-                    open_issues = client.list_open_board_issues()
-                    open_by_number = {issue.number: issue for issue in open_issues}
-                    projected = _board(client, protocol._ledger_claims(client), issues=open_issues)
-                    checks = _slice_rule_checks(
-                        BoardReferenceLookup(client, repository, open_by_number),
-                        target_issue,
-                        projected,
-                        requested.out_of_order_reason,
-                    )
-            if any(check.level == "error" for check in checks):
-                return _refuse_claim(parsed.json, target_issue, checks)
-            for check in checks:
-                print(check.render(), file=sys.stderr if parsed.json else sys.stdout)
-            # `_acquire_claim_with_observed` already reads the ledger once,
-            # right after posting, to detect a claim race; that same snapshot
-            # is what the "touches" note below needs, so reusing it (instead
-            # of a fresh `protocol._ledger_claims(client)` call) removes the
-            # slowest step of `claim` — the wait was reported as a hang that
-            # landed after the mutation was already visible on the ledger.
-            try:
-                claimed, observed = protocol._acquire_claim_with_observed(client, requested)
-            except protocol.ClaimPostedReconcileFailedError as error:
-                # The claim comment already exists and already won the
-                # ledger; a failure in the post-claim label/projection
-                # reconcile must never read as a refusal — that would leave
-                # the operator believing nothing happened while a live claim
-                # sits on the ledger. Print the claim plainly even under
-                # --json: there is no well-formed claim payload to emit when
-                # the reconcile itself is what failed.
-                print(
-                    f"CLAIMED {_claim_subject(error.claim)}: "
-                    f"{error.claim.claim_id} {error.claim.comment.url}"
-                )
-                print(
-                    f"ERROR: the claim above exists, but the post-claim "
-                    f"reconcile failed: {error.reconcile_error}",
-                    file=sys.stderr,
-                )
-                return 2
-            touches = protocol.conflicting_claims(observed, claimed)
-            if parsed.json:
-                return _claim_json(
-                    claimed,
-                    versioning=ScopeVersioning(n, total, share),
-                    touches=touches,
-                    checks=checks,
-                )
-            print(f"CLAIMED {_claim_subject(claimed)}: {claimed.claim_id} {claimed.comment.url}")
-            print(_claim_cost_line(n, total, touches))
-            return 0
-        if parsed.command == "release":
-            issue = _optional_issue_number(parsed.issue)
-            identity = _resolved_identity(issue, release_branch or "")
-            outcome = _release_outcome(parsed)
-            if isinstance(outcome, protocol.MergedRelease):
-                _verify_merged_release(client, repository, identity, outcome)
-            released = protocol.release_claim(
-                client,
-                identity,
-                parsed.agent,
-                parsed.role,
-                outcome,
-                parsed.claim_id,
-                branch=release_branch,
-                coordinator_override=parsed.coordinator_override,
-            )
-            if parsed.json:
-                return _release_json(released, parsed.agent, parsed.role, outcome)
-            print(f"RELEASED {_claim_subject(released)}: {released.claim_id}")
-            return 0
-        if parsed.command == "supersede":
-            successor_issue = _optional_issue_number(parsed.successor_issue)
-            frozen = protocol.supersede_ledger(
-                client,
-                successor_issue,
-                parsed.agent,
-                parsed.role,
-                parsed.reason,
-                parsed.claim_id,
-            )
-            print(
-                f"SUPERSEDED ledger #{protocol.LEDGER_ISSUE} successor "
-                f"#{successor_issue}: {frozen.claim_id}"
-            )
-            return 0
-        try:
-            for repair in protocol.repair_duplicate_claims(client):
-                superseded = ", ".join(f"#{cid}" for cid in repair.superseded_comment_ids)
-                print(
-                    f"REPAIRED claim {repair.claim_id!r}: superseded {superseded} "
-                    f"-> survivor #{repair.survivor_comment_id}"
-                )
-        except protocol.LedgerSupersededError:
-            # A frozen ledger has nothing left for duplicate repair to fix; let the
-            # label reconciliation below observe the freeze and run its own cleanup.
-            pass
-        issue = _optional_issue_number(parsed.issue)
-        if issue is None:
-            reconciled = protocol.reconcile_all_labels(client)
-        else:
-            protocol.reconcile_issue_label(client, issue)
-            reconciled = tuple(
-                claim.identity.issue
-                for claim in protocol._ledger_claims(client)
-                if isinstance(claim.identity, protocol.IssueIdentity)
-                and claim.identity.issue == issue
-            )
-        print("RECONCILED " + (", ".join(f"#{issue}" for issue in reconciled) or "no claims"))
-        return 0
+        return _dispatch(parsed)
     except protocol.ClaimError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
