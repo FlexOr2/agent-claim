@@ -684,7 +684,9 @@ def test_board_projects_fixture_json_without_github_writes(
 
     assert issue_claim.main(["--repo", "example/agent-claim", "board"]) == 0
     rendered = capsys.readouterr().out
-    assert "CONTRACT" in rendered and "NEXT" in rendered and "ACTIONABLE" in rendered
+    assert "CONTRACT" in rendered
+    assert "NEXT" in rendered
+    assert "ACTIONABLE" in rendered
     assert "#10" in rendered
     assert "no: claimed" in rendered
     assert all("--method" not in arguments for arguments in observed)
@@ -1704,7 +1706,8 @@ def test_claim_json_refusal_reports_out_of_order_without_mutating(
     assert check["check"] == "out-of-order"
     assert check["issue"] == 11
     assert check["slice"] is None
-    assert "#11" in check["text"] and "Top work" in check["text"]
+    assert "#11" in check["text"]
+    assert "Top work" in check["text"]
     assert "--out-of-order REASON" in check["text"]
     assert client.comments[LEDGER_ISSUE] == []
 
@@ -2269,7 +2272,8 @@ def test_board_reports_each_item_actionability_reason(
     )
     item = next(item for item in projected.items if item.number == issue.number)
 
-    assert (item.actionable, item.actionable_reason) == expected
+    actual = (item.actionable, item.actionable_reason)
+    assert actual == expected
 
 
 def test_board_collects_every_open_blocker_from_issue_list() -> None:
@@ -2380,10 +2384,12 @@ def test_frozen_marker_without_a_valid_form_fails_loud() -> None:
         complete_contract("Claim #10.") + "\n\nEingefroren bis: no operator or date",
     )
 
+    raised_argument_1 = board.BoardConfig()
+    raised_argument_2 = datetime(2026, 8, 21, tzinfo=timezone.utc)
     with pytest.raises(ClaimError, match="Eingefroren bis"):
         board.build_board(
-            (issue,), (), (), (), board.BoardConfig(),
-            now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+            (issue,), (), (), (), raised_argument_1,
+            now=raised_argument_2,
         )
 
 
@@ -2424,10 +2430,12 @@ def test_frozen_marker_outside_a_fence_still_fails_loud_when_malformed() -> None
         "Eingefroren bis: no operator or date",
     )
 
+    raised_argument_1 = board.BoardConfig()
+    raised_argument_2 = datetime(2026, 8, 31, tzinfo=timezone.utc)
     with pytest.raises(ClaimError, match="Eingefroren bis"):
         board.build_board(
-            (issue,), (), (), (), board.BoardConfig(),
-            now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+            (issue,), (), (), (), raised_argument_1,
+            now=raised_argument_2,
         )
 
 
@@ -3410,8 +3418,10 @@ def test_lane_and_issue_claim_markers_use_different_key_sets() -> None:
     issue_keys = _marker_payload_keys(claim_comment(request(lane=False)))
     lane_keys = _marker_payload_keys(claim_comment(request(lane=True)))
 
-    assert "issue" in issue_keys and "lane" not in issue_keys
-    assert "lane" in lane_keys and "issue" not in lane_keys
+    assert "issue" in issue_keys
+    assert "lane" not in issue_keys
+    assert "lane" in lane_keys
+    assert "issue" not in lane_keys
     assert issue_keys != lane_keys
 
 
@@ -3438,8 +3448,9 @@ def test_lane_and_issue_claim_markers_use_different_key_sets() -> None:
 def test_marker_identity_discriminator_refuses_ambiguous_or_missing_keys(
     payload: dict[str, object], match: str
 ) -> None:
+    raised_argument_1 = comment(1, marker(payload))
     with pytest.raises(InvalidClaimMarker, match=match):
-        parse_claim_event(comment(1, marker(payload)))
+        parse_claim_event(raised_argument_1)
 
 
 def test_protocol_parser_returns_action_specific_types() -> None:
@@ -3537,8 +3548,9 @@ def test_protocol_event_requires_exact_final_agent_attribution(
     if attribution is not None:
         body += f"\n\n{attribution}"
 
+    raised_argument_1 = comment(1, body)
     with pytest.raises(InvalidClaimMarker, match="exact agent attribution"):
-        parse_claim_event(comment(1, body))
+        parse_claim_event(raised_argument_1)
 
 
 @pytest.mark.parametrize(
@@ -3551,15 +3563,17 @@ def test_outbound_comment_constructors_reject_controlled_identity_fields(
     claimed = parse_claim_event(comment(1, claim_comment(request())))
     assert isinstance(claimed, ActiveClaim)
 
+    raised_argument_1 = replace(request(), agent=invalid)
     with pytest.raises(ClaimError, match="agent must be one bounded non-empty line"):
-        claim_comment(replace(request(), agent=invalid))
+        claim_comment(raised_argument_1)
     with pytest.raises(ClaimError, match="agent must be one bounded non-empty line"):
         release_comment(claimed, invalid, "builder", "landed")
     with pytest.raises(ClaimError, match="agent must be one bounded non-empty line"):
         supersede_comment(claimed, 170, invalid, "coordinator", "rollover")
 
+    raised_argument_1 = replace(request(), role=invalid)
     with pytest.raises(ClaimError, match="role must be one bounded non-empty line"):
-        claim_comment(replace(request(), role=invalid))
+        claim_comment(raised_argument_1)
     with pytest.raises(ClaimError, match="role must be one bounded non-empty line"):
         release_comment(claimed, "Codex Sol", invalid, "landed")
     with pytest.raises(ClaimError, match="role must be one bounded non-empty line"):
@@ -3621,8 +3635,9 @@ def test_legacy_marker_fails_loud_with_a_clear_message_before_ledger_is_configur
         legacy=True,
     )
 
+    raised_argument_1 = comment(1, legacy)
     with pytest.raises(ClaimError, match="before configure_ledger"):
-        parse_claim_event(comment(1, legacy))
+        parse_claim_event(raised_argument_1)
 
 
 @pytest.mark.parametrize(
@@ -3656,8 +3671,15 @@ def test_invalid_branch_and_private_or_noncanonical_scope_fail_loud(
         "scope": scope,
     }
 
-    with pytest.raises(InvalidClaimMarker):
-        parse_claim_event(comment(1, marker(payload)))
+    raised_argument_1 = comment(1, marker(payload))
+    with pytest.raises(
+        InvalidClaimMarker,
+        match=(
+            "claim marker branch is not a safe Git ref|claim scope (entries must be "
+            "canonical bounded paths|must be repository-relative)"
+        ),
+    ):
+        parse_claim_event(raised_argument_1)
 
 
 def test_unknown_or_missing_marker_fields_fail_loud() -> None:
@@ -3673,13 +3695,18 @@ def test_unknown_or_missing_marker_fields_fail_loud() -> None:
         "surprise": True,
     }
 
+    raised_argument_1 = comment(1, marker(unknown))
     with pytest.raises(InvalidClaimMarker, match="upgrade the installed tool"):
-        parse_claim_event(comment(1, marker(unknown)))
-    with pytest.raises(InvalidClaimMarker):
-        parse_claim_event(comment(2, marker({"action": "claim"})))
+        parse_claim_event(raised_argument_1)
+    raised_argument_1 = comment(2, marker({"action": "claim"}))
+    with pytest.raises(
+        InvalidClaimMarker, match="claim marker issue must be a positive integer"
+    ):
+        parse_claim_event(raised_argument_1)
     missing = {key: value for key, value in unknown.items() if key not in {"surprise", "scope"}}
+    raised_argument_1 = comment(3, marker(missing))
     with pytest.raises(InvalidClaimMarker, match="fields differ(?!.*upgrade)"):
-        parse_claim_event(comment(3, marker(missing)))
+        parse_claim_event(raised_argument_1)
 
 
 def test_release_must_come_from_original_claimant() -> None:
@@ -3688,8 +3715,10 @@ def test_release_must_come_from_original_claimant() -> None:
     assert claimed is not None
     foreign_release = release_event(claimed, agent="Other", role="builder")
 
+    raised_argument_1 = comment(1, claimed_body)
+    raised_argument_2 = comment(2, foreign_release)
     with pytest.raises(InvalidClaimMarker, match="only be released by its claimant"):
-        active_claims((comment(1, claimed_body), comment(2, foreign_release)))
+        active_claims((raised_argument_1, raised_argument_2))
 
 
 def test_coordinator_override_is_explicit_and_bound_to_claim_comment() -> None:
@@ -3711,8 +3740,10 @@ def test_coordinator_override_is_explicit_and_bound_to_claim_comment() -> None:
         first_line.removeprefix("<!-- agent-claim:v2 ").removesuffix(" -->")
     )
     payload["claim_comment_id"] = 999
+    raised_argument_1 = comment(1, claimed_body)
+    raised_argument_2 = comment(2, marker(payload))
     with pytest.raises(InvalidClaimMarker, match="wrong claim comment"):
-        active_claims((comment(1, claimed_body), comment(2, marker(payload))))
+        active_claims((raised_argument_1, raised_argument_2))
 
 
 def test_active_claims_strict_reader_refuses_reused_claim_ids_and_orphan_releases() -> None:
@@ -3724,16 +3755,20 @@ def test_active_claims_strict_reader_refuses_reused_claim_ids_and_orphan_release
     assert claimed is not None
     released = release_event(claimed)
 
+    raised_argument_1 = comment(1, claimed_body)
+    raised_argument_2 = comment(2, released)
+    raised_argument_3 = comment(3, claimed_body)
     with pytest.raises(InvalidClaimMarker, match="was reused"):
         active_claims(
             (
-                comment(1, claimed_body),
-                comment(2, released),
-                comment(3, claimed_body),
+                raised_argument_1,
+                raised_argument_2,
+                raised_argument_3,
             )
         )
+    raised_argument_1 = comment(1, released)
     with pytest.raises(InvalidClaimMarker, match="before it was acquired"):
-        active_claims((comment(1, released),))
+        active_claims((raised_argument_1,))
 
 
 def test_duplicate_claimant_releases_are_idempotent() -> None:
@@ -3793,14 +3828,18 @@ def test_supersede_atomically_terminates_the_only_ledger_claim() -> None:
     assert isinstance(parsed, LedgerSupersede)
     assert parsed.successor_issue == 170
 
+    raised_argument_1 = comment(1, claimed_body)
+    raised_argument_2 = comment(2, frozen)
     with pytest.raises(LedgerSuperseded, match="successor #170"):
-        active_claims((comment(1, claimed_body), comment(2, frozen)))
+        active_claims((raised_argument_1, raised_argument_2))
     late_claim = comment(
         3,
         claim_comment(request("late", issue=72, scope=("frontend",))),
     )
+    raised_argument_1 = comment(1, claimed_body)
+    raised_argument_2 = comment(2, frozen)
     with pytest.raises(LedgerSuperseded, match="successor #170"):
-        active_claims((comment(1, claimed_body), comment(2, frozen), late_claim))
+        active_claims((raised_argument_1, raised_argument_2, late_claim))
 
 
 def test_supersede_is_an_inert_rejected_event_while_another_lane_is_active() -> None:
@@ -3842,8 +3881,9 @@ def test_supersede_command_posts_terminal_event_and_observes_freeze() -> None:
 
     assert selected == acquired
     assert LEDGER_ISSUE not in client.labels
+    raised_argument_1 = client.list_protocol_candidates(LEDGER_ISSUE)
     with pytest.raises(LedgerSuperseded, match="successor #170"):
-        active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+        active_claims(raised_argument_1)
 
 
 def test_supersede_race_loses_cleanly_without_poisoning_the_ledger() -> None:
@@ -3945,9 +3985,7 @@ def test_supersede_requires_a_higher_numbered_successor() -> None:
             acquired.claim_id,
         )
 
-    with pytest.raises(InvalidClaimMarker, match="greater than the current ledger"):
-        parse_claim_event(
-            comment(
+    raised_argument_1 = comment(
                 2,
                 marker(
                     {
@@ -3962,6 +4000,9 @@ def test_supersede_requires_a_higher_numbered_successor() -> None:
                     }
                 ),
             )
+    with pytest.raises(InvalidClaimMarker, match="greater than the current ledger"):
+        parse_claim_event(
+            raised_argument_1
         )
 
     assert len(client.list_protocol_candidates(LEDGER_ISSUE)) == protocol_count
@@ -4083,8 +4124,9 @@ def test_comma_joined_scope_refuses_empty_or_padded_entries(scope: list[str]) ->
         "scope": scope,
     }
 
+    raised_argument_1 = comment(1, marker(payload))
     with pytest.raises(InvalidClaimMarker, match="canonical bounded paths"):
-        parse_claim_event(comment(1, marker(payload)))
+        parse_claim_event(raised_argument_1)
 
 
 @pytest.mark.parametrize(
@@ -4289,10 +4331,11 @@ def test_rescope_refuses_dropping_a_path_it_does_not_hold() -> None:
     client = FakeComments()
     acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
 
+    raised_argument_1 = IssueIdentity(72)
     with pytest.raises(ClaimUnavailable, match="cannot drop 'docs/PRODUCT.md'"):
         rescope_claim(
             client,
-            IssueIdentity(72),
+            raised_argument_1,
             "Codex Sol",
             (),
             ("docs/PRODUCT.md",),
@@ -4304,19 +4347,21 @@ def test_rescope_refuses_an_empty_or_unchanged_scope() -> None:
     client = FakeComments()
     acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
 
+    raised_argument_1 = IssueIdentity(72)
     with pytest.raises(ClaimUnavailable, match="non-empty scope"):
         rescope_claim(
             client,
-            IssueIdentity(72),
+            raised_argument_1,
             "Codex Sol",
             (),
             ("src/widget.py",),
             "claim-a",
         )
+    raised_argument_1 = IssueIdentity(72)
     with pytest.raises(ClaimUnavailable, match="does not change"):
         rescope_claim(
             client,
-            IssueIdentity(72),
+            raised_argument_1,
             "Codex Sol",
             ("src/widget.py",),
             (),
@@ -4328,10 +4373,11 @@ def test_rescope_refuses_a_foreign_agent() -> None:
     client = FakeComments()
     acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
 
+    raised_argument_1 = IssueIdentity(72)
     with pytest.raises(ClaimUnavailable, match="only the original claimant"):
         rescope_claim(
             client,
-            IssueIdentity(72),
+            raised_argument_1,
             "Grok 4.6",
             ("src/new.py",),
             (),
@@ -4392,7 +4438,8 @@ def test_who_reports_the_claim_holding_a_path() -> None:
     second = parse_claim_event(
         comment(2, claim_comment(request("claim-b", issue=73, scope=("src/widget.py",))))
     )
-    assert first is not None and second is not None
+    assert first is not None
+    assert second is not None
     claims = (first, second)
 
     assert claims_holding_path(claims, "docs/PRODUCT.md") == (first,)
@@ -4447,10 +4494,11 @@ def test_same_issue_refuses_a_second_claim_even_with_disjoint_scope() -> None:
     incumbent = comment(1, claim_comment(request(issue=72, scope=("frontend",))))
     client = FakeComments({LEDGER_ISSUE: [incumbent]}, {72})
 
+    raised_argument_1 = request("claim-b", "Grok 4.6", issue=72, scope=("src",))
     with pytest.raises(ClaimUnavailable, match="issue #72"):
         acquire_claim(
             client,
-            request("claim-b", "Grok 4.6", issue=72, scope=("src",)),
+            raised_argument_1,
         )
 
 
@@ -4458,10 +4506,13 @@ def test_same_lane_refuses_a_second_claim_even_with_disjoint_scope() -> None:
     client = FakeComments()
     acquire_claim(client, request(lane=True, branch="docs/lane-a", scope=("frontend",)))
 
+    raised_argument_1 = request(
+        "claim-b", "Grok 4.6", lane=True, branch="docs/lane-a", scope=("src",)
+    )
     with pytest.raises(ClaimUnavailable, match="lane 'docs/lane-a'"):
         acquire_claim(
             client,
-            request("claim-b", "Grok 4.6", lane=True, branch="docs/lane-a", scope=("src",)),
+            raised_argument_1,
         )
 
 
@@ -4484,10 +4535,11 @@ def test_acquire_claim_refuses_reusing_an_active_claim_id_before_posting() -> No
     incumbent = comment(1, claim_comment(request("claim-a", issue=72, scope=("old",))))
     client = FakeComments({LEDGER_ISSUE: [incumbent]}, {72})
 
+    raised_argument_1 = request("claim-a", "Codex Sol", issue=72, scope=("old", "new"))
     with pytest.raises(ClaimUnavailable, match="claim id 'claim-a' is already"):
         acquire_claim(
             client,
-            request("claim-a", "Codex Sol", issue=72, scope=("old", "new")),
+            raised_argument_1,
         )
 
     assert client.comments[LEDGER_ISSUE] == [incumbent]
@@ -4500,10 +4552,11 @@ def test_acquire_claim_refuses_reusing_a_released_claim_id_before_posting() -> N
     entries = [comment(1, claimed_body), comment(2, release_event(claimed))]
     client = FakeComments({LEDGER_ISSUE: list(entries)})
 
+    raised_argument_1 = request("claim-a", "Grok 4.6", issue=73, scope=("fresh",))
     with pytest.raises(ClaimUnavailable, match="claim id 'claim-a' is already"):
         acquire_claim(
             client,
-            request("claim-a", "Grok 4.6", issue=73, scope=("fresh",)),
+            raised_argument_1,
         )
 
     assert client.comments[LEDGER_ISSUE] == entries
@@ -4516,8 +4569,9 @@ def test_acquire_claim_translates_a_same_claim_id_post_race_into_a_clear_error()
         claim_comment(request("claim-a", "Grok 4.6", issue=73, scope=("elsewhere",))),
     )
 
+    raised_argument_1 = request("claim-a", "Codex Sol", issue=72, scope=("mine",))
     with pytest.raises(ClaimUnavailable, match="claim race detected"):
-        acquire_claim(client, request("claim-a", "Codex Sol", issue=72, scope=("mine",)))
+        acquire_claim(client, raised_argument_1)
 
 
 def test_cross_issue_scope_race_keeps_both_overlapping_claims() -> None:
@@ -4648,8 +4702,9 @@ def test_successor_adopts_old_projection_but_old_helper_cannot_mutate_it(
     assert "ledger=170" in client.comments[72][0].body.partition("\n")[0]
 
     monkeypatch.setattr(protocol, "LEDGER_ISSUE", 71)
+    raised_argument_1 = issue_claim._unclaimed_projection()
     with pytest.raises(ClaimError, match="newer ledger generation"):
-        client.upsert_projection(72, issue_claim._unclaimed_projection(), create=False)
+        client.upsert_projection(72, raised_argument_1, create=False)
     assert len(client.comments[72]) == 1
     assert "ledger=170" in client.comments[72][0].body.partition("\n")[0]
 
@@ -4658,10 +4713,11 @@ def test_release_refuses_foreign_actor_without_explicit_override() -> None:
     client = FakeComments()
     acquired = acquire_claim(client, request(issue=72))
 
+    raised_argument_1 = IssueIdentity(72)
     with pytest.raises(ClaimUnavailable, match="original claimant"):
         release_claim(
             client,
-            IssueIdentity(72),
+            raised_argument_1,
             "Other",
             "builder",
             "takeover",
@@ -4778,8 +4834,9 @@ def test_release_claim_omitted_id_fails_closed_for_wrong_agent_branch_or_two_mat
     client = _claims_client(*standing)
     protocol_count = len(client.list_protocol_candidates(LEDGER_ISSUE))
 
+    raised_argument_1 = IssueIdentity(72)
     with pytest.raises(ClaimUnavailable, match="pass --claim-id") as raised:
-        release_claim(client, IssueIdentity(72), agent, None, None, None, branch=branch)
+        release_claim(client, raised_argument_1, agent, None, None, None, branch=branch)
 
     assert "conflicting claims" not in str(raised.value)
     assert len(client.list_protocol_candidates(LEDGER_ISSUE)) == protocol_count
@@ -4813,8 +4870,9 @@ def test_release_claim_omitted_id_requires_branch_and_does_not_call_git(
         request("mine", "Ada", issue=72, role="reviewer", branch="lane-72", scope=("src",))
     )
 
+    raised_argument_1 = IssueIdentity(72)
     with pytest.raises(ClaimUnavailable, match="current branch"):
-        release_claim(client, IssueIdentity(72), "Ada", None, None, None)
+        release_claim(client, raised_argument_1, "Ada", None, None, None)
     assert len(client.list_protocol_candidates(LEDGER_ISSUE)) == 1
 
     released = release_claim(client, IssueIdentity(72), "Ada", None, None, None, branch="lane-72")
@@ -4836,10 +4894,11 @@ def test_release_claim_override_fails_before_ledger_without_role_and_reason(
     client = FakeComments()
     expected = "--role coordinator" if role != "coordinator" else "--reason"
 
+    raised_argument_1 = IssueIdentity(72)
     with pytest.raises(ClaimUnavailable, match=expected):
         release_claim(
             client,
-            IssueIdentity(72),
+            raised_argument_1,
             "Ada",
             role,
             reason,
@@ -4877,8 +4936,9 @@ def test_label_reconciliation_heals_claim_posted_during_release_remove() -> None
 def test_label_failure_is_loud_while_comment_truth_remains() -> None:
     client = FakeComments(fail_add_label=True)
 
+    raised_argument_1 = request(issue=72)
     with pytest.raises(ClaimError, match="label add failed"):
-        acquire_claim(client, request(issue=72))
+        acquire_claim(client, raised_argument_1)
 
     assert [
         claim.identity.issue
@@ -4959,8 +5019,9 @@ def test_reconcile_repairs_a_duplicate_claim_id_and_restores_strict_reads() -> N
     newer_body = claim_comment(request("claim-a", "Codex Sol", issue=72, scope=("new",)))
     client = FakeComments({LEDGER_ISSUE: [comment(1, older_body), comment(2, newer_body)]})
 
+    raised_argument_1 = client.list_protocol_candidates(LEDGER_ISSUE)
     with pytest.raises(InvalidClaimMarker, match="was reused"):
-        active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+        active_claims(raised_argument_1)
 
     repaired = repair_duplicate_claims(client)
 
@@ -5221,8 +5282,9 @@ def test_stale_reconcile_removes_label_when_supersede_wins_midflight() -> None:
         reconcile_issue_label(client, LEDGER_ISSUE)
 
     assert LEDGER_ISSUE not in client.labels
-    with pytest.raises(LedgerSuperseded):
-        active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+    raised_argument_1 = client.list_protocol_candidates(LEDGER_ISSUE)
+    with pytest.raises(LedgerSuperseded, match='successor #170'):
+        active_claims(raised_argument_1)
 
 
 def test_old_reconcile_clears_only_its_generation_label_after_freeze() -> None:
@@ -5306,7 +5368,8 @@ def test_status_reports_repository_scope_overlaps_as_notes(
             claim_comment(request("claim-b", issue=73, scope=("shared/file.py",))),
         )
     )
-    assert first is not None and second is not None
+    assert first is not None
+    assert second is not None
 
     exit_code = _status((first, second), None)
 
@@ -5331,7 +5394,8 @@ def test_status_notes_a_scope_that_is_claimed_after_its_descendant(
     parent = parse_claim_event(
         comment(2, claim_comment(request("claim-b", issue=73, scope=("shared",))))
     )
-    assert descendant is not None and parent is not None
+    assert descendant is not None
+    assert parent is not None
 
     assert _status((descendant, parent), None) == 0
     rendered = capsys.readouterr().out
@@ -5468,8 +5532,9 @@ def test_github_rejects_blocker_states_the_api_cannot_return(
         ),
     )
 
+    raised_argument_1 = frozenset({86})
     with pytest.raises(ClaimError, match="malformed board blocker"):
-        client.list_board_blockers(frozenset({86}))
+        client.list_board_blockers(raised_argument_1)
 
 
 def test_github_marks_a_missing_blocker_only_after_a_404(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5595,8 +5660,9 @@ def test_fake_and_github_adapters_expose_only_common_protocol_candidates(
 def test_comment_size_is_bounded_before_any_adapter_post() -> None:
     widest_scope = tuple(f"p{index:03d}-" + "x" * 507 for index in range(256))
 
+    raised_argument_1 = request(scope=widest_scope)
     with pytest.raises(ClaimError, match=str(MAX_COMMENT_BYTES)):
-        claim_comment(request(scope=widest_scope))
+        claim_comment(raised_argument_1)
 
 
 def test_github_comment_body_uses_stdin_instead_of_process_argument(
@@ -5789,8 +5855,9 @@ def test_github_successor_adopts_stale_projection_but_old_generation_skips_it(
     successor = replace(stale, body=successor_body)
     monkeypatch.setattr(client, "_projection_comments", lambda issue: (successor,))
     observed.clear()
+    raised_argument_1 = issue_claim._unclaimed_projection()
     with pytest.raises(ClaimError, match="newer ledger generation"):
-        client.upsert_projection(72, issue_claim._unclaimed_projection(), create=False)
+        client.upsert_projection(72, raised_argument_1, create=False)
     assert observed == []
 
 
@@ -6053,8 +6120,10 @@ def test_bounded_command_reaps_child_when_select_fails(
 
     process = observed["process"]
     assert process.poll() is not None
-    assert process.stdout is not None and process.stdout.closed
-    assert FailingSelector.instance is not None and FailingSelector.instance.closed
+    assert process.stdout is not None
+    assert process.stdout.closed
+    assert FailingSelector.instance is not None
+    assert FailingSelector.instance.closed
 
 
 def test_bounded_command_reaps_child_when_output_read_fails(
@@ -6436,8 +6505,9 @@ def test_claim_request_binds_omitted_base_and_branch_to_checkout(
 def test_claim_still_requires_scope_and_supersede_still_requires_role(
     arguments: list[str],
 ) -> None:
+    raised_argument_1 = issue_claim._parser()
     with pytest.raises(SystemExit) as exited:
-        issue_claim._parser().parse_args(arguments)
+        raised_argument_1.parse_args(arguments)
 
     assert exited.value.code == 2
 
@@ -6559,8 +6629,9 @@ def test_claim_and_release_parse_omitted_agent(
 
 def test_supersede_still_requires_agent(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_agent_identity_env(monkeypatch)
+    raised_argument_1 = issue_claim._parser()
     with pytest.raises(SystemExit) as exited:
-        issue_claim._parser().parse_args(
+        raised_argument_1.parse_args(
             [
                 "supersede",
                 "170",
@@ -7451,7 +7522,8 @@ def test_cli_lane_mode_refuses_a_non_conventional_branch(
     captured = capsys.readouterr()
     assert "codex/issue-38-issueless-claims" in captured.err
     assert "issue number" in captured.err
-    assert "'docs/'" in captured.err and "'fix/'" in captured.err
+    assert "'docs/'" in captured.err
+    assert "'fix/'" in captured.err
     assert client.comments == {}
 
 
@@ -7794,8 +7866,9 @@ def test_cli_claim_and_release_accept_json_while_parent_and_bootstrap_reject_it(
     assert omitted_claim.json is False
     assert omitted_release.json is False
     for arguments in (["--json", "status"], ["bootstrap", "--json"]):
+        raised_argument_1 = issue_claim._parser()
         with pytest.raises(SystemExit) as exited:
-            issue_claim._parser().parse_args(arguments)
+            raised_argument_1.parse_args(arguments)
         assert exited.value.code == 2
 
 
@@ -8191,7 +8264,8 @@ def test_cli_comma_joined_scope_flag_equals_repeated_scope_flags(
     assert (joined, repeated) == (0, 0)
     first = parse_claim_event(client.comments[LEDGER_ISSUE][0])
     second = parse_claim_event(repeated_client.comments[LEDGER_ISSUE][0])
-    assert isinstance(first, ActiveClaim) and isinstance(second, ActiveClaim)
+    assert isinstance(first, ActiveClaim)
+    assert isinstance(second, ActiveClaim)
     assert first.scope == second.scope == ("docs/PRODUCT.md", "src/widget.py")
 
 
@@ -8704,7 +8778,8 @@ def test_claim_cost_lists_an_overlapping_standing_claim_as_a_touch() -> None:
             ),
         )
     )
-    assert isinstance(standing, ActiveClaim) and isinstance(lane, ActiveClaim)
+    assert isinstance(standing, ActiveClaim)
+    assert isinstance(lane, ActiveClaim)
     overlapping = protocol.conflicting_claims(
         (standing, lane), request("challenger", issue=56, scope=("src/widget.py",))
     )
@@ -9366,8 +9441,9 @@ def test_cli_supersede_freezes_the_drained_ledger_and_prints_the_contract_line(
     assert LEDGER_ISSUE not in client.labels
     assert "not available in v0.1" not in captured.out
     assert "not available in v0.1" not in captured.err
+    raised_argument_1 = client.list_protocol_candidates(LEDGER_ISSUE)
     with pytest.raises(LedgerSuperseded, match="successor #170"):
-        active_claims(client.list_protocol_candidates(LEDGER_ISSUE))
+        active_claims(raised_argument_1)
 
 
 @pytest.mark.parametrize("failure", ["builder", "drain"])
@@ -10032,9 +10108,10 @@ def test_same_issue_still_refuses_a_second_live_claim() -> None:
     client = FakeComments()
     acquire_claim(client, request(issue=72, scope=("src/a.py",)))
 
+    raised_argument_1 = request("claim-b", "Grok 4.6", issue=72, scope=("src/b.py",))
     with pytest.raises(ClaimUnavailable, match="issue #72 is claimed"):
         acquire_claim(
-            client, request("claim-b", "Grok 4.6", issue=72, scope=("src/b.py",))
+            client, raised_argument_1
         )
 
 
@@ -10085,17 +10162,18 @@ def test_resource_refuses_a_second_live_hold_of_the_same_value() -> None:
         request(issue=72, scope=("src/a.py",), resource="schema-hop", resource_value=4),
     )
 
-    with pytest.raises(ClaimUnavailable, match="schema-hop 4 is held by Codex Sol"):
-        acquire_claim(
-            client,
-            request(
+    raised_argument_1 = request(
                 "claim-b",
                 "Grok 4.6",
                 issue=73,
                 scope=("src/b.py",),
                 resource="schema-hop",
                 resource_value=4,
-            ),
+            )
+    with pytest.raises(ClaimUnavailable, match="schema-hop 4 is held by Codex Sol"):
+        acquire_claim(
+            client,
+            raised_argument_1,
         )
 
 
@@ -10162,17 +10240,18 @@ def test_resource_race_explicit_value_still_fails_closed() -> None:
     )
     client.inject_after_next_ledger_post = earlier
 
-    with pytest.raises(ClaimUnavailable, match="schema-hop 1 is held by Grok 4.6"):
-        acquire_claim(
-            client,
-            request(
+    raised_argument_1 = request(
                 "later",
                 "Codex Sol",
                 issue=73,
                 scope=("src/b.py",),
                 resource="schema-hop",
                 resource_value=1,
-            ),
+            )
+    with pytest.raises(ClaimUnavailable, match="schema-hop 1 is held by Grok 4.6"):
+        acquire_claim(
+            client,
+            raised_argument_1,
         )
 
 
@@ -10590,14 +10669,16 @@ def test_ruled_expectations_without_a_date_fail_loud() -> None:
         + expectation_block("- Name it. *(geregelt: ja)*", heading="Erwartung"),
     )
 
+    raised_argument_1 = board.BoardConfig()
+    raised_argument_2 = datetime(2026, 8, 21, tzinfo=timezone.utc)
     with pytest.raises(ClaimError, match="no readable date"):
         board.build_board(
             (issue,),
             (),
             (),
             (),
-            board.BoardConfig(),
-            now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+            raised_argument_1,
+            now=raised_argument_2,
         )
 
 
@@ -11000,14 +11081,16 @@ def test_distinct_heading_dates_without_an_operator_date_fail_loud() -> None:
         ),
     )
 
+    raised_argument_1 = board.BoardConfig()
+    raised_argument_2 = datetime(2026, 8, 21, tzinfo=timezone.utc)
     with pytest.raises(ClaimError, match="more than one date"):
         board.build_board(
             (issue,),
             (),
             (),
             (),
-            board.BoardConfig(),
-            now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+            raised_argument_1,
+            now=raised_argument_2,
         )
 
 
@@ -11098,7 +11181,8 @@ def test_identity_conflict_still_marks_status_conflict(
             claim_comment(request("claim-b", "Grok 4.6", issue=72, scope=("src/b.py",))),
         )
     )
-    assert first is not None and second is not None
+    assert first is not None
+    assert second is not None
 
     assert _status((first, second), None) == 2
     rendered = capsys.readouterr().out
