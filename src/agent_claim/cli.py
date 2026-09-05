@@ -202,7 +202,8 @@ def _request(arguments: argparse.Namespace) -> protocol.ClaimRequest:
         branch = checkout._git_output(["branch", "--show-current"])
     else:
         branch = arguments.branch
-    identity = _resolved_identity(arguments.issue, branch)
+    issue = _optional_issue_number(arguments.issue)
+    identity = _resolved_identity(issue, branch)
     payload: dict[str, object] = {
         "action": "claim",
         "agent": agent,
@@ -545,7 +546,7 @@ def _who(claims: tuple[protocol.ActiveClaim, ...], path: str) -> None:
         )
 
 
-def _who_json(claims: tuple[protocol.ActiveClaim, ...], path: str, ledger: int) -> int:
+def _who_json(claims: tuple[protocol.ActiveClaim, ...], path: str, ledger: int) -> None:
     holders = protocol.claims_holding_path(claims, path)
     state = "UNCLAIMED" if not holders else "CLAIMED"
     payload = {
@@ -568,10 +569,9 @@ def _who_json(claims: tuple[protocol.ActiveClaim, ...], path: str, ledger: int) 
         ],
     }
     print(json.dumps(payload))
-    return 0
 
 
-def _rescope_json(claimed: protocol.ActiveClaim) -> int:
+def _rescope_json(claimed: protocol.ActiveClaim) -> None:
     print(
         json.dumps(
             {
@@ -585,7 +585,6 @@ def _rescope_json(claimed: protocol.ActiveClaim) -> int:
             }
         )
     )
-    return 0
 
 
 @dataclass(frozen=True)
@@ -633,7 +632,7 @@ def _release_json(
     agent: str,
     role: str | None,
     outcome: protocol.ReleaseOutcome,
-) -> int:
+) -> None:
     print(
         json.dumps(
             {
@@ -646,7 +645,6 @@ def _release_json(
             }
         )
     )
-    return 0
 
 
 def _merged_pull_request_floor(issues: tuple[board.Issue, ...], now: datetime) -> datetime:
@@ -1267,11 +1265,11 @@ def _pull_request_check(client: github.GitHubIssueComments, repository: str, num
     return 0
 
 
-def _release_outcome(arguments: argparse.Namespace) -> protocol.ReleaseOutcome:
-    if arguments.merged is not None:
-        return protocol.MergedRelease(arguments.merged)
+def _release_outcome(merged: int | None, abandoned: str | None) -> protocol.ReleaseOutcome:
+    if merged is not None:
+        return protocol.MergedRelease(merged)
     return protocol.AbandonedRelease(
-        protocol._outbound_text(arguments.abandoned, "abandoned reason", maximum=512)
+        protocol._outbound_text(abandoned, "abandoned reason", maximum=512)
     )
 
 
@@ -1607,7 +1605,8 @@ def _cmd_release(parsed: argparse.Namespace, session: _CommandSession) -> None:
     client = session.client
     issue = _optional_issue_number(parsed.issue)
     identity = _resolved_identity(issue, session.release_branch or "")
-    outcome = _release_outcome(parsed)
+    merged = None if parsed.merged is None else int(parsed.merged)
+    outcome = _release_outcome(merged, parsed.abandoned)
     if isinstance(outcome, protocol.MergedRelease):
         _verify_merged_release(client, client.repository, identity, outcome)
     released = protocol.release_claim(
@@ -1627,7 +1626,7 @@ def _cmd_release(parsed: argparse.Namespace, session: _CommandSession) -> None:
 
 
 def _cmd_supersede(parsed: argparse.Namespace, session: _CommandSession) -> None:
-    successor_issue = _optional_issue_number(parsed.successor_issue)
+    successor_issue = int(parsed.successor_issue)
     frozen = protocol.supersede_ledger(
         session.client,
         successor_issue,
