@@ -4774,13 +4774,14 @@ def test_release_refuses_foreign_actor_without_explicit_override() -> None:
     acquired = acquire_claim(client, request(issue=72))
 
     raised_argument_1 = IssueIdentity(72)
+    raised_argument_2 = protocol.AbandonedRelease("takeover")
     with pytest.raises(ClaimUnavailableError, match="original claimant"):
         release_claim(
             client,
             raised_argument_1,
             "Other",
             "builder",
-            protocol.AbandonedRelease("takeover"),
+            raised_argument_2,
             acquired.claim_id,
         )
 
@@ -4937,10 +4938,11 @@ def test_release_claim_override_fails_before_ledger_without_the_coordinator_role
 ) -> None:
     client = FakeComments()
 
+    raised_argument_1 = IssueIdentity(72)
     with pytest.raises(ClaimUnavailableError, match="--role coordinator"):
         release_claim(
             client,
-            IssueIdentity(72),
+            raised_argument_1,
             "Ada",
             role,
             LANDED,
@@ -11924,8 +11926,9 @@ def test_release_abandoned_records_why_the_lane_stopped(
     ],
 )
 def test_release_requires_exactly_one_landing_outcome(arguments: list[str]) -> None:
+    raised_argument_1 = issue_claim._parser()
     with pytest.raises(SystemExit) as exited:
-        issue_claim._parser().parse_args(arguments)
+        raised_argument_1.parse_args(arguments)
 
     assert exited.value.code == 2
 

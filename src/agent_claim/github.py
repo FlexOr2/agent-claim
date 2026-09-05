@@ -69,6 +69,7 @@ API_ISSUE_STATES: dict[str, board.BlockerState] = {
     "open": board.BlockerState.OPEN,
     "closed": board.BlockerState.CLOSED,
 }
+MALFORMED_PULL_REQUEST = "GitHub returned a malformed pull request"
 
 
 def github_command_environment() -> dict[str, str]:
@@ -483,7 +484,7 @@ class GitHubIssueComments:
 
     def _pull_request_detail(self, value: object) -> board.PullRequestDetail:
         if not isinstance(value, dict):
-            raise ClaimError("GitHub returned a malformed pull request")
+            raise ClaimError(MALFORMED_PULL_REQUEST)
         number = value.get("number")
         body = value.get("body")
         if body is None:
@@ -507,7 +508,7 @@ class GitHubIssueComments:
             or (merged_at is not None and not isinstance(merged_at, str))
             or (isinstance(merged_at, str) and TIMESTAMP_PATTERN.fullmatch(merged_at) is None)
         ):
-            raise ClaimError("GitHub returned a malformed pull request")
+            raise ClaimError(MALFORMED_PULL_REQUEST)
         return board.PullRequestDetail(
             number,
             body,
@@ -535,7 +536,7 @@ class GitHubIssueComments:
         )
         values = self._json_lines(raw, "pull request")
         if len(values) != 1:
-            raise ClaimError("GitHub returned a malformed pull request")
+            raise ClaimError(MALFORMED_PULL_REQUEST)
         detail = self._pull_request_detail(values[0])
         if detail.number != number:
             raise ClaimError(f"GitHub answered for pull request #{detail.number}, not #{number}")
