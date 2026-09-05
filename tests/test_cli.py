@@ -208,9 +208,15 @@ def test_bootstrap_ignores_an_untrusted_unlocked_marker(
 def test_bootstrap_refuses_other_machine_coordination_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client, _ = ledger_client(monkeypatch, [ledger_row(4, body="<!-- another-claim-ledger:v1 -->")])
+    client, observed = ledger_client(
+        monkeypatch, [ledger_row(4, body="<!-- another-claim-ledger:v1 -->")]
+    )
     with pytest.raises(ClaimError, match="refusing to compete"):
         issue_claim.bootstrap_ledger(client)
+    assert not any(
+        arguments[:4] == ["api", "--method", "POST", f"repos/{client.repository}/issues"]
+        for arguments in observed
+    )
 
 
 def test_discovery_finds_a_labelled_ledger_without_scanning_open_issues(
@@ -6220,40 +6226,92 @@ def test_bounded_command_reaps_child_on_cancellation(
 
 
 def test_bounded_command_requires_the_named_executable() -> None:
-    with pytest.raises(ClaimError, match="missing-claim-command is required"):
+    with pytest.raises(ClaimError) as excinfo:
         github._bounded_command(
             ["missing-claim-command"],
             purpose="missing executable probe",
         )
+    assert str(excinfo.value) == "missing-claim-command is required for issue claims"
 
 
 def test_bounded_command_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(github, "GH_TIMEOUT_SECONDS", 0)
-    with pytest.raises(ClaimError, match="timed out"):
+    recorded: dict[str, subprocess.Popen[bytes]] = {}
+    original_popen = subprocess.Popen
+
+    def start(*arguments, **kwargs):
+        process = original_popen(*arguments, **kwargs)
+        recorded["process"] = process
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", start)
+    monkeypatch.setattr(github, "GH_TIMEOUT_SECONDS", 0.05)
+    with pytest.raises(ClaimError) as excinfo:
         github._bounded_command(
-            [sys.executable, "-c", "print('hello')"],
+            [sys.executable, "-c", "import time; time.sleep(30)"],
             purpose="timeout probe",
         )
+    assert str(excinfo.value) == "timeout probe timed out"
+    assert recorded["process"].poll() is not None
+
+
+def test_bounded_command_stops_a_child_that_hangs_after_closing_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded: dict[str, subprocess.Popen[bytes]] = {}
+    original_popen = subprocess.Popen
+
+    def start(*arguments, **kwargs):
+        process = original_popen(*arguments, **kwargs)
+        recorded["process"] = process
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", start)
+    with pytest.raises(ClaimError) as excinfo:
+        github._bounded_command(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os, sys, time\n"
+                    "for stream in (sys.stdout, sys.stderr):\n"
+                    "    try:\n"
+                    "        stream.close()\n"
+                    "    except OSError:\n"
+                    "        pass\n"
+                    "for fd in (1, 2):\n"
+                    "    try:\n"
+                    "        os.close(fd)\n"
+                    "    except OSError:\n"
+                    "        pass\n"
+                    "time.sleep(30)"
+                ),
+            ],
+            purpose="hang probe",
+        )
+    assert str(excinfo.value) == "hang probe did not exit after closing its output"
+    assert recorded["process"].poll() is not None
 
 
 def test_bounded_command_uses_combined_output_as_nonzero_exit_message() -> None:
-    with pytest.raises(ClaimError, match="boom"):
+    with pytest.raises(ClaimError) as excinfo:
         github._bounded_command(
             [sys.executable, "-c", "raise SystemExit('boom')"],
             purpose="exit probe",
         )
+    assert str(excinfo.value) == "boom"
 
 
 def test_bounded_command_names_the_exit_code_when_nonzero_output_is_empty() -> None:
-    with pytest.raises(ClaimError, match="failed with exit 7"):
+    with pytest.raises(ClaimError) as excinfo:
         github._bounded_command(
             [sys.executable, "-c", "raise SystemExit(7)"],
             purpose="empty exit probe",
         )
+    assert str(excinfo.value) == "empty exit probe failed with exit 7"
 
 
 def test_bounded_command_rejects_non_utf8_output() -> None:
-    with pytest.raises(ClaimError, match="non-UTF-8"):
+    with pytest.raises(ClaimError) as excinfo:
         github._bounded_command(
             [
                 sys.executable,
@@ -6262,6 +6320,7 @@ def test_bounded_command_rejects_non_utf8_output() -> None:
             ],
             purpose="decode probe",
         )
+    assert str(excinfo.value) == "decode probe returned non-UTF-8 output"
 
 
 def test_scope_directories_detects_a_git_tree(monkeypatch: pytest.MonkeyPatch) -> None:
