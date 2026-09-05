@@ -218,7 +218,7 @@ def _bounded_command(
 
 class GitHubIssueComments:
     def __init__(self, repository: str):
-        if REPOSITORY_PATTERN.fullmatch(repository) is None:
+        if re.fullmatch(REPOSITORY_PATTERN, repository) is None:
             raise ClaimError("repository must be OWNER/REPO")
         self.repository = repository
         self._rollover_warning_printed = False
@@ -228,6 +228,11 @@ class GitHubIssueComments:
             ["gh", *arguments],
             purpose="GitHub issue coordination",
             input_data=input_data,
+        )
+
+    def issue_reference_json(self, number: int) -> str:
+        return self._run(
+            ["api", f"repos/{self.repository}/issues/{number}", "--jq", "{state,title,body}"]
         )
 
     def _json_lines(self, raw: str, description: str) -> tuple[object, ...]:

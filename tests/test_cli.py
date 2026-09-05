@@ -1010,7 +1010,7 @@ def _stub_issue_reference(
 ) -> None:
     """Overrides the autouse OPEN default for exactly the given issue numbers."""
 
-    def fetch(repository: str, number: int) -> "issue_claim._IssueReference":
+    def fetch(client: object, number: int) -> "issue_claim._IssueReference":
         state, title, body = states[number]
         return issue_claim._IssueReference(state, title, body)
 
@@ -1310,7 +1310,7 @@ def test_claim_refuses_non_issue_or_closed_blockers_before_mutation(
         monkeypatch.setattr(
             issue_claim,
             "_fetch_issue_reference",
-            lambda _repository, _number: pytest.fail("claim must reuse board blocker state"),
+            lambda _client, _number: pytest.fail("claim must reuse board blocker state"),
         )
     monkeypatch.setattr(
         issue_claim, "_request", lambda _arguments: request(issue=10, scope=("src/work.py",))
@@ -1435,7 +1435,7 @@ def test_claim_ignores_body_size_and_closed_next_references(
     monkeypatch.setattr(
         issue_claim,
         "_fetch_issue_reference",
-        lambda _repository, _number: pytest.fail("claim must not inspect Next references"),
+        lambda _client, _number: pytest.fail("claim must not inspect Next references"),
     )
     monkeypatch.setattr(
         issue_claim, "_request", lambda _arguments: request(issue=10, scope=("src/work.py",))
@@ -7259,7 +7259,7 @@ def _default_open_issue_reference(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         issue_claim,
         "_fetch_issue_reference",
-        lambda repository, number: issue_claim._IssueReference(
+        lambda client, number: issue_claim._IssueReference(
             issue_claim.ReferenceState.OPEN, "", ""
         ),
     )
@@ -12186,3 +12186,11 @@ def test_a_non_ascii_digit_in_a_hash_reference_is_not_an_issue_number() -> None:
 
     assert arabic_three.blocker_issues == frozenset()
     assert mixed.blocker_issues == frozenset()
+
+
+def test_a_nested_quoted_frozen_line_still_parses_and_an_indented_line_does_not() -> None:
+    quoted = "> > **Eingefroren bis:** 2026-09-30 (Operator, 30.09.2026)"
+    indented = "    **Eingefroren bis:** 2026-09-30 (Operator, 30.09.2026)"
+
+    assert board.frozen_trigger(quoted) == "2026-09-30"
+    assert board.frozen_trigger(indented) is None

@@ -1583,14 +1583,16 @@ def _assigned_request(request: ClaimRequest) -> ClaimRequest:
         return request
     name = _outbound_resource_name(request.resource)
     if request.resource_value is None:
-        return replace(request, resource=name)
+        assigned: ClaimRequest = replace(request, resource=name)
+        return assigned
     if (
         isinstance(request.resource_value, bool)
         or not isinstance(request.resource_value, int)
         or request.resource_value < 1
     ):
         raise ClaimError("resource value must be a positive integer")
-    return replace(request, resource=name)
+    assigned: ClaimRequest = replace(request, resource=name)
+    return assigned
 
 
 def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:

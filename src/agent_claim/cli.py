@@ -889,8 +889,8 @@ class SliceCheck:
         }
 
 
-def _fetch_issue_reference(repository: str, number: int) -> _IssueReference:
-    """The live state, title, and body of issue `number` in `repository`.
+def _fetch_issue_reference(client: github.GitHubIssueComments, number: int) -> _IssueReference:
+    """The live state, title, and body of issue `number` from `client`.
 
     Called only for a claim target or a slice-table `#n` link that the
     already-fetched open board didn't resolve as OPEN — a closed or missing
@@ -899,10 +899,7 @@ def _fetch_issue_reference(repository: str, number: int) -> _IssueReference:
     at a time rather than a repository-wide query.
     """
     try:
-        raw = _bounded_command(
-            ["gh", "api", f"repos/{repository}/issues/{number}", "--jq", "{state,title,body}"],
-            purpose="claim reference lookup",
-        )
+        raw = client.issue_reference_json(number)
     except protocol.ClaimError as error:
         # `gh api` reports a nonexistent issue as an HTTP 404 in its combined
         # stdout/stderr text; `_bounded_command` doesn't expose the process's
@@ -932,12 +929,14 @@ def _fetch_issue_reference(repository: str, number: int) -> _IssueReference:
 
 
 def _issue_reference_state(
-    repository: str, open_by_number: dict[int, board.Issue], number: int
+    client: github.GitHubIssueComments,
+    open_by_number: dict[int, board.Issue],
+    number: int,
 ) -> tuple[ReferenceState, str | None, str | None]:
     open_issue = open_by_number.get(number)
     if open_issue is not None:
         return ReferenceState.OPEN, open_issue.title, open_issue.body
-    reference = _fetch_issue_reference(repository, number)
+    reference = _fetch_issue_reference(client, number)
     return reference.state, reference.title, reference.body
 
 
@@ -961,7 +960,9 @@ def _out_of_order_check(
 
 
 def _slice_table_entry_checks(
-    repository: str, open_by_number: dict[int, board.Issue], entry: board.SliceTableEntry
+    client: github.GitHubIssueComments,
+    open_by_number: dict[int, board.Issue],
+    entry: board.SliceTableEntry,
 ) -> SliceCheck | None:
     if isinstance(entry, board.MalformedSliceTable):
         return SliceCheck(
@@ -975,14 +976,16 @@ def _slice_table_entry_checks(
             "malformed-slice-cell",
             f'malformed slice table row: "{entry.line}"',
         )
-    return _slice_row_checks(repository, open_by_number, entry)
+    return _slice_row_checks(client, open_by_number, entry)
 
 
 def _slice_row_checks(
-    repository: str, open_by_number: dict[int, board.Issue], row: board.SliceTableRow
+    client: github.GitHubIssueComments,
+    open_by_number: dict[int, board.Issue],
+    row: board.SliceTableRow,
 ) -> SliceCheck | None:
     if row.item_issue is not None:
-        state, _title, _body = _issue_reference_state(repository, open_by_number, row.item_issue)
+        state, _title, _body = _issue_reference_state(client, open_by_number, row.item_issue)
         if state is ReferenceState.CLOSED:
             return SliceCheck(
                 "error",
@@ -1077,7 +1080,7 @@ def _slice_rule_checks(
     out_of_order = _out_of_order_check(projected, issue, out_of_order_reason)
     if out_of_order is not None:
         checks.append(out_of_order)
-    state, title, body = _issue_reference_state(repository, open_by_number, issue)
+    state, title, body = _issue_reference_state(client, open_by_number, issue)
     if state is ReferenceState.CLOSED:
         checks.append(
             SliceCheck("error", "closed-issue", f"issue #{issue} is closed", issue=issue)
@@ -1093,7 +1096,7 @@ def _slice_rule_checks(
         checks.extend(_body_contract_checks(item.contract, projected.blocker_references))
     if body is not None:
         for entry in board.parse_slice_table(body):
-            table_check = _slice_table_entry_checks(repository, open_by_number, entry)
+            table_check = _slice_table_entry_checks(client, open_by_number, entry)
             if table_check is not None:
                 checks.append(table_check)
     if title is not None:

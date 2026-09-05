@@ -36,7 +36,7 @@ OPERATOR_RULING_DATE_PATTERN = re.compile(
 )
 RULING_OLD_AFTER_LANDINGS = 10
 FROZEN_LINE_PATTERN = re.compile(
-    r"(?m)^(?:>[ \t]*)*(?:\*\*Eingefroren bis:\*\*|Eingefroren bis:)[ \t]*(?P<value>[^\r\n]*)$"
+    r"(?m)^(?:>[ \t]*+)*+(?:\*\*Eingefroren bis:\*\*|Eingefroren bis:)[ \t]*(?P<value>[^\r\n]*)$"
 )
 FROZEN_TRIGGER_PATTERN = re.compile(
     r"(?P<trigger>\S.*?)[ \t]*\(Operator,[ \t]*"
@@ -905,7 +905,7 @@ def _with_blocker_defects(
     )
     if not pull_requests:
         return contract
-    return replace(
+    with_pull_request_defects: Contract = replace(
         contract,
         defects=(
             *contract.defects,
@@ -915,6 +915,7 @@ def _with_blocker_defects(
             ),
         ),
     )
+    return with_pull_request_defects
 
 
 def _open_blockers(contract: Contract, blockers: dict[int, BlockerReference]) -> tuple[int, ...]:
