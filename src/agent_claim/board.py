@@ -71,10 +71,22 @@ RULED_EXPECTATION_PATTERN = re.compile(
 # expectation, whether or not it happens to carry either marker yet.
 EXPECTATION_LINE_SHAPE_PATTERN = re.compile(r"^(?:[-*+]|\d+[.)])[ \t]+")
 REFERENCE_PATTERN = re.compile(r"(?<![A-Za-z0-9_])#([1-9][0-9]*)")
+# One issue named the way GitHub names it across repositories: `OWNER/REPO#n`,
+# or `#n` for the repository the text itself lives in. Every typed line below
+# embeds this one grammar, so a shorthand and its qualified spelling always
+# parse to the same reference.
+QUALIFIED_REFERENCE = (
+    rf"(?:(?P<repository>{protocol.REPOSITORY_PATTERN.pattern}))?#(?P<number>[1-9][0-9]*)"
+)
 CLOSING_REFERENCE_PATTERN = re.compile(
     r"(?im)\b(?:close(?:s|d)?|fix(?:es|ed)?|resolve(?:s|d)?|"
-    r"land(?:s|ed)?|implement(?:s|ed)?)\s*:?\s*#([1-9][0-9]*)"
+    r"land(?:s|ed)?|implement(?:s|ed)?)\s*:?\s*" + QUALIFIED_REFERENCE
 )
+WORK_ITEM_KIND = "work-item"
+CLASSIFICATION_LINE_PATTERN = re.compile(
+    r"(?im)^(?P<kind>Work-Item|No-Item):[ \t]*(?P<value>[^\r\n]*?)[ \t]*$"
+)
+WORK_ITEM_VALUE_PATTERN = re.compile(QUALIFIED_REFERENCE)
 # A slice's pull request must never close its still-open epic — that would
 # retire the epic before its remaining slices exist. This repository's
 # established substitute is a whole line opening with one of these markers
@@ -152,6 +164,60 @@ class PullRequest:
     body: str
     head_ref_name: str
     merged_at: str | None = None
+
+
+@dataclass(frozen=True)
+class PullRequestDetail:
+    """One pull request read for its own sake, rather than for the board's stages."""
+
+    number: int
+    body: str
+    base_ref_name: str
+    head_ref_name: str
+    author: str
+    merged: bool
+
+
+@dataclass(frozen=True)
+class IssueReference:
+    """One issue, always qualified: a same-repository `#n` is resolved at parse time."""
+
+    repository: str
+    number: int
+
+    def __str__(self) -> str:
+        return f"{self.repository}#{self.number}"
+
+
+class NoItemKind(StrEnum):
+    DOCS = "docs"
+    FIX = "fix"
+
+
+@dataclass(frozen=True)
+class WorkItemClassification:
+    item: IssueReference
+
+    def __str__(self) -> str:
+        return f"Work-Item: {self.item}"
+
+
+@dataclass(frozen=True)
+class NoItemClassification:
+    kind: NoItemKind
+
+    def __str__(self) -> str:
+        return f"No-Item: {self.kind.value}"
+
+
+Classification = WorkItemClassification | NoItemClassification
+
+
+@dataclass(frozen=True)
+class ClassificationDefect:
+    """Why a pull request's classification is not one this repository accepts."""
+
+    message: str
 
 
 @dataclass(frozen=True)
@@ -657,6 +723,61 @@ def parent_line_numbers(body: str) -> frozenset[int]:
     )
 
 
+def _issue_reference(match: re.Match[str], repository: str) -> IssueReference:
+    return IssueReference(match.group("repository") or repository, int(match.group("number")))
+
+
+def closing_references(text: str, repository: str) -> frozenset[IssueReference]:
+    """Every issue the text closes, read the way GitHub renders it.
+
+    Routed through `_live_text` for the same reason every other marker in
+    this module is: a fenced example of the closing-keyword convention
+    ("Fixes #64" inside a code block, say) must document the syntax without
+    silently closing #64.
+    """
+    return frozenset(
+        _issue_reference(match, repository)
+        for match in CLOSING_REFERENCE_PATTERN.finditer(_live_text(text))
+    )
+
+
+def parse_pull_request_classification(
+    body: str, repository: str
+) -> Classification | ClassificationDefect:
+    """The one `Work-Item:`/`No-Item:` line a pull request body must carry.
+
+    A pull request either lands one work item and closes it, or declares
+    itself issue-less documentation or a fix. Nothing else in a body names an
+    item: a dispatched slice is its own item, and its pull request closes it.
+    """
+    matches = tuple(CLASSIFICATION_LINE_PATTERN.finditer(_live_text(body)))
+    if not matches:
+        return ClassificationDefect("carries no `Work-Item:` or `No-Item:` line")
+    work_items = tuple(
+        match for match in matches if match.group("kind").lower() == WORK_ITEM_KIND
+    )
+    if len(work_items) > 1:
+        named = " and ".join(match.group("value") for match in work_items[:2])
+        return ClassificationDefect(f"names two work items, {named}; split it")
+    if len(matches) > 1:
+        return ClassificationDefect(
+            f"carries {len(matches)} classification lines; exactly one is required"
+        )
+    value = matches[0].group("value")
+    if work_items:
+        reference = WORK_ITEM_VALUE_PATTERN.fullmatch(value)
+        if reference is None:
+            return ClassificationDefect(
+                f"carries `Work-Item: {value}`; a work item reads OWNER/REPO#n or #n"
+            )
+        return WorkItemClassification(_issue_reference(reference, repository))
+    if value.lower() not in {kind.value for kind in NoItemKind}:
+        return ClassificationDefect(
+            f"carries `No-Item: {value}`; an issue-less pull request is docs or fix"
+        )
+    return NoItemClassification(NoItemKind(value.lower()))
+
+
 def slice_title_match(title: str) -> tuple[int, int] | None:
     """`(slice number, parent issue)` when `title` looks like a dispatched slice.
 
@@ -857,23 +978,17 @@ def _priority_bucket(
     return len(config.priority_labels) + 1, "unlabelled"
 
 
-def _associated_issues(pull_requests: tuple[PullRequest, ...]) -> frozenset[int]:
-    """Issues a pull request closes, read the way GitHub renders it.
-
-    Routed through `_live_text` for the same reason every other marker in
-    this module is: a fenced example of the closing-keyword convention
-    ("Fixes #64" inside a code block, say) must document the syntax without
-    silently closing #64.
-    """
+def _associated_issues(
+    pull_requests: tuple[PullRequest, ...], repository: str
+) -> frozenset[int]:
+    """Issues of `repository` that these pull requests close."""
     return frozenset(
-        reference
+        reference.number
         for pull_request in pull_requests
-        for reference in (
-            int(number)
-            for number in CLOSING_REFERENCE_PATTERN.findall(
-                _live_text(f"{pull_request.title}\n{pull_request.body}")
-            )
+        for reference in closing_references(
+            f"{pull_request.title}\n{pull_request.body}", repository
         )
+        if reference.repository == repository
     )
 
 
@@ -936,6 +1051,7 @@ def build_board(
     claims: tuple[protocol.ActiveClaim, ...],
     config: BoardConfig,
     *,
+    repository: str,
     blocker_references: tuple[BlockerReference, ...] | None = None,
     now: datetime | None = None,
     trunk_landings: tuple[datetime, ...] = (),
@@ -989,12 +1105,12 @@ def build_board(
         for issue in issues
     }
     claims_by_issue = _claim_by_issue(claims)
-    in_flight_references = _associated_issues(open_pull_requests) | _touched_without_closing(
-        open_pull_requests
-    )
-    landed_references = _associated_issues(recent_merged_pull_requests) | _touched_without_closing(
-        recent_merged_pull_requests
-    )
+    in_flight_references = _associated_issues(
+        open_pull_requests, repository
+    ) | _touched_without_closing(open_pull_requests)
+    landed_references = _associated_issues(
+        recent_merged_pull_requests, repository
+    ) | _touched_without_closing(recent_merged_pull_requests)
     open_branches = frozenset(pr.head_ref_name for pr in open_pull_requests)
 
     items: list[BoardItem] = []

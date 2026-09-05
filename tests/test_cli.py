@@ -56,6 +56,7 @@ _LIVE_VERSIONED_PATHS = checkout.versioned_paths
 _LIVE_TRUNK_LANDING_TIMES = checkout.trunk_landing_times
 
 BASE = "a" * 40
+REPOSITORY = "example/agent-claim"
 
 
 def ledger_row(
@@ -350,6 +351,11 @@ def request(
     )
 
 
+def projected_board(*positional, repository: str = REPOSITORY, **keyword) -> board.Board:
+    """`board.build_board` for scenarios that do not turn on which repository is projected."""
+    return board.build_board(*positional, repository=repository, **keyword)
+
+
 def _claims_client(*standing: ClaimRequest) -> FakeComments:
     return FakeComments(
         {
@@ -378,6 +384,9 @@ class FakeComments:
     board_open_pull_requests: tuple[board.PullRequest, ...] = ()
     board_merged_pull_requests: tuple[board.PullRequest, ...] = ()
     board_blocker_references: tuple[board.BlockerReference, ...] | None = None
+    repository: str = REPOSITORY
+    default_branch_name: str = "main"
+    pull_requests: dict[int, board.PullRequestDetail] = field(default_factory=dict)
 
     def list_protocol_candidates(self, issue: int) -> tuple[IssueComment, ...]:
         return tuple(
@@ -445,6 +454,15 @@ class FakeComments:
 
     def list_open_board_issues(self) -> tuple[board.Issue, ...]:
         return self.board_issues
+
+    def pull_request_detail(self, number: int) -> board.PullRequestDetail:
+        detail = self.pull_requests.get(number)
+        if detail is None:
+            raise ClaimError(f"GitHub has no pull request #{number}")
+        return detail
+
+    def default_branch(self) -> str:
+        return self.default_branch_name
 
     def list_board_blockers(
         self, numbers: frozenset[int]
@@ -1169,7 +1187,7 @@ def test_next_reports_expectation_state(
     assert issue_claim.main(["--repo", "example/agent-claim", "next"]) == expected_exit
     assert capsys.readouterr().out == expected_output
 
-    projected = board.build_board(
+    projected = projected_board(
         (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
     )
     assert projected.items[0].expectation_state is expected_state
@@ -2243,7 +2261,7 @@ def test_board_reports_each_item_actionability_reason(
     expected: tuple[bool, str | None],
 ) -> None:
     blocker = board_issue(9, "Blocker", complete_contract("Claim #9."))
-    projected = board.build_board(
+    projected = projected_board(
         (blocker, issue) if blocker_is_open else (issue,),
         (),
         (),
@@ -2281,7 +2299,7 @@ def test_board_collects_every_open_blocker_from_issue_list() -> None:
             blocked_by="#790, #642",
         ),
     )
-    projected = board.build_board(
+    projected = projected_board(
         (
             blocked,
             board_issue(642, "P3", complete_contract("Claim #642.")),
@@ -2302,7 +2320,7 @@ def test_board_collects_every_open_blocker_from_issue_list() -> None:
 
 def test_board_treats_nichts_as_unblocked() -> None:
     issue = board_issue(10, "Ready", complete_contract("Claim #10.", blocked_by="nichts"))
-    projected = board.build_board(
+    projected = projected_board(
         (issue,),
         (),
         (),
@@ -2324,7 +2342,7 @@ FROZEN_LINE = (
 def test_frozen_item_leaves_actionable_and_thaws_when_the_line_is_removed() -> None:
     frozen_body = complete_contract("Claim #301.") + f"\n\n{FROZEN_LINE}"
     frozen = board_issue(301, "Highest scored", frozen_body)
-    projected_while_frozen = board.build_board(
+    projected_while_frozen = projected_board(
         (frozen,), (), (), (), board.BoardConfig(),
         now=datetime(2026, 8, 31, tzinfo=timezone.utc),
     )
@@ -2338,7 +2356,7 @@ def test_frozen_item_leaves_actionable_and_thaws_when_the_line_is_removed() -> N
 
     thawed_body = complete_contract("Claim #301.")
     thawed = board_issue(301, "Highest scored", thawed_body)
-    projected_after_thaw = board.build_board(
+    projected_after_thaw = projected_board(
         (thawed,), (), (), (), board.BoardConfig(),
         now=datetime(2026, 8, 31, tzinfo=timezone.utc),
     )
@@ -2359,7 +2377,7 @@ def test_frozen_item_score_stays_visible_on_the_rendered_board() -> None:
         "Highest scored",
         complete_contract("Claim #301.") + f"\n\n{FROZEN_LINE}",
     )
-    projected = board.build_board(
+    projected = projected_board(
         (frozen,), (), (), (), board.BoardConfig(),
         now=datetime(2026, 8, 31, tzinfo=timezone.utc),
     )
@@ -2381,7 +2399,7 @@ def test_frozen_marker_without_a_valid_form_fails_loud() -> None:
     )
 
     with pytest.raises(ClaimError, match="Eingefroren bis"):
-        board.build_board(
+        projected_board(
             (issue,), (), (), (), board.BoardConfig(),
             now=datetime(2026, 8, 21, tzinfo=timezone.utc),
         )
@@ -2402,7 +2420,7 @@ def test_frozen_marker_syntax_documented_in_a_fence_is_not_a_live_marker() -> No
         "```\n\n"
         "— den `next` und `board` respektieren.",
     )
-    projected = board.build_board(
+    projected = projected_board(
         (documented,), (), (), (), board.BoardConfig(),
         now=datetime(2026, 8, 31, tzinfo=timezone.utc),
     )
@@ -2425,7 +2443,7 @@ def test_frozen_marker_outside_a_fence_still_fails_loud_when_malformed() -> None
     )
 
     with pytest.raises(ClaimError, match="Eingefroren bis"):
-        board.build_board(
+        projected_board(
             (issue,), (), (), (), board.BoardConfig(),
             now=datetime(2026, 8, 31, tzinfo=timezone.utc),
         )
@@ -2451,7 +2469,7 @@ def test_a_marker_swallowed_by_an_unclosed_fence_is_not_frozen() -> None:
     )
 
     assert board.frozen_trigger(unclosed_fence_body.body) is None
-    projected = board.build_board(
+    projected = projected_board(
         (unclosed_fence_body,), (), (), (), board.BoardConfig(),
         now=datetime(2026, 8, 31, tzinfo=timezone.utc),
     )
@@ -2470,7 +2488,7 @@ def test_a_blockquoted_marker_still_freezes() -> None:
     )
 
     assert board.frozen_trigger(quoted.body) == "quoted real trigger"
-    projected = board.build_board(
+    projected = projected_board(
         (quoted,), (), (), (), board.BoardConfig(),
         now=datetime(2026, 8, 31, tzinfo=timezone.utc),
     )
@@ -2487,7 +2505,7 @@ def test_a_tilde_fenced_example_is_not_a_live_marker() -> None:
     )
 
     assert board.frozen_trigger(tilde_fenced.body) is None
-    projected = board.build_board(
+    projected = projected_board(
         (tilde_fenced,), (), (), (), board.BoardConfig(),
         now=datetime(2026, 8, 31, tzinfo=timezone.utc),
     )
@@ -2507,7 +2525,7 @@ def test_an_info_stringed_delimiter_does_not_close_a_fence() -> None:
     )
 
     assert board.frozen_trigger(reopened_by_info_string.body) == "real trigger"
-    projected = board.build_board(
+    projected = projected_board(
         (reopened_by_info_string,), (), (), (), board.BoardConfig(),
         now=datetime(2026, 8, 31, tzinfo=timezone.utc),
     )
@@ -2528,7 +2546,7 @@ def test_an_info_stringed_middle_line_keeps_the_whole_block_one_fence() -> None:
     )
 
     assert board.frozen_trigger(one_fence.body) is None
-    projected = board.build_board(
+    projected = projected_board(
         (one_fence,), (), (), (), board.BoardConfig(),
         now=datetime(2026, 8, 31, tzinfo=timezone.utc),
     )
@@ -2669,6 +2687,8 @@ def test_board_reads_priority_configuration_from_the_checkout_root(
         return str(toplevel)
 
     class BoardClient:
+        repository = REPOSITORY
+
         def list_open_board_issues(self) -> tuple[board.Issue, ...]:
             return (
                 board.Issue(
@@ -2723,7 +2743,7 @@ def test_board_marks_text_only_items_stale_only_after_seven_idle_days(
 ) -> None:
     issue = board.Issue(22, "Idle issue", (), "", "2026-08-01T00:00:00Z", updated_at)
 
-    projected = board.build_board(
+    projected = projected_board(
         (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
     )
 
@@ -2749,7 +2769,7 @@ def test_board_ranks_a_real_blocker_ahead_of_a_blocked_product_item() -> None:
         "2026-08-20T00:00:00Z",
     )
 
-    projected = board.build_board(
+    projected = projected_board(
         (blocker, product), (), (), (), board.BoardConfig(), now=now
     )
 
@@ -2764,7 +2784,7 @@ def test_board_never_counts_an_open_pull_request_as_a_blocker() -> None:
     )
     pull_request = board.BlockerReference(86, board.BlockerState.OPEN, True)
 
-    projected = board.build_board(
+    projected = projected_board(
         (dependent,),
         (),
         (),
@@ -2826,7 +2846,7 @@ def test_board_records_the_latest_closed_issue_blocker(
     )
     unblocked = board_issue(21, "Never blocked", complete_contract("Ship it."))
 
-    projected = board.build_board(
+    projected = projected_board(
         (freed, unblocked),
         (),
         (),
@@ -2854,7 +2874,7 @@ def test_board_reports_when_the_last_stale_blocker_closed() -> None:
         ),
     )
 
-    projected = board.build_board(
+    projected = projected_board(
         (dependent,), (), (), (), board.BoardConfig(),
         blocker_references=blockers,
         now=datetime(2026, 9, 5, tzinfo=timezone.utc),
@@ -2876,7 +2896,7 @@ def test_board_text_and_json_show_freed_on_and_freed_days() -> None:
         board.BlockerReference(11, board.BlockerState.OPEN, False),
     )
 
-    projected = board.build_board(
+    projected = projected_board(
         (freed, blocked, unblocked), (), (), (), board.BoardConfig(),
         blocker_references=blockers,
         now=datetime(2026, 9, 5, tzinfo=timezone.utc),
@@ -2918,7 +2938,7 @@ def test_board_category_order_keeps_ci_ahead_of_a_high_scoring_blocker() -> None
     )
     open_pull_request = board.PullRequest(90, "Fixes #31", "", "branch")
 
-    projected = board.build_board(
+    projected = projected_board(
         (ci, blocker, dependent),
         (open_pull_request,),
         (),
@@ -2942,7 +2962,7 @@ def test_next_names_the_boards_top_row_even_when_it_is_not_the_highest_score() -
     dependent = board_issue(52, "Depends on the prerequisite", "## Blocked by\n#51")
     open_pull_request = board.PullRequest(200, "Fixes #50", "", "branch")
 
-    projected = board.build_board(
+    projected = projected_board(
         (in_flight_unlabelled, blocker, dependent),
         (open_pull_request,),
         (),
@@ -2981,7 +3001,7 @@ def test_an_epic_inherits_the_landed_stage_of_a_slice_that_did_not_close_it() ->
     )
     slice_pull_request = board.PullRequest(120, "Slice 1", _slice_pull_request_body(60), "branch")
 
-    projected = board.build_board(
+    projected = projected_board(
         (epic,), (), (slice_pull_request,), (), board.BoardConfig(), now=now
     )
 
@@ -2997,7 +3017,7 @@ def test_an_epic_is_in_flight_while_an_open_slice_touches_it_without_closing_it(
         122, "Slice 1", _slice_pull_request_body(62), "branch"
     )
 
-    projected = board.build_board(
+    projected = projected_board(
         (epic,), (open_slice_pull_request,), (), (), board.BoardConfig(), now=now
     )
 
@@ -3016,7 +3036,7 @@ def test_a_pull_request_merely_mentioning_the_epic_number_confers_no_stage() -> 
         "branch",
     )
 
-    projected = board.build_board(
+    projected = projected_board(
         (epic,), (), (unrelated_pull_request,), (), board.BoardConfig(), now=now
     )
 
@@ -3037,7 +3057,7 @@ def test_a_dedicated_reference_line_without_corroboration_confers_no_stage() -> 
     )
     drive_by_pull_request = board.PullRequest(123, "Unrelated cleanup", "Refs #63.", "branch")
 
-    projected = board.build_board(
+    projected = projected_board(
         (epic,), (), (drive_by_pull_request,), (), board.BoardConfig(), now=now
     )
 
@@ -3056,7 +3076,7 @@ def test_a_reference_line_inside_a_fenced_code_block_confers_no_stage() -> None:
         "branch",
     )
 
-    projected = board.build_board(
+    projected = projected_board(
         (epic,), (), (fenced_pull_request,), (), board.BoardConfig(), now=now
     )
 
@@ -3079,7 +3099,7 @@ def test_a_fenced_closing_keyword_confers_no_stage() -> None:
         "branch",
     )
 
-    projected = board.build_board(
+    projected = projected_board(
         (issue,), (), (fenced_pull_request,), (), board.BoardConfig(), now=now
     )
 
@@ -3099,6 +3119,8 @@ def test_board_queries_merged_pull_requests_back_to_the_oldest_open_issue(
     observed_since: list[datetime] = []
 
     class BoardClient:
+        repository = REPOSITORY
+
         def list_open_board_issues(self) -> tuple[board.Issue, ...]:
             return (old_epic, recent_issue)
 
@@ -3136,6 +3158,8 @@ def test_board_loads_each_distinct_blocker_once(
     observed: list[frozenset[int]] = []
 
     class BoardClient:
+        repository = REPOSITORY
+
         def list_open_board_issues(self) -> tuple[board.Issue, ...]:
             return (first, second)
 
@@ -3286,7 +3310,7 @@ def test_a_configured_idea_keeps_freeze_claim_and_blocker_reasons(
         for claim_request in claims
         if (claim := parse_claim_event(comment(1, claim_comment(claim_request)))) is not None
     )
-    projected = board.build_board(
+    projected = projected_board(
         (blocker, idea) if has_open_blocker else (idea,),
         (),
         (),
@@ -3304,7 +3328,7 @@ def test_an_idea_without_a_priority_label_follows_the_regular_score_order() -> N
     regular_work = board_issue(10, "Regular work", complete_contract("Ship the change."))
     idea = board_issue(11, "Operator idea", "## Wunsch\nMake the board clearer.", labels=("idea",))
 
-    projected = board.build_board(
+    projected = projected_board(
         (idea, regular_work), (), (), (), board.BoardConfig(idea_label="idea"),
         now=datetime(2026, 8, 21, tzinfo=timezone.utc),
     )
@@ -10591,7 +10615,7 @@ def test_ruled_expectations_without_a_date_fail_loud() -> None:
     )
 
     with pytest.raises(ClaimError, match="no readable date"):
-        board.build_board(
+        projected_board(
             (issue,),
             (),
             (),
@@ -10609,7 +10633,7 @@ def test_proposed_expectations_have_neither_fresh_nor_old() -> None:
         + "\n\n"
         + expectation_block("- Name it. *(Default: yes)*"),
     )
-    projected = board.build_board(
+    projected = projected_board(
         (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
     )
 
@@ -10633,7 +10657,7 @@ def test_a_ruled_heading_rules_a_block_of_prose_lines() -> None:
             heading="Erwartungen (refine-Lauf 27.08.2026 — GEREGELT: Operator 27.08.2026)",
         ),
     )
-    projected = board.build_board(
+    projected = projected_board(
         (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
     )
 
@@ -10660,7 +10684,7 @@ def test_a_proposal_marker_under_a_ruled_heading_still_surfaces_as_proposed() ->
             heading="Erwartungen (refine-Lauf 27.08.2026 — GEREGELT: Operator 27.08.2026)",
         ),
     )
-    projected = board.build_board(
+    projected = projected_board(
         (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
     )
 
@@ -10681,7 +10705,7 @@ def test_prose_without_a_ruled_heading_still_reads_as_proposed() -> None:
             heading="Erwartungen (refine-Lauf 27.08.2026)",
         ),
     )
-    projected = board.build_board(
+    projected = projected_board(
         (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
     )
 
@@ -10712,7 +10736,7 @@ def test_one_unruled_block_among_ruled_ones_keeps_the_item_proposed() -> None:
             heading="Erwartungen aus echter Benutzung",
         )
     )
-    projected = board.build_board(
+    projected = projected_board(
         (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
     )
 
@@ -10759,7 +10783,7 @@ def test_a_new_line_without_its_own_marker_stays_proposed_under_a_ruled_heading(
             heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
         ),
     )
-    projected = board.build_board(
+    projected = projected_board(
         (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
     )
 
@@ -10782,7 +10806,7 @@ def test_prose_and_a_table_row_stay_ruled_under_a_ruled_heading() -> None:
             heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
         ),
     )
-    projected = board.build_board(
+    projected = projected_board(
         (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
     )
 
@@ -10798,7 +10822,7 @@ def test_a_ruled_heading_with_no_lines_beneath_it_reads_as_proposed() -> None:
         + "\n\n"
         + expectation_block(heading="Erwartungen (GEREGELT: Operator 27.08.2026)"),
     )
-    projected = board.build_board(
+    projected = projected_board(
         (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
     )
 
@@ -10822,7 +10846,7 @@ def test_a_hyphenated_ja_nein_contradiction_is_not_ruled() -> None:
             heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
         ),
     )
-    projected = board.build_board(
+    projected = projected_board(
         (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
     )
 
@@ -10844,7 +10868,7 @@ def test_a_hyphenated_nein_ja_contradiction_is_not_ruled() -> None:
             heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
         ),
     )
-    projected = board.build_board(
+    projected = projected_board(
         (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
     )
 
@@ -10863,7 +10887,7 @@ def test_ja_with_an_owner_reference_still_rules() -> None:
             heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
         ),
     )
-    projected = board.build_board(
+    projected = projected_board(
         (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
     )
 
@@ -10882,7 +10906,7 @@ def test_nein_with_a_reason_still_rules() -> None:
             heading="Erwartungen (GEREGELT: Operator 27.08.2026)",
         ),
     )
-    projected = board.build_board(
+    projected = projected_board(
         (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
     )
 
@@ -10900,7 +10924,7 @@ def test_a_ruling_is_old_after_ten_trunk_landings() -> None:
     landings = tuple(
         datetime(2026, 8, 29, hour, tzinfo=timezone.utc) for hour in range(10)
     )
-    projected = board.build_board(
+    projected = projected_board(
         (issue,),
         (),
         (),
@@ -10924,7 +10948,7 @@ def test_one_trunk_landing_does_not_make_a_ruling_old() -> None:
         + "\n\n"
         + expectation_block("- Name it. *(geregelt: ja)*"),
     )
-    projected = board.build_board(
+    projected = projected_board(
         (issue,),
         (),
         (),
@@ -10946,7 +10970,7 @@ def test_same_day_trunk_landings_do_not_age_a_date_only_ruling() -> None:
         + "\n\n"
         + expectation_block("- Name it. *(geregelt: ja)*"),
     )
-    projected = board.build_board(
+    projected = projected_board(
         (issue,),
         (),
         (),
@@ -10975,7 +10999,7 @@ def test_operator_ruling_date_wins_over_another_heading_date() -> None:
         datetime(2026, 8, 15, tzinfo=timezone.utc),
         datetime(2026, 8, 29, tzinfo=timezone.utc),
     )
-    projected = board.build_board(
+    projected = projected_board(
         (issue,),
         (),
         (),
@@ -11001,7 +11025,7 @@ def test_distinct_heading_dates_without_an_operator_date_fail_loud() -> None:
     )
 
     with pytest.raises(ClaimError, match="more than one date"):
-        board.build_board(
+        projected_board(
             (issue,),
             (),
             (),
@@ -11070,7 +11094,7 @@ def test_each_item_carries_its_own_ruling_age() -> None:
         ),
     )
     landings = tuple(datetime(2026, 8, 10 + index, tzinfo=timezone.utc) for index in range(12))
-    projected = board.build_board(
+    projected = projected_board(
         (fresh, old),
         (),
         (),
@@ -11178,3 +11202,283 @@ def test_no_path_class_list_is_read_or_written() -> None:
     text = Path("src/agent_claim/protocol.py").read_text()
     assert "single-writer" not in text
     assert "single_writer" not in text
+
+
+WORK_ITEM_ISSUE = 72
+LANDING_BRANCH = f"codex/issue-{WORK_ITEM_ISSUE}-claims"
+
+
+def landing_pull_request(
+    *,
+    body: str,
+    number: int = 12,
+    base_ref_name: str = "main",
+    head_ref_name: str = LANDING_BRANCH,
+    author: str = "ada",
+    merged: bool = False,
+) -> board.PullRequestDetail:
+    return board.PullRequestDetail(number, body, base_ref_name, head_ref_name, author, merged)
+
+
+def pr_check_client(
+    monkeypatch: pytest.MonkeyPatch,
+    detail: board.PullRequestDetail,
+    *,
+    standing: tuple[ClaimRequest, ...] = (),
+) -> FakeComments:
+    """A client serving one pull request and the claims that back it."""
+    claims = standing or (
+        request("landing", issue=WORK_ITEM_ISSUE, branch=LANDING_BRANCH, scope=("src",)),
+    )
+    client = _claims_client(*claims)
+    client.pull_requests[detail.number] = detail
+    monkeypatch.setattr(github, "GitHubIssueComments", lambda _repository: client)
+    monkeypatch.setattr(discovery, "discover_ledger", lambda _client: LEDGER_ISSUE)
+    return client
+
+
+def run_pr_check(number: int = 12) -> int:
+    return issue_claim.main(["--repo", REPOSITORY, "pr-check", "--pr", str(number)])
+
+
+def test_pr_check_accepts_a_claimed_work_item_that_the_pull_request_closes(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pr_check_client(
+        monkeypatch,
+        landing_pull_request(
+            body=f"Work-Item: {REPOSITORY}#{WORK_ITEM_ISSUE}\n\nCloses #{WORK_ITEM_ISSUE}"
+        ),
+    )
+
+    assert run_pr_check() == 0
+    assert capsys.readouterr().out == (
+        f"PR #12 by ada declares Work-Item: {REPOSITORY}#{WORK_ITEM_ISSUE}\n"
+    )
+
+
+def test_pr_check_reads_the_same_work_item_from_shorthand_and_qualified_lines(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pr_check_client(
+        monkeypatch,
+        landing_pull_request(
+            body=f"Work-Item: #{WORK_ITEM_ISSUE}\n\nCloses {REPOSITORY}#{WORK_ITEM_ISSUE}"
+        ),
+    )
+
+    assert run_pr_check() == 0
+    assert capsys.readouterr().out == (
+        f"PR #12 by ada declares Work-Item: {REPOSITORY}#{WORK_ITEM_ISSUE}\n"
+    )
+
+
+def test_pr_check_accepts_an_issueless_documentation_pull_request(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pr_check_client(monkeypatch, landing_pull_request(body="No-Item: docs\n\nTidy the README."))
+
+    assert run_pr_check() == 0
+    assert capsys.readouterr().out == "PR #12 by ada declares No-Item: docs\n"
+
+
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        pytest.param(
+            "Advances #72\n\nJust some prose.",
+            "carries no `Work-Item:` or `No-Item:` line",
+            id="advances-is-not-a-classification",
+        ),
+        pytest.param(
+            "Work-Item: #72\nNo-Item: docs\n\nCloses #72",
+            "carries 2 classification lines; exactly one is required",
+            id="duplicate-classification",
+        ),
+        pytest.param(
+            "Work-Item: #72\nWork-Item: #73\n\nCloses #72\nCloses #73",
+            "names two work items, #72 and #73; split it",
+            id="two-work-items",
+        ),
+        pytest.param(
+            "No-Item: chore\n\nHousekeeping.",
+            "carries `No-Item: chore`; an issue-less pull request is docs or fix",
+            id="unknown-no-item-kind",
+        ),
+        pytest.param(
+            "Work-Item: soon\n\nCloses #72",
+            "carries `Work-Item: soon`; a work item reads OWNER/REPO#n or #n",
+            id="malformed-work-item",
+        ),
+        pytest.param(
+            "Work-Item: #72\n\nNo closing keyword here.",
+            f"carries no closing reference for its work item {REPOSITORY}#72",
+            id="missing-closing-reference",
+        ),
+        pytest.param(
+            "Work-Item: #72\n\nCloses #72\nCloses #99",
+            f"closes {REPOSITORY}#99 besides its work item {REPOSITORY}#72; "
+            "a pull request lands one item",
+            id="closes-another-item",
+        ),
+        pytest.param(
+            f"Work-Item: #{LEDGER_ISSUE}\n\nCloses #{LEDGER_ISSUE}",
+            f"names the claim ledger #{LEDGER_ISSUE} as its work item",
+            id="ledger-as-work-item",
+        ),
+        pytest.param(
+            "Work-Item: other/repo#5\n\nCloses other/repo#5",
+            "names work item other/repo#5 of another repository, which holds no claim here",
+            id="foreign-work-item",
+        ),
+    ],
+)
+def test_pr_check_refuses_a_pull_request_body_with_one_line(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    body: str,
+    reason: str,
+) -> None:
+    pr_check_client(monkeypatch, landing_pull_request(body=body))
+
+    assert run_pr_check() == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"REFUSED: pull request #12 {reason}\n"
+
+
+def test_pr_check_refuses_a_work_item_without_a_claim_on_the_head_branch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pr_check_client(
+        monkeypatch,
+        landing_pull_request(body="Work-Item: #72\n\nCloses #72"),
+        standing=(request("elsewhere", issue=72, branch="codex/other-lane", scope=("src",)),),
+    )
+
+    assert run_pr_check() == 1
+    assert capsys.readouterr().err == (
+        f"REFUSED: pull request #12 has no active claim for #72 on branch {LANDING_BRANCH!r}\n"
+    )
+
+
+def test_pr_check_refuses_a_pull_request_that_does_not_target_the_default_branch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    client = pr_check_client(
+        monkeypatch,
+        landing_pull_request(body="Work-Item: #72\n\nCloses #72", base_ref_name="release"),
+    )
+    client.default_branch_name = "trunk"
+
+    assert run_pr_check() == 1
+    assert capsys.readouterr().err == (
+        "REFUSED: pull request #12 targets 'release', not the default branch 'trunk'\n"
+    )
+
+
+def test_pr_check_reads_a_fenced_classification_line_as_documentation(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pr_check_client(
+        monkeypatch,
+        landing_pull_request(body="Documents the convention:\n\n```\nWork-Item: #72\n```\n"),
+    )
+
+    assert run_pr_check() == 1
+    assert capsys.readouterr().err == (
+        "REFUSED: pull request #12 carries no `Work-Item:` or `No-Item:` line\n"
+    )
+
+
+def test_github_adapter_reads_a_pull_request_and_the_default_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GitHubIssueComments(REPOSITORY)
+
+    def run(arguments: list[str], *, input_data: bytes | None = None) -> str:
+        if arguments[:2] == ["pr", "view"]:
+            return json.dumps(
+                {
+                    "number": 12,
+                    "body": "Work-Item: #72",
+                    "baseRefName": "main",
+                    "headRefName": "codex/issue-72-claims",
+                    "author": {"login": "ada"},
+                    "mergedAt": "2026-09-05T10:00:00Z",
+                }
+            )
+        return "main"
+
+    monkeypatch.setattr(client, "_run", run)
+
+    assert client.pull_request_detail(12) == board.PullRequestDetail(
+        12, "Work-Item: #72", "main", "codex/issue-72-claims", "ada", True
+    )
+    assert client.default_branch() == "main"
+
+
+@pytest.mark.parametrize(
+    ("payload", "branch"),
+    [
+        pytest.param({"number": 12, "body": "b"}, "main", id="missing-refs"),
+        pytest.param(
+            {
+                "number": 12,
+                "body": "b",
+                "baseRefName": "main",
+                "headRefName": "work",
+                "author": {},
+                "mergedAt": None,
+            },
+            "main",
+            id="author-without-login",
+        ),
+        pytest.param(
+            {
+                "number": 12,
+                "body": "b",
+                "baseRefName": "main",
+                "headRefName": "work",
+                "author": {"login": "ada"},
+                "mergedAt": "yesterday",
+            },
+            "main",
+            id="malformed-merge-time",
+        ),
+    ],
+)
+def test_github_adapter_fails_loud_on_a_malformed_pull_request(
+    monkeypatch: pytest.MonkeyPatch, payload: dict[str, object], branch: str
+) -> None:
+    client = GitHubIssueComments(REPOSITORY)
+    monkeypatch.setattr(
+        client, "_run", lambda arguments, input_data=None: json.dumps(payload)
+    )
+
+    with pytest.raises(ClaimError, match="malformed pull request"):
+        client.pull_request_detail(12)
+
+
+def test_github_adapter_fails_loud_on_a_malformed_default_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GitHubIssueComments(REPOSITORY)
+    monkeypatch.setattr(client, "_run", lambda arguments, input_data=None: "not a branch")
+
+    with pytest.raises(ClaimError, match="malformed default branch"):
+        client.default_branch()
+
+
+def test_a_closing_reference_to_another_repository_confers_no_stage() -> None:
+    issue = board_issue(65, "Same number, other repository", complete_contract("Cut it."))
+    foreign = board.PullRequest(
+        130, "Lands elsewhere", "Fixes other/repo#65", "branch", "2026-08-20T00:00:00Z"
+    )
+
+    projected = projected_board(
+        (issue,), (), (foreign,), (), board.BoardConfig(),
+        now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+    )
+
+    assert projected.items[0].stage is board.Stage.TEXT_ONLY

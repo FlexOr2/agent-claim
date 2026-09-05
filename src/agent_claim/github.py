@@ -404,6 +404,62 @@ class GitHubIssueComments:
             raise ClaimError("GitHub returned a malformed board pull request")
         return board.PullRequest(number, title, body, head_ref_name, merged_at)
 
+    def _pull_request_detail(self, value: object) -> board.PullRequestDetail:
+        if not isinstance(value, dict):
+            raise ClaimError("GitHub returned a malformed pull request")
+        number = value.get("number")
+        body = value.get("body")
+        if body is None:
+            body = ""
+        base_ref_name = value.get("baseRefName")
+        head_ref_name = value.get("headRefName")
+        author = value.get("author")
+        login = author.get("login") if isinstance(author, dict) else None
+        merged_at = value.get("mergedAt")
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, int)
+            or number < 1
+            or not isinstance(body, str)
+            or not isinstance(base_ref_name, str)
+            or not isinstance(head_ref_name, str)
+            or not isinstance(login, str)
+            or not login
+            or (merged_at is not None and not isinstance(merged_at, str))
+            or (isinstance(merged_at, str) and TIMESTAMP_PATTERN.fullmatch(merged_at) is None)
+        ):
+            raise ClaimError("GitHub returned a malformed pull request")
+        return board.PullRequestDetail(
+            number, body, base_ref_name, head_ref_name, login, merged_at is not None
+        )
+
+    def pull_request_detail(self, number: int) -> board.PullRequestDetail:
+        raw = self._run(
+            [
+                "pr",
+                "view",
+                str(number),
+                "--repo",
+                self.repository,
+                "--json",
+                "number,body,baseRefName,headRefName,author,mergedAt",
+                "--jq",
+                ".",
+            ]
+        )
+        values = self._json_lines(raw, "pull request")
+        if len(values) != 1:
+            raise ClaimError("GitHub returned a malformed pull request")
+        return self._pull_request_detail(values[0])
+
+    def default_branch(self) -> str:
+        branch = self._run(
+            ["api", f"repos/{self.repository}", "--jq", ".default_branch"]
+        )
+        if protocol.BRANCH_PATTERN.fullmatch(branch) is None:
+            raise ClaimError("GitHub returned a malformed default branch")
+        return branch
+
     def _open_issue_page(self, page: int) -> tuple[object, ...]:
         raw = self._run(
             [

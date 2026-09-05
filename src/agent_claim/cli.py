@@ -377,6 +377,12 @@ def _parser() -> argparse.ArgumentParser:
     supersede.add_argument("--reason", required=True)
     supersede.add_argument("--claim-id", required=True)
 
+    pull_request_check = commands.add_parser(
+        "pr-check",
+        help="check a pull request's typed work-item classification before it merges",
+    )
+    pull_request_check.add_argument("--pr", type=int, required=True, metavar="NUMBER")
+
     policy = commands.add_parser("policy", help="print the provider-neutral loader block")
     policy.add_argument("--print", action="store_true", required=True, dest="print_loader")
     commands.add_parser(
@@ -686,6 +692,7 @@ def _board(
         *pull_requests,
         claims,
         board.load_config(toplevel / ".agent-claim" / "board.toml"),
+        repository=client.repository,
         blocker_references=blocker_references.result(),
         now=now,
         trunk_landings=checkout.trunk_landing_times(),
@@ -1071,6 +1078,93 @@ def _refuse_claim(json_mode: bool, issue: int | None, checks: tuple[SliceCheck, 
     return 2
 
 
+def _claim_defect(
+    client: github.GitHubIssueComments,
+    detail: board.PullRequestDetail,
+    item: board.IssueReference,
+) -> board.ClassificationDefect | None:
+    if any(
+        isinstance(claim.identity, protocol.IssueIdentity)
+        and claim.identity.issue == item.number
+        and claim.branch == detail.head_ref_name
+        for claim in protocol._ledger_claims(client)
+    ):
+        return None
+    return board.ClassificationDefect(
+        f"has no active claim for #{item.number} on branch {detail.head_ref_name!r}"
+    )
+
+
+def _closing_defect(
+    detail: board.PullRequestDetail,
+    repository: str,
+    item: board.IssueReference,
+) -> board.ClassificationDefect | None:
+    """Which issues this landing must close, and that it closes nothing else."""
+    closing = board.closing_references(detail.body, repository)
+    if item not in closing:
+        return board.ClassificationDefect(
+            f"carries no closing reference for its work item {item}"
+        )
+    besides = tuple(sorted(closing - {item}, key=str))
+    if besides:
+        named = ", ".join(str(reference) for reference in besides)
+        return board.ClassificationDefect(
+            f"closes {named} besides its work item {item}; a pull request lands one item"
+        )
+    return None
+
+
+def _work_item_defect(
+    client: github.GitHubIssueComments,
+    repository: str,
+    detail: board.PullRequestDetail,
+    item: board.IssueReference,
+) -> board.ClassificationDefect | None:
+    """Why this repository does not accept `item` as the landing pull request's work item."""
+    if item.repository != repository:
+        return board.ClassificationDefect(
+            f"names work item {item} of another repository, which holds no claim here"
+        )
+    if item.number == protocol.LEDGER_ISSUE:
+        return board.ClassificationDefect(
+            f"names the claim ledger #{protocol.LEDGER_ISSUE} as its work item"
+        )
+    claim_defect = _claim_defect(client, detail, item)
+    if claim_defect is not None:
+        return claim_defect
+    return _closing_defect(detail, repository, item)
+
+
+def _checked_classification(
+    client: github.GitHubIssueComments, repository: str, detail: board.PullRequestDetail
+) -> board.Classification | board.ClassificationDefect:
+    classification = board.parse_pull_request_classification(detail.body, repository)
+    if isinstance(classification, board.ClassificationDefect):
+        return classification
+    default_branch = client.default_branch()
+    if detail.base_ref_name != default_branch:
+        return board.ClassificationDefect(
+            f"targets {detail.base_ref_name!r}, not the default branch {default_branch!r}"
+        )
+    if isinstance(classification, board.NoItemClassification):
+        return classification
+    defect = _work_item_defect(client, repository, detail, classification.item)
+    return classification if defect is None else defect
+
+
+def _pull_request_check(
+    client: github.GitHubIssueComments, repository: str, number: int
+) -> int:
+    detail = client.pull_request_detail(number)
+    checked = _checked_classification(client, repository, detail)
+    if isinstance(checked, board.ClassificationDefect):
+        print(f"REFUSED: pull request #{detail.number} {checked.message}", file=sys.stderr)
+        return 1
+    print(f"PR #{detail.number} by {detail.author} declares {checked}")
+    return 0
+
+
 MUTATING_HOOK_TOOLS = frozenset({"Edit", "MultiEdit", "Write", "search_replace", "write"})
 
 
@@ -1208,6 +1302,8 @@ def main(arguments: list[str] | None = None) -> int:
                 "no agent-claim ledger exists; run agent-claim bootstrap"
             )
         protocol.configure_ledger(ledger)
+        if parsed.command == "pr-check":
+            return _pull_request_check(client, repository, parsed.pr)
         if parsed.command == "status":
             comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
             claims = protocol.active_claims(comments)

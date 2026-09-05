@@ -101,6 +101,31 @@ A duplicate still active under two different agents is a real ownership
 conflict; `reconcile` reports it and leaves the whole ledger untouched — for
 every duplicated id, not just the conflicting one — instead of picking a winner.
 
+## Landing classification
+
+`agent-claim pr-check --pr <n>` reads one pull request of the current
+checkout's repository (or `--repo OWNER/REPOSITORY`) and answers one question:
+which item does this landing close? It prints `PR #<n> by <author> declares
+<classification>` and exits 0, or prints one `REFUSED: pull request #<n> ...`
+line and exits 1. Run it as a required check on every pull request that targets
+the default branch.
+
+A pull request body carries exactly one classification line:
+
+- `Work-Item: OWNER/REPO#n` (or `Work-Item: #n` for this repository) together
+  with a closing reference for that same item — `Closes #n`, or any other
+  keyword GitHub itself closes on, optionally qualified as `OWNER/REPO#n`; or
+- `No-Item: docs` or `No-Item: fix` for a lane that owns no issue.
+
+`pr-check` refuses a body with no classification line, with more than one, or
+naming two work items (split the pull request); a work item that is the claim
+ledger issue or lives in another repository; a work item with no active claim
+on the pull request's head branch; a closing reference naming anything but the
+work item; and a pull request that does not target the default branch. A
+classification line inside a fenced code block is documentation, never a
+declaration. `Advances #n` is read nowhere: a dispatched slice is its own item,
+and its pull request closes it.
+
 ## Read-only board projection
 
 `agent-claim board` reads the open issues, open PRs, PRs merged since the
