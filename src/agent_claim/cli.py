@@ -37,7 +37,6 @@ LedgerSupersede = protocol.LedgerSupersede
 LedgerSuperseded = protocol.LedgerSuperseded
 PROJECTION_MARKER_PATTERN = protocol.PROJECTION_MARKER_PATTERN
 _active_projection = protocol._active_projection
-_bounded_command = github._bounded_command
 _git_output = checkout._git_output
 _projection_ledger = protocol._projection_ledger
 _projection_marker = protocol._projection_marker
@@ -254,6 +253,9 @@ def _request(arguments: argparse.Namespace) -> protocol.ClaimRequest:
     return request
 
 
+LANE_ISSUE_HELP = "omit for lane mode, derived from a docs/ or fix/ checkout branch"
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-claim", description=__doc__)
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -286,7 +288,7 @@ def _parser() -> argparse.ArgumentParser:
         "issue",
         type=int,
         nargs="?",
-        help="omit for lane mode, derived from a docs/ or fix/ checkout branch",
+        help=LANE_ISSUE_HELP,
     )
     claim.add_argument("--agent")
     claim.add_argument("--role", default=DEFAULT_CLAIM_ROLE)
@@ -324,7 +326,7 @@ def _parser() -> argparse.ArgumentParser:
         "issue",
         type=int,
         nargs="?",
-        help="omit for lane mode, derived from a docs/ or fix/ checkout branch",
+        help=LANE_ISSUE_HELP,
     )
     release.add_argument("--agent")
     release.add_argument("--role")
@@ -351,7 +353,7 @@ def _parser() -> argparse.ArgumentParser:
         "issue",
         type=int,
         nargs="?",
-        help="omit for lane mode, derived from a docs/ or fix/ checkout branch",
+        help=LANE_ISSUE_HELP,
     )
     rescope.add_argument("--agent")
     rescope.add_argument(
@@ -886,8 +888,8 @@ class SliceCheck:
         }
 
 
-def _fetch_issue_reference(repository: str, number: int) -> _IssueReference:
-    """The live state, title, and body of issue `number` in `repository`.
+def _fetch_issue_reference(client: github.GitHubIssueComments, number: int) -> _IssueReference:
+    """The live state, title, and body of issue `number` from `client`.
 
     Called only for a claim target or a slice-table `#n` link that the
     already-fetched open board didn't resolve as OPEN — a closed or missing
@@ -896,10 +898,7 @@ def _fetch_issue_reference(repository: str, number: int) -> _IssueReference:
     at a time rather than a repository-wide query.
     """
     try:
-        raw = _bounded_command(
-            ["gh", "api", f"repos/{repository}/issues/{number}", "--jq", "{state,title,body}"],
-            purpose="claim reference lookup",
-        )
+        raw = client.issue_reference_json(number)
     except protocol.ClaimError as error:
         # `gh api` reports a nonexistent issue as an HTTP 404 in its combined
         # stdout/stderr text; `_bounded_command` doesn't expose the process's
@@ -929,12 +928,14 @@ def _fetch_issue_reference(repository: str, number: int) -> _IssueReference:
 
 
 def _issue_reference_state(
-    repository: str, open_by_number: dict[int, board.Issue], number: int
+    client: github.GitHubIssueComments,
+    open_by_number: dict[int, board.Issue],
+    number: int,
 ) -> tuple[ReferenceState, str | None, str | None]:
     open_issue = open_by_number.get(number)
     if open_issue is not None:
         return ReferenceState.OPEN, open_issue.title, open_issue.body
-    reference = _fetch_issue_reference(repository, number)
+    reference = _fetch_issue_reference(client, number)
     return reference.state, reference.title, reference.body
 
 
@@ -958,94 +959,84 @@ def _out_of_order_check(
 
 
 def _slice_table_entry_checks(
-    repository: str, open_by_number: dict[int, board.Issue], entry: board.SliceTableEntry
-) -> tuple[SliceCheck, ...]:
+    client: github.GitHubIssueComments,
+    open_by_number: dict[int, board.Issue],
+    entry: board.SliceTableEntry,
+) -> SliceCheck | None:
     if isinstance(entry, board.MalformedSliceTable):
-        return (
-            SliceCheck(
-                "error",
-                "malformed-slice-table",
-                f'malformed slice table header: "{entry.line}"',
-            ),
+        return SliceCheck(
+            "error",
+            "malformed-slice-table",
+            f'malformed slice table header: "{entry.line}"',
         )
     if isinstance(entry, board.MalformedSliceRow):
-        return (
-            SliceCheck(
-                "error",
-                "malformed-slice-cell",
-                f'malformed slice table row: "{entry.line}"',
-            ),
+        return SliceCheck(
+            "error",
+            "malformed-slice-cell",
+            f'malformed slice table row: "{entry.line}"',
         )
-    return _slice_row_checks(repository, open_by_number, entry)
+    return _slice_row_checks(client, open_by_number, entry)
 
 
 def _slice_row_checks(
-    repository: str, open_by_number: dict[int, board.Issue], row: board.SliceTableRow
-) -> tuple[SliceCheck, ...]:
+    client: github.GitHubIssueComments,
+    open_by_number: dict[int, board.Issue],
+    row: board.SliceTableRow,
+) -> SliceCheck | None:
     if row.item_issue is not None:
-        state, _title, _body = _issue_reference_state(repository, open_by_number, row.item_issue)
+        state, _title, _body = _issue_reference_state(client, open_by_number, row.item_issue)
         if state is ReferenceState.CLOSED:
-            return (
-                SliceCheck(
-                    "error",
-                    "landed-slice-in-table",
-                    f"slice {row.index} links closed #{row.item_issue}; "
-                    "a landed slice leaves the table",
-                    slice=row.index,
-                    issue=row.item_issue,
-                ),
+            return SliceCheck(
+                "error",
+                "landed-slice-in-table",
+                f"slice {row.index} links closed #{row.item_issue}; "
+                "a landed slice leaves the table",
+                slice=row.index,
+                issue=row.item_issue,
             )
         if state is ReferenceState.MISSING:
-            return (
-                SliceCheck(
-                    "error",
-                    "missing-slice-item",
-                    f"slice {row.index} links #{row.item_issue}, which does not exist here",
-                    slice=row.index,
-                    issue=row.item_issue,
-                ),
-            )
-        return ()
-    if row.item_cell == board.UNDISPATCHED_SLICE_CELL:
-        return (
-            SliceCheck(
-                "warning",
-                "undispatched-slice",
-                f'slice {row.index} "{row.name}" is not dispatched; '
-                "make it an item before building it",
+            return SliceCheck(
+                "error",
+                "missing-slice-item",
+                f"slice {row.index} links #{row.item_issue}, which does not exist here",
                 slice=row.index,
-            ),
-        )
-    return (
-        SliceCheck(
-            "error",
-            "malformed-slice-cell",
-            f'slice {row.index} item cell "{row.item_cell}" is neither — nor #n',
+                issue=row.item_issue,
+            )
+        return None
+    if row.item_cell == board.UNDISPATCHED_SLICE_CELL:
+        return SliceCheck(
+            "warning",
+            "undispatched-slice",
+            f'slice {row.index} "{row.name}" is not dispatched; '
+            "make it an item before building it",
             slice=row.index,
-        ),
+        )
+    return SliceCheck(
+        "error",
+        "malformed-slice-cell",
+        f'slice {row.index} item cell "{row.item_cell}" is neither — nor #n',
+        slice=row.index,
     )
 
 
 def _parent_checks(
     client: github.GitHubIssueComments, repository: str, issue: int, title: str
-) -> tuple[SliceCheck, ...]:
+) -> SliceCheck | None:
     """Warn when a slice-shaped title names a parent GitHub does not record as one."""
     match = board.slice_title_match(title)
     if match is None:
-        return ()
+        return None
     slice_number, parent_issue = match
     parent = client.parent_issue(issue)
     if parent is not None and parent.reference == board.IssueReference(repository, parent_issue):
-        return ()
-    return (
-        SliceCheck(
-            "warning",
-            "missing-parent",
-            f"looks like slice {slice_number} of #{parent_issue} but is no sub-issue "
-            f"of #{parent_issue}; the parent inherits nothing",
-            slice=slice_number,
-            issue=parent_issue,
-        ),
+        return None
+    return SliceCheck(
+        "warning",
+        "missing-parent",
+        f"looks like slice {slice_number} of #{parent_issue} but is no sub-issue "
+        f"of #{parent_issue}; the parent inherits nothing",
+        slice=slice_number,
+        issue=parent_issue,
     )
 
 
@@ -1088,7 +1079,7 @@ def _slice_rule_checks(
     out_of_order = _out_of_order_check(projected, issue, out_of_order_reason)
     if out_of_order is not None:
         checks.append(out_of_order)
-    state, title, body = _issue_reference_state(repository, open_by_number, issue)
+    state, title, body = _issue_reference_state(client, open_by_number, issue)
     if state is ReferenceState.CLOSED:
         checks.append(
             SliceCheck("error", "closed-issue", f"issue #{issue} is closed", issue=issue)
@@ -1104,9 +1095,13 @@ def _slice_rule_checks(
         checks.extend(_body_contract_checks(item.contract, projected.blocker_references))
     if body is not None:
         for entry in board.parse_slice_table(body):
-            checks.extend(_slice_table_entry_checks(repository, open_by_number, entry))
+            table_check = _slice_table_entry_checks(client, open_by_number, entry)
+            if table_check is not None:
+                checks.append(table_check)
     if title is not None:
-        checks.extend(_parent_checks(client, repository, issue, title))
+        parent_check = _parent_checks(client, repository, issue, title)
+        if parent_check is not None:
+            checks.append(parent_check)
     return tuple(checks)
 
 
@@ -1342,7 +1337,7 @@ def _verify_merged_release(
             f"pull request #{detail.number} names {classification}, "
             f"not work item #{identity.issue}"
         )
-    reference = _fetch_issue_reference(repository, identity.issue)
+    reference = _fetch_issue_reference(client, identity.issue)
     if reference.state is not ReferenceState.CLOSED:
         raise protocol.ClaimUnavailable(
             f"work item #{identity.issue} is {reference.state.value}, not closed"
@@ -1397,13 +1392,16 @@ def _protect_relative_path(raw_path: str) -> str | None:
         return None
 
 
+PATH_REQUIRED = "path required"
+
+
 def _protect_write(repository: str | None, payload: dict[str, object]) -> int:
     tool_input = _hook_field(payload, "toolInput", "tool_input")
     if not isinstance(tool_input, dict):
-        return _hook_deny("path required")
+        return _hook_deny(PATH_REQUIRED)
     raw_path = _hook_path(tool_input)
     if raw_path is None:
-        return _hook_deny("path required")
+        return _hook_deny(PATH_REQUIRED)
     agent = checkout._resolved_agent(None)
     branch = checkout._git_output(["branch", "--show-current"])
     if branch in {"main", "master"}:
@@ -1414,7 +1412,7 @@ def _protect_write(repository: str | None, payload: dict[str, object]) -> int:
         return _hook_deny("worktree")
     relative = _protect_relative_path(raw_path)
     if relative is None:
-        return _hook_deny("path required")
+        return _hook_deny(PATH_REQUIRED)
     client = github.GitHubIssueComments(checkout._repository(repository))
     ledger = discovery.discover_ledger(client)
     if ledger is None:
@@ -1444,6 +1442,10 @@ def _protect(repository: str | None) -> int:
         return _protect_write(repository, payload)
     except Exception as error:
         return _hook_deny(str(error))
+
+
+def _optional_issue_number(value: int | None) -> int | None:
+    return None if value is None else int(value)
 
 
 def main(arguments: list[str] | None = None) -> int:
@@ -1487,15 +1489,17 @@ def main(arguments: list[str] | None = None) -> int:
             )
         protocol.configure_ledger(ledger)
         if parsed.command == "pr-check":
-            return _pull_request_check(client, repository, parsed.pr)
+            pull_request_number = int(parsed.pr)
+            return _pull_request_check(client, repository, pull_request_number)
         if parsed.command == "status":
+            issue = _optional_issue_number(parsed.issue)
             comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
             claims = protocol.active_claims(comments)
             now = datetime.now(timezone.utc)
             if parsed.json:
-                return _status_json(claims, parsed.issue, ledger, now=now)
+                return _status_json(claims, issue, ledger, now=now)
             print(f"LEDGER #{ledger}")
-            return _status(claims, parsed.issue, now=now)
+            return _status(claims, issue, now=now)
         if parsed.command == "board":
             comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
             projected = _board(client, protocol.active_claims(comments))
@@ -1531,6 +1535,7 @@ def main(arguments: list[str] | None = None) -> int:
             print(f"LEDGER #{ledger}")
             return _who(claims, parsed.path)
         if parsed.command == "rescope":
+            issue = _optional_issue_number(parsed.issue)
             rescope_branch = checkout._git_output(["branch", "--show-current"])
             if not rescope_branch:
                 raise protocol.ClaimUnavailable(
@@ -1538,7 +1543,7 @@ def main(arguments: list[str] | None = None) -> int:
                     "check out the claim branch, or pass an issue number"
                 )
             checkout._validate_worktree_branch(rescope_branch)
-            identity = _resolved_identity(parsed.issue, rescope_branch)
+            identity = _resolved_identity(issue, rescope_branch)
             add = protocol._valid_scope(parsed.add) if parsed.add else ()
             drop = protocol._valid_scope(parsed.drop) if parsed.drop else ()
             allow_directory_reason = parsed.allow_directory
@@ -1654,7 +1659,8 @@ def main(arguments: list[str] | None = None) -> int:
             print(_claim_cost_line(n, total, touches))
             return 0
         if parsed.command == "release":
-            identity = _resolved_identity(parsed.issue, release_branch or "")
+            issue = _optional_issue_number(parsed.issue)
+            identity = _resolved_identity(issue, release_branch or "")
             outcome = _release_outcome(parsed)
             if isinstance(outcome, protocol.MergedRelease):
                 _verify_merged_release(client, repository, identity, outcome)
@@ -1673,9 +1679,10 @@ def main(arguments: list[str] | None = None) -> int:
             print(f"RELEASED {_claim_subject(released)}: {released.claim_id}")
             return 0
         if parsed.command == "supersede":
+            successor_issue = _optional_issue_number(parsed.successor_issue)
             frozen = protocol.supersede_ledger(
                 client,
-                parsed.successor_issue,
+                successor_issue,
                 parsed.agent,
                 parsed.role,
                 parsed.reason,
@@ -1683,7 +1690,7 @@ def main(arguments: list[str] | None = None) -> int:
             )
             print(
                 f"SUPERSEDED ledger #{protocol.LEDGER_ISSUE} successor "
-                f"#{parsed.successor_issue}: {frozen.claim_id}"
+                f"#{successor_issue}: {frozen.claim_id}"
             )
             return 0
         try:
@@ -1697,15 +1704,16 @@ def main(arguments: list[str] | None = None) -> int:
             # A frozen ledger has nothing left for duplicate repair to fix; let the
             # label reconciliation below observe the freeze and run its own cleanup.
             pass
-        if parsed.issue is None:
+        issue = _optional_issue_number(parsed.issue)
+        if issue is None:
             reconciled = protocol.reconcile_all_labels(client)
         else:
-            protocol.reconcile_issue_label(client, parsed.issue)
+            protocol.reconcile_issue_label(client, issue)
             reconciled = tuple(
                 claim.identity.issue
                 for claim in protocol._ledger_claims(client)
                 if isinstance(claim.identity, protocol.IssueIdentity)
-                and claim.identity.issue == parsed.issue
+                and claim.identity.issue == issue
             )
         print("RECONCILED " + (", ".join(f"#{issue}" for issue in reconciled) or "no claims"))
         return 0

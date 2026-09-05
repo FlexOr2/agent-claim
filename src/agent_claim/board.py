@@ -15,14 +15,15 @@ from . import protocol
 DEFAULT_PRIORITY_LABELS = ("security", "data", "ci", "product", "ux", "cleanup")
 CONFIG_PATH = Path(".agent-claim/board.toml")
 IDEA_REFINEMENT_STEP = "Problem neu prüfen und Item verfeinern"
+BLOCKED_BY = "Blocked by"
 CONTRACT_HEADING_PATTERN = re.compile(
-    r"(?m)^#{1,6}[ \t]+(?P<name>Now|Next|Blocked by|Done when)[ \t]*$"
+    rf"(?m)^#{{1,6}}[ \t]+(?P<name>Now|Next|{BLOCKED_BY}|Done when)[ \t]*$"
 )
 CONTRACT_FIELD_PATTERN = re.compile(
-    r"(?m)^(?:\*\*(?P<bold_name>Now|Next|Blocked by|Done when):\*\*|"
-    r"(?P<plain_name>Now|Next|Blocked by|Done when):)[ \t]*(?P<value>[^\r\n]*)$"
+    rf"(?m)^(?:\*\*(?P<bold_name>Now|Next|{BLOCKED_BY}|Done when):\*\*|"
+    rf"(?P<plain_name>Now|Next|{BLOCKED_BY}|Done when):)[ \t]*(?P<value>[^\r\n]*)$"
 )
-BLOCKER_LIST_PATTERN = re.compile(r"#([1-9][0-9]*)(?:[ \t]*,[ \t]*#([1-9][0-9]*))*")
+BLOCKER_LIST_PATTERN = re.compile(r"#([1-9]\d*)(?:[ \t]*,[ \t]*#([1-9]\d*))*", re.ASCII)
 NO_BLOCKERS = "nichts"
 MARKDOWN_HEADING_PATTERN = re.compile(r"(?m)^#{1,6} .*$")
 EXPECTATION_HEADING_PATTERN = re.compile(
@@ -35,7 +36,8 @@ OPERATOR_RULING_DATE_PATTERN = re.compile(
 )
 RULING_OLD_AFTER_LANDINGS = 10
 FROZEN_LINE_PATTERN = re.compile(
-    r"(?m)^(?:>[ \t]*)*(?:\*\*Eingefroren bis:\*\*|Eingefroren bis:)[ \t]*(?P<value>[^\r\n]*)$"
+    r"(?m)^(?:[ \t]{0,3}>)*[ \t]{0,3}(?:\*\*Eingefroren bis:\*\*|Eingefroren bis:)"
+    r"[ \t]*(?P<value>[^\r\n]*)$"
 )
 FROZEN_TRIGGER_PATTERN = re.compile(
     r"(?P<trigger>\S.*?)[ \t]*\(Operator,[ \t]*"
@@ -48,8 +50,8 @@ FROZEN_TRIGGER_PATTERN = re.compile(
 # `Closing`'s stricter pattern requires nothing but whitespace to follow.
 # A 4-space-indented code block (CommonMark's other fencing form) is not
 # modeled here; see `_live_text` for why that gap is safe.
-FENCE_OPENING_PATTERN = re.compile(r"^[ ]{0,3}(?P<run>`{3,}|~{3,})")
-FENCE_CLOSING_PATTERN = re.compile(r"^[ ]{0,3}(?P<run>`{3,}|~{3,})[ \t]*$")
+FENCE_OPENING_PATTERN = re.compile(r"^ {0,3}(?P<run>`{3,}|~{3,})")
+FENCE_CLOSING_PATTERN = re.compile(r"^ {0,3}(?P<run>`{3,}|~{3,})[ \t]*$")
 PROPOSED_EXPECTATION_PATTERN = re.compile(
     r"\*\(Default:[ \t]*(?:yes|no|later)\)\*", re.IGNORECASE
 )
@@ -70,13 +72,13 @@ RULED_EXPECTATION_PATTERN = re.compile(
 # contract is written as one. A line with that shape is a candidate
 # expectation, whether or not it happens to carry either marker yet.
 EXPECTATION_LINE_SHAPE_PATTERN = re.compile(r"^(?:[-*+]|\d+[.)])[ \t]+")
-REFERENCE_PATTERN = re.compile(r"(?<![A-Za-z0-9_])#([1-9][0-9]*)")
+REFERENCE_PATTERN = re.compile(r"(?<!\w)#([1-9]\d*)", re.ASCII)
 # One issue named the way GitHub names it across repositories: `OWNER/REPO#n`,
 # or `#n` for the repository the text itself lives in. Every typed line below
 # embeds this one grammar, so a shorthand and its qualified spelling always
 # parse to the same reference.
 QUALIFIED_REFERENCE = (
-    rf"(?:(?P<repository>{protocol.REPOSITORY_PATTERN.pattern}))?#(?P<number>[1-9][0-9]*)"
+    rf"(?:(?P<repository>{protocol.REPOSITORY_PATTERN.pattern}))?#(?P<number>[1-9]\d*)"
 )
 # GitHub links a keyword to a reference only on one line, separated by
 # horizontal space and ending at the reference: `Closes#7`, a keyword whose
@@ -90,7 +92,8 @@ REFERENCE_BOUNDARY = r"(?![A-Za-z0-9_])"
 CLOSING_KEYWORDS = r"close(?:s|d)?|fix(?:es|ed)?|resolve(?:s|d)?"
 CLOSING_REFERENCE_PATTERN = re.compile(
     rf"(?im)\b(?:{CLOSING_KEYWORDS}){KEYWORD_SEPARATOR}"
-    rf"{QUALIFIED_REFERENCE}{REFERENCE_BOUNDARY}"
+    rf"{QUALIFIED_REFERENCE}{REFERENCE_BOUNDARY}",
+    re.ASCII,
 )
 # The board's stage heuristic also believes a pull request that says it landed
 # or implemented an issue. GitHub closes on neither word, so this wider set
@@ -98,13 +101,14 @@ CLOSING_REFERENCE_PATTERN = re.compile(
 # it retire".
 LANDING_CLAIM_PATTERN = re.compile(
     rf"(?im)\b(?:{CLOSING_KEYWORDS}|land(?:s|ed)?|implement(?:s|ed)?)"
-    rf"{KEYWORD_SEPARATOR}{QUALIFIED_REFERENCE}{REFERENCE_BOUNDARY}"
+    rf"{KEYWORD_SEPARATOR}{QUALIFIED_REFERENCE}{REFERENCE_BOUNDARY}",
+    re.ASCII,
 )
 WORK_ITEM_KIND = "work-item"
 CLASSIFICATION_LINE_PATTERN = re.compile(
-    r"(?im)^(?P<kind>Work-Item|No-Item):[ \t]*(?P<value>[^\r\n]*?)[ \t]*$"
+    r"(?im)^(?P<kind>Work-Item|No-Item):(?P<value>[^\r\n]*)$"
 )
-WORK_ITEM_VALUE_PATTERN = re.compile(QUALIFIED_REFERENCE)
+WORK_ITEM_VALUE_PATTERN = re.compile(QUALIFIED_REFERENCE, re.ASCII)
 RECOVERY_STEP = "close or re-project"
 # A slice's pull request must never close its still-open epic — that would
 # retire the epic before its remaining slices exist. This repository's
@@ -123,24 +127,24 @@ TOUCHES_WITHOUT_CLOSING_LINE_PATTERN = re.compile(
 CLAIM_OLD_AFTER = timedelta(hours=1)
 CUT_HEADING_PATTERN = re.compile(r"(?m)^##[ \t]+Schnitt")
 CUT_SECTION_HEADING_PATTERN = re.compile(r"(?m)^##[ \t]+")
-SLICE_LINE_PATTERN = re.compile(r"(?m)^\*\*Scheibe [1-9][0-9]*:[ \t]*\S.*?\*\*\s*$")
+SLICE_LINE_PATTERN = re.compile(r"(?m)^\*\*Scheibe [1-9]\d*:[ \t]*\S.*?\*\*\s*$", re.ASCII)
 # The slice table's header cells, in order, compared case- and
 # whitespace-insensitively (`_table_row_cells` already strips each cell).
 SLICE_TABLE_HEADER_CELLS = ("#", "scheibe", "item", "hängt ab von")
 _SLICE_TABLE_SEPARATOR_CELL_PATTERN = re.compile(r"^:?-+:?$")
-_SLICE_TABLE_INDEX_PATTERN = re.compile(r"^[1-9][0-9]*$")
-_SLICE_TABLE_ITEM_LINK_PATTERN = re.compile(r"^#([1-9][0-9]*)$")
+_SLICE_TABLE_INDEX_PATTERN = re.compile(r"^[1-9]\d*$", re.ASCII)
+_SLICE_TABLE_ITEM_LINK_PATTERN = re.compile(r"^#([1-9]\d*)$", re.ASCII)
 UNDISPATCHED_SLICE_CELL = "—"
 # The three slice-title forms seen in atelier-2 (`#79`): a parenthetical
 # after the real title (`(#962 Scheibe 4)`, `(#962 slice 4)`) or a leading
 # German phrase (`Scheibe 4 von #962`).
 _SLICE_TITLE_PARENTHETICAL_PATTERN = re.compile(
-    r"\(#(?P<parent>[1-9][0-9]*)[ \t]+(?:Scheibe|slice)[ \t]+(?P<slice>[1-9][0-9]*)\)",
-    re.IGNORECASE,
+    r"\(#(?P<parent>[1-9]\d*)[ \t]+(?:Scheibe|slice)[ \t]+(?P<slice>[1-9]\d*)\)",
+    re.IGNORECASE | re.ASCII,
 )
 _SLICE_TITLE_VON_PATTERN = re.compile(
-    r"Scheibe[ \t]+(?P<slice>[1-9][0-9]*)[ \t]+von[ \t]+#(?P<parent>[1-9][0-9]*)",
-    re.IGNORECASE,
+    r"Scheibe[ \t]+(?P<slice>[1-9]\d*)[ \t]+von[ \t]+#(?P<parent>[1-9]\d*)",
+    re.IGNORECASE | re.ASCII,
 )
 
 
@@ -449,7 +453,7 @@ def parse_contract(body: str) -> Contract:
             defects.append(ContractDefect(name, f"duplicate {name} projection field"))
             continue
         sections[name] = value
-    blocked_by = sections.get("Blocked by")
+    blocked_by = sections.get(BLOCKED_BY)
     if (
         blocked_by is not None
         and blocked_by != NO_BLOCKERS
@@ -457,8 +461,8 @@ def parse_contract(body: str) -> Contract:
     ):
         defects.append(
             ContractDefect(
-                "Blocked by",
-                "Blocked by must be exactly nichts or a comma-separated #N list",
+                BLOCKED_BY,
+                f"{BLOCKED_BY} must be exactly nichts or a comma-separated #N list",
             )
         )
     return Contract(
@@ -780,13 +784,13 @@ def parse_pull_request_classification(
         match for match in matches if match.group("kind").lower() == WORK_ITEM_KIND
     )
     if len(work_items) > 1:
-        named = " and ".join(match.group("value") for match in work_items[:2])
+        named = " and ".join(match.group("value").strip(" \t") for match in work_items[:2])
         return ClassificationDefect(f"names two work items, {named}; split it")
     if len(matches) > 1:
         return ClassificationDefect(
             f"carries {len(matches)} classification lines; exactly one is required"
         )
-    value = matches[0].group("value")
+    value = matches[0].group("value").strip(" \t")
     if work_items:
         reference = WORK_ITEM_VALUE_PATTERN.fullmatch(value)
         if reference is None:
@@ -908,7 +912,7 @@ def _with_blocker_defects(
         defects=(
             *contract.defects,
             *(
-                ContractDefect("Blocked by", f"blocker #{blocker} is a pull request")
+                ContractDefect(BLOCKED_BY, f"blocker #{blocker} is a pull request")
                 for blocker in pull_requests
             ),
         ),
@@ -1342,7 +1346,7 @@ def _contract_summary(contract: Contract) -> str:
         for name, value in (
             ("Now", contract.now),
             ("Next", contract.next),
-            ("Blocked by", contract.blocked_by),
+            (BLOCKED_BY, contract.blocked_by),
             ("Done when", contract.done_when),
         )
         if value is not None
