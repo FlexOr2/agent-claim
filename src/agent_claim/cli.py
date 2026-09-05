@@ -328,7 +328,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     release.add_argument("--agent")
     release.add_argument("--role")
-    release.add_argument("--reason")
+    outcome = release.add_mutually_exclusive_group(required=True)
+    outcome.add_argument(
+        "--merged",
+        type=int,
+        metavar="PULL_REQUEST",
+        help="the pull request that landed this claim's item on the default branch",
+    )
+    outcome.add_argument(
+        "--abandoned",
+        metavar="REASON",
+        help="why this claim ends without a landing",
+    )
     release.add_argument("--claim-id")
     release.add_argument("--coordinator-override", action="store_true")
     release.add_argument("--json", action="store_true")
@@ -376,6 +387,12 @@ def _parser() -> argparse.ArgumentParser:
     supersede.add_argument("--role", required=True)
     supersede.add_argument("--reason", required=True)
     supersede.add_argument("--claim-id", required=True)
+
+    pull_request_check = commands.add_parser(
+        "pr-check",
+        help="check a pull request's typed work-item classification before it merges",
+    )
+    pull_request_check.add_argument("--pr", type=int, required=True, metavar="NUMBER")
 
     policy = commands.add_parser("policy", help="print the provider-neutral loader block")
     policy.add_argument("--print", action="store_true", required=True, dest="print_loader")
@@ -622,7 +639,10 @@ def _claim_json(
 
 
 def _release_json(
-    released: protocol.ActiveClaim, agent: str, role: str | None, reason: str | None
+    released: protocol.ActiveClaim,
+    agent: str,
+    role: str | None,
+    outcome: protocol.ReleaseOutcome,
 ) -> int:
     print(
         json.dumps(
@@ -632,7 +652,7 @@ def _release_json(
                 "claim_id": released.claim_id,
                 "agent": agent,
                 "role": role if role is not None else released.role,
-                "reason": reason if reason is not None else protocol.DEFAULT_RELEASE_REASON,
+                "reason": outcome.reason,
             }
         )
     )
@@ -686,6 +706,7 @@ def _board(
         *pull_requests,
         claims,
         board.load_config(toplevel / ".agent-claim" / "board.toml"),
+        repository=client.repository,
         blocker_references=blocker_references.result(),
         now=now,
         trunk_landings=checkout.trunk_landing_times(),
@@ -749,12 +770,24 @@ def _ruling_pull_hint(item: board.BoardItem) -> str | None:
     )
 
 
-def _next_json(item: board.BoardItem | None, skipped: tuple[board.BoardItem, ...]) -> int:
+def _next_json(
+    item: board.BoardItem | None,
+    skipped: tuple[board.BoardItem, ...],
+    recovery: tuple[board.BoardItem, ...],
+) -> int:
     payload: dict[str, object] = {
+        "recovery": [
+            {
+                "number": recovery_item.number,
+                "title": recovery_item.title,
+                "step": board.RECOVERY_STEP,
+            }
+            for recovery_item in recovery
+        ],
         "skipped": [
             {"number": skipped_item.number, "reason": skipped_item.actionable_reason}
             for skipped_item in skipped
-        ]
+        ],
     }
     if item is not None:
         payload.update(
@@ -774,13 +807,24 @@ def _next_json(item: board.BoardItem | None, skipped: tuple[board.BoardItem, ...
     return 0
 
 
-def _next(item: board.BoardItem | None, skipped: tuple[board.BoardItem, ...]) -> int:
-    lines = (
-        [f"#{item.number} score {item.score}: {item.title}", f"Next: {item.next_step}"]
-        if item is not None
-        else ["No actionable item."]
-    )
-    if item is not None:
+def _next(
+    item: board.BoardItem | None,
+    skipped: tuple[board.BoardItem, ...],
+    recovery: tuple[board.BoardItem, ...],
+) -> int:
+    """A landed-but-open item is named before anything new is pulled."""
+    lines: list[str] = []
+    if recovery:
+        lines.append("RECOVERY")
+        lines.extend(
+            f"#{recovery_item.number}: {board.RECOVERY_STEP}" for recovery_item in recovery
+        )
+        lines.append("")
+    if item is None:
+        lines.append("No actionable item.")
+    else:
+        lines.append(f"#{item.number} score {item.score}: {item.title}")
+        lines.append(f"Next: {item.next_step}")
         hint = _ruling_pull_hint(item)
         if hint is not None:
             lines.append(hint)
@@ -982,19 +1026,23 @@ def _slice_row_checks(
     )
 
 
-def _parent_line_checks(title: str, body: str) -> tuple[SliceCheck, ...]:
+def _parent_checks(
+    client: github.GitHubIssueComments, repository: str, issue: int, title: str
+) -> tuple[SliceCheck, ...]:
+    """Warn when a slice-shaped title names a parent GitHub does not record as one."""
     match = board.slice_title_match(title)
     if match is None:
         return ()
     slice_number, parent_issue = match
-    if parent_issue in board.parent_line_numbers(body):
+    parent = client.parent_issue(issue)
+    if parent is not None and parent.reference == board.IssueReference(repository, parent_issue):
         return ()
     return (
         SliceCheck(
             "warning",
-            "missing-parent-line",
-            f"looks like slice {slice_number} of #{parent_issue} but carries no "
-            f'"Part of #{parent_issue}" line; the parent inherits nothing',
+            "missing-parent",
+            f"looks like slice {slice_number} of #{parent_issue} but is no sub-issue "
+            f"of #{parent_issue}; the parent inherits nothing",
             slice=slice_number,
             issue=parent_issue,
         ),
@@ -1029,6 +1077,7 @@ def _body_contract_checks(
 
 
 def _slice_rule_checks(
+    client: github.GitHubIssueComments,
     repository: str,
     open_by_number: dict[int, board.Issue],
     issue: int,
@@ -1056,8 +1105,8 @@ def _slice_rule_checks(
     if body is not None:
         for entry in board.parse_slice_table(body):
             checks.extend(_slice_table_entry_checks(repository, open_by_number, entry))
-    if title is not None and body is not None:
-        checks.extend(_parent_line_checks(title, body))
+    if title is not None:
+        checks.extend(_parent_checks(client, repository, issue, title))
     return tuple(checks)
 
 
@@ -1069,6 +1118,235 @@ def _refuse_claim(json_mode: bool, issue: int | None, checks: tuple[SliceCheck, 
     for check in checks:
         print(check.render(), file=sys.stderr)
     return 2
+
+
+def _claim_defect(
+    client: github.GitHubIssueComments,
+    detail: board.PullRequestDetail,
+    identity: protocol.ClaimIdentity,
+) -> board.ClassificationDefect | None:
+    """A landing declares only what its own head branch holds a live claim on."""
+    if any(
+        claim.identity == identity and claim.branch == detail.head_ref_name
+        for claim in protocol._ledger_claims(client)
+    ):
+        return None
+    subject = (
+        f"claim for #{identity.issue}"
+        if isinstance(identity, protocol.IssueIdentity)
+        else "issue-less lane claim"
+    )
+    return board.ClassificationDefect(
+        f"has no active {subject} on branch {detail.head_ref_name!r}"
+    )
+
+
+def _no_item_defect(
+    client: github.GitHubIssueComments,
+    repository: str,
+    detail: board.PullRequestDetail,
+) -> board.ClassificationDefect | None:
+    """Why this repository does not accept an issue-less landing as declared.
+
+    A `No-Item` lane owns no issue, so it needs its own lane claim and may
+    retire nothing: a closing reference here would close an item no claim and
+    no `Work-Item:` line ever named.
+    """
+    claim_defect = _claim_defect(client, detail, protocol.LaneIdentity())
+    if claim_defect is not None:
+        return claim_defect
+    closing = board.closing_references(detail.body, repository)
+    if closing:
+        named = ", ".join(str(reference) for reference in sorted(closing, key=str))
+        return board.ClassificationDefect(
+            f"declares no work item but closes {named}; name it as the work item"
+        )
+    return None
+
+
+@dataclass(frozen=True)
+class _ParentRequirement:
+    """What an item's parent demands of the pull request that lands the item."""
+
+    reference: board.IssueReference
+    closing_required: bool
+
+
+def _parent_requirement(
+    client: github.GitHubIssueComments,
+    repository: str,
+    item: board.IssueReference,
+) -> _ParentRequirement | board.ClassificationDefect | None:
+    """The parent's demand, read from GitHub's sub-issue relation.
+
+    Closing a parent's last open child completes the parent, so that landing
+    closes the parent too. A parent keeping other open children stays open,
+    and must say what happens next.
+    """
+    parent = client.parent_issue(item.number)
+    if parent is None:
+        return None
+    if parent.reference.repository != repository:
+        return board.ClassificationDefect(
+            f"has parent {parent.reference} in another repository, "
+            "whose children this check cannot read"
+        )
+    remaining = tuple(
+        child for child in client.open_sub_issues(parent.reference.number) if child != item
+    )
+    if not remaining:
+        return _ParentRequirement(parent.reference, True)
+    if board.parse_contract(parent.body).next is None:
+        children = "child" if len(remaining) == 1 else "children"
+        return board.ClassificationDefect(
+            f"leaves parent {parent.reference} open with {len(remaining)} other open "
+            f"{children}, whose body carries no Next line"
+        )
+    return _ParentRequirement(parent.reference, False)
+
+
+def _closing_defect(
+    detail: board.PullRequestDetail,
+    repository: str,
+    item: board.IssueReference,
+    requirement: _ParentRequirement | None,
+) -> board.ClassificationDefect | None:
+    """Which issues this landing must close, and that it closes nothing else."""
+    closing = board.closing_references(detail.body, repository)
+    if item not in closing:
+        return board.ClassificationDefect(
+            f"carries no closing reference for its work item {item}"
+        )
+    completed_parent = (
+        {requirement.reference}
+        if requirement is not None and requirement.closing_required
+        else set()
+    )
+    missing_parent = completed_parent - closing
+    if missing_parent:
+        parent = next(iter(missing_parent))
+        return board.ClassificationDefect(
+            f"closes the last open child of parent {parent}; close the parent too"
+        )
+    besides = tuple(sorted(closing - {item} - completed_parent, key=str))
+    if besides:
+        named = ", ".join(str(reference) for reference in besides)
+        return board.ClassificationDefect(
+            f"closes {named} besides its work item {item}; a pull request lands one item"
+        )
+    return None
+
+
+def _work_item_defect(
+    client: github.GitHubIssueComments,
+    repository: str,
+    detail: board.PullRequestDetail,
+    item: board.IssueReference,
+) -> board.ClassificationDefect | None:
+    """Why this repository does not accept `item` as the landing pull request's work item."""
+    if item.repository != repository:
+        return board.ClassificationDefect(
+            f"names work item {item} of another repository, which holds no claim here"
+        )
+    if item.number == protocol.LEDGER_ISSUE:
+        return board.ClassificationDefect(
+            f"names the claim ledger #{protocol.LEDGER_ISSUE} as its work item"
+        )
+    claim_defect = _claim_defect(client, detail, protocol.IssueIdentity(item.number))
+    if claim_defect is not None:
+        return claim_defect
+    requirement = _parent_requirement(client, repository, item)
+    if isinstance(requirement, board.ClassificationDefect):
+        return requirement
+    return _closing_defect(detail, repository, item, requirement)
+
+
+def _checked_classification(
+    client: github.GitHubIssueComments, repository: str, detail: board.PullRequestDetail
+) -> board.Classification | board.ClassificationDefect:
+    if detail.head_repository != repository:
+        return board.ClassificationDefect(
+            f"proposes a branch of {detail.head_repository}; cross-repository pull "
+            "requests are not classified"
+        )
+    classification = board.parse_pull_request_classification(detail.body, repository)
+    if isinstance(classification, board.ClassificationDefect):
+        return classification
+    default_branch = client.default_branch()
+    if detail.base_ref_name != default_branch:
+        return board.ClassificationDefect(
+            f"targets {detail.base_ref_name!r}, not the default branch {default_branch!r}"
+        )
+    defect = (
+        _no_item_defect(client, repository, detail)
+        if isinstance(classification, board.NoItemClassification)
+        else _work_item_defect(client, repository, detail, classification.item)
+    )
+    return classification if defect is None else defect
+
+
+def _pull_request_check(
+    client: github.GitHubIssueComments, repository: str, number: int
+) -> int:
+    detail = client.pull_request_detail(number)
+    checked = _checked_classification(client, repository, detail)
+    if isinstance(checked, board.ClassificationDefect):
+        print(f"REFUSED: pull request #{detail.number} {checked.message}", file=sys.stderr)
+        return 1
+    print(f"PR #{detail.number} by {detail.author} declares {checked}")
+    return 0
+
+
+def _release_outcome(arguments: argparse.Namespace) -> protocol.ReleaseOutcome:
+    if arguments.merged is not None:
+        return protocol.MergedRelease(arguments.merged)
+    return protocol.AbandonedRelease(
+        protocol._outbound_text(arguments.abandoned, "abandoned reason", maximum=512)
+    )
+
+
+def _verify_merged_release(
+    client: github.GitHubIssueComments,
+    repository: str,
+    identity: protocol.ClaimIdentity,
+    merged: protocol.MergedRelease,
+) -> None:
+    """Refuse a `--merged` release the landing itself does not support."""
+    detail = client.pull_request_detail(merged.pull_request)
+    if not detail.merged:
+        raise protocol.ClaimUnavailable(f"pull request #{detail.number} is not merged")
+    default_branch = client.default_branch()
+    if detail.base_ref_name != default_branch:
+        raise protocol.ClaimUnavailable(
+            f"pull request #{detail.number} merged into {detail.base_ref_name!r}, "
+            f"not the default branch {default_branch!r}"
+        )
+    classification = board.parse_pull_request_classification(detail.body, repository)
+    if isinstance(classification, board.ClassificationDefect):
+        raise protocol.ClaimUnavailable(
+            f"pull request #{detail.number} {classification.message}"
+        )
+    if isinstance(identity, protocol.LaneIdentity):
+        if isinstance(classification, board.WorkItemClassification):
+            raise protocol.ClaimUnavailable(
+                f"pull request #{detail.number} names {classification.item}; "
+                "an issue-less lane needs a No-Item line"
+            )
+        return
+    item = board.IssueReference(repository, identity.issue)
+    if (
+        not isinstance(classification, board.WorkItemClassification)
+        or classification.item != item
+    ):
+        raise protocol.ClaimUnavailable(
+            f"pull request #{detail.number} names {classification}, "
+            f"not work item #{identity.issue}"
+        )
+    reference = _fetch_issue_reference(repository, identity.issue)
+    if reference.state is not ReferenceState.CLOSED:
+        raise protocol.ClaimUnavailable(
+            f"work item #{identity.issue} is {reference.state.value}, not closed"
+        )
 
 
 MUTATING_HOOK_TOOLS = frozenset({"Edit", "MultiEdit", "Write", "search_replace", "write"})
@@ -1181,7 +1459,7 @@ def main(arguments: list[str] | None = None) -> int:
         release_branch: str | None = None
         if parsed.command == "release":
             if parsed.coordinator_override:
-                protocol._require_coordinator_override(parsed.role, parsed.reason)
+                protocol._require_coordinator_override(parsed.role)
             if parsed.issue is None or parsed.claim_id is None:
                 release_branch = checkout._git_output(["branch", "--show-current"])
                 if not release_branch:
@@ -1208,6 +1486,8 @@ def main(arguments: list[str] | None = None) -> int:
                 "no agent-claim ledger exists; run agent-claim bootstrap"
             )
         protocol.configure_ledger(ledger)
+        if parsed.command == "pr-check":
+            return _pull_request_check(client, repository, parsed.pr)
         if parsed.command == "status":
             comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
             claims = protocol.active_claims(comments)
@@ -1231,14 +1511,19 @@ def main(arguments: list[str] | None = None) -> int:
             projected = _board(client, protocol.active_claims(comments))
             item = board.highest_scored_actionable(projected)
             skipped = _unworkable(projected)
+            recovery = projected.recovery
             if item is None:
-                if skipped:
+                if skipped or recovery:
                     if parsed.json:
-                        _next_json(None, skipped)
+                        _next_json(None, skipped, recovery)
                     else:
-                        _next(None, skipped)
+                        _next(None, skipped, recovery)
                 return 3
-            return _next_json(item, skipped) if parsed.json else _next(item, skipped)
+            return (
+                _next_json(item, skipped, recovery)
+                if parsed.json
+                else _next(item, skipped, recovery)
+            )
         if parsed.command == "who":
             claims = protocol._ledger_claims(client)
             if parsed.json:
@@ -1318,6 +1603,7 @@ def main(arguments: list[str] | None = None) -> int:
                         client, protocol._ledger_claims(client), issues=open_issues
                     )
                     checks = _slice_rule_checks(
+                        client,
                         repository,
                         open_by_number,
                         target_issue,
@@ -1369,18 +1655,21 @@ def main(arguments: list[str] | None = None) -> int:
             return 0
         if parsed.command == "release":
             identity = _resolved_identity(parsed.issue, release_branch or "")
+            outcome = _release_outcome(parsed)
+            if isinstance(outcome, protocol.MergedRelease):
+                _verify_merged_release(client, repository, identity, outcome)
             released = protocol.release_claim(
                 client,
                 identity,
                 parsed.agent,
                 parsed.role,
-                parsed.reason,
+                outcome,
                 parsed.claim_id,
                 branch=release_branch,
                 coordinator_override=parsed.coordinator_override,
             )
             if parsed.json:
-                return _release_json(released, parsed.agent, parsed.role, parsed.reason)
+                return _release_json(released, parsed.agent, parsed.role, outcome)
             print(f"RELEASED {_claim_subject(released)}: {released.claim_id}")
             return 0
         if parsed.command == "supersede":

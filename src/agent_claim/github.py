@@ -64,7 +64,7 @@ GH_QUIET_ENVIRONMENT = {
     "NO_COLOR": "1",
     "GH_NO_UPDATE_NOTIFIER": "1",
 }
-API_BLOCKER_STATES: dict[str, board.BlockerState] = {
+API_ISSUE_STATES: dict[str, board.BlockerState] = {
     "open": board.BlockerState.OPEN,
     "closed": board.BlockerState.CLOSED,
 }
@@ -74,6 +74,21 @@ def github_command_environment() -> dict[str, str]:
     environment = os.environ.copy()
     environment.update(GH_QUIET_ENVIRONMENT)
     return environment
+
+
+def _head_repository(pull_request: dict[str, object]) -> str | None:
+    """`OWNER/REPOSITORY` of the branch a pull request proposes, or None when
+    GitHub does not name both halves — a fork deleted after the pull request
+    opened, say.
+    """
+    repository = pull_request.get("headRepository")
+    owner = pull_request.get("headRepositoryOwner")
+    name = repository.get("name") if isinstance(repository, dict) else None
+    login = owner.get("login") if isinstance(owner, dict) else None
+    if not isinstance(name, str) or not isinstance(login, str):
+        return None
+    full_name = f"{login}/{name}"
+    return full_name if REPOSITORY_PATTERN.fullmatch(full_name) else None
 
 
 def strip_ansi(text: str) -> str:
@@ -404,6 +419,151 @@ class GitHubIssueComments:
             raise ClaimError("GitHub returned a malformed board pull request")
         return board.PullRequest(number, title, body, head_ref_name, merged_at)
 
+    def _pull_request_detail(self, value: object) -> board.PullRequestDetail:
+        if not isinstance(value, dict):
+            raise ClaimError("GitHub returned a malformed pull request")
+        number = value.get("number")
+        body = value.get("body")
+        if body is None:
+            body = ""
+        base_ref_name = value.get("baseRefName")
+        head_ref_name = value.get("headRefName")
+        head_repository = _head_repository(value)
+        author = value.get("author")
+        login = author.get("login") if isinstance(author, dict) else None
+        merged_at = value.get("mergedAt")
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, int)
+            or number < 1
+            or not isinstance(body, str)
+            or not isinstance(base_ref_name, str)
+            or not isinstance(head_ref_name, str)
+            or head_repository is None
+            or not isinstance(login, str)
+            or not login
+            or (merged_at is not None and not isinstance(merged_at, str))
+            or (isinstance(merged_at, str) and TIMESTAMP_PATTERN.fullmatch(merged_at) is None)
+        ):
+            raise ClaimError("GitHub returned a malformed pull request")
+        return board.PullRequestDetail(
+            number,
+            body,
+            base_ref_name,
+            head_ref_name,
+            head_repository,
+            login,
+            merged_at is not None,
+        )
+
+    def pull_request_detail(self, number: int) -> board.PullRequestDetail:
+        raw = self._run(
+            [
+                "pr",
+                "view",
+                str(number),
+                "--repo",
+                self.repository,
+                "--json",
+                "number,body,baseRefName,headRefName,headRepository,"
+                "headRepositoryOwner,author,mergedAt",
+                "--jq",
+                ".",
+            ]
+        )
+        values = self._json_lines(raw, "pull request")
+        if len(values) != 1:
+            raise ClaimError("GitHub returned a malformed pull request")
+        detail = self._pull_request_detail(values[0])
+        if detail.number != number:
+            raise ClaimError(
+                f"GitHub answered for pull request #{detail.number}, not #{number}"
+            )
+        return detail
+
+    def _issue_reference(self, value: object, description: str) -> board.IssueReference:
+        if not isinstance(value, dict):
+            raise ClaimError(f"GitHub returned a malformed {description}")
+        number = value.get("number")
+        repository_url = value.get("repository")
+        repository = (
+            repository_url.rpartition("/repos/")[2] if isinstance(repository_url, str) else None
+        )
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, int)
+            or number < 1
+            or repository is None
+            or REPOSITORY_PATTERN.fullmatch(repository) is None
+        ):
+            raise ClaimError(f"GitHub returned a malformed {description}")
+        return board.IssueReference(repository, number)
+
+    def _issue_state(self, value: object, description: str) -> board.BlockerState:
+        state = value.get("state") if isinstance(value, dict) else None
+        parsed = API_ISSUE_STATES.get(state) if isinstance(state, str) else None
+        if parsed is None:
+            raise ClaimError(f"GitHub returned a malformed {description}")
+        return parsed
+
+    def parent_issue(self, number: int) -> board.ParentIssue | None:
+        """The issue GitHub records as `number`'s parent, or None when it has none."""
+        try:
+            raw = self._run(
+                [
+                    "api",
+                    f"repos/{self.repository}/issues/{number}/parent",
+                    "--jq",
+                    '{number,repository:.repository_url,body:(.body // "")}',
+                ]
+            )
+        except ClaimError as error:
+            # The sub-issue endpoint answers "no parent" with an HTTP 404, which
+            # `gh api` reports in its combined output; that is an answer, not a
+            # failure.
+            if "HTTP 404" in str(error):
+                return None
+            raise
+        values = self._json_lines(raw, "parent issue")
+        if len(values) != 1 or not isinstance(values[0], dict):
+            raise ClaimError("GitHub returned a malformed parent issue")
+        body = values[0].get("body")
+        if not isinstance(body, str):
+            raise ClaimError("GitHub returned a malformed parent issue")
+        return board.ParentIssue(self._issue_reference(values[0], "parent issue"), body)
+
+    def open_sub_issues(self, number: int) -> tuple[board.IssueReference, ...]:
+        """The parent's children GitHub still holds open.
+
+        Every child's state is read here rather than filtered by `--jq`: a
+        state this adapter does not understand would otherwise vanish and make
+        a parent look childless, which is exactly the landing this check must
+        refuse.
+        """
+        raw = self._run(
+            [
+                "api",
+                "--paginate",
+                f"repos/{self.repository}/issues/{number}/sub_issues?per_page=100",
+                "--jq",
+                ".[] | {number,repository:.repository_url,state}",
+            ]
+        )
+        children: list[board.IssueReference] = []
+        for value in self._json_lines(raw, "sub-issue"):
+            reference = self._issue_reference(value, "sub-issue")
+            if self._issue_state(value, "sub-issue") is board.BlockerState.OPEN:
+                children.append(reference)
+        return tuple(children)
+
+    def default_branch(self) -> str:
+        branch = self._run(
+            ["api", f"repos/{self.repository}", "--jq", ".default_branch"]
+        )
+        if protocol.BRANCH_PATTERN.fullmatch(branch) is None:
+            raise ClaimError("GitHub returned a malformed default branch")
+        return branch
+
     def _open_issue_page(self, page: int) -> tuple[object, ...]:
         raw = self._run(
             [
@@ -454,7 +614,7 @@ class GitHubIssueComments:
         state = value.get("state")
         closed_at = value.get("closedAt")
         is_pull_request = value.get("isPullRequest")
-        blocker_state = API_BLOCKER_STATES.get(state) if isinstance(state, str) else None
+        blocker_state = API_ISSUE_STATES.get(state) if isinstance(state, str) else None
         if (
             isinstance(returned_number, bool)
             or returned_number != number

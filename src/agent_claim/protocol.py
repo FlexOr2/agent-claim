@@ -37,7 +37,6 @@ MAX_PROTOCOL_BYTES = 8 * 1024 * 1024
 MAX_COMMENT_BYTES = 48 * 1024
 MAX_SCOPE_ENTRIES = 256
 MAX_SCOPE_PATH_LENGTH = 512
-DEFAULT_RELEASE_REASON = "landed"
 
 
 class ClaimError(RuntimeError):
@@ -201,6 +200,31 @@ class LedgerSuperseded(ClaimError):
             f"claim ledger #{LEDGER_ISSUE} is frozen; update and use "
             f"successor #{successor_issue}"
         )
+
+
+@dataclass(frozen=True)
+class MergedRelease:
+    """A claim released because the named pull request landed on the default branch."""
+
+    pull_request: int
+
+    @property
+    def reason(self) -> str:
+        return f"merged #{self.pull_request}"
+
+
+@dataclass(frozen=True)
+class AbandonedRelease:
+    """A claim released without a landing, and why."""
+
+    explanation: str
+
+    @property
+    def reason(self) -> str:
+        return f"abandoned: {self.explanation}"
+
+
+ReleaseOutcome = MergedRelease | AbandonedRelease
 
 
 @dataclass(frozen=True)
@@ -1841,11 +1865,9 @@ def rescope_claim(
     return own
 
 
-def _require_coordinator_override(role: str | None, reason: str | None) -> None:
+def _require_coordinator_override(role: str | None) -> None:
     if role != "coordinator":
         raise ClaimUnavailable("a coordinator override requires --role coordinator")
-    if reason is None:
-        raise ClaimUnavailable("a coordinator override requires --reason")
 
 
 def _claims_for_identity(
@@ -1882,14 +1904,14 @@ def release_claim(
     identity: ClaimIdentity,
     agent: str,
     role: str | None,
-    reason: str | None,
+    outcome: ReleaseOutcome,
     claim_id: str | None,
     *,
     branch: str | None = None,
     coordinator_override: bool = False,
 ) -> ActiveClaim:
     if coordinator_override:
-        _require_coordinator_override(role, reason)
+        _require_coordinator_override(role)
     standing = _claims_for_identity(_ledger_claims(client), identity, branch)
     if not standing:
         raise ClaimUnavailable(
@@ -1928,23 +1950,20 @@ def release_claim(
         raise ClaimUnavailable(
             "only the original claimant may release; use an explicit coordinator override"
         )
-    if reason is None:
-        reason = DEFAULT_RELEASE_REASON
-
     ledger_url = client.post_comment(
         LEDGER_ISSUE,
         release_comment(
             selected,
             agent,
             role,
-            reason,
+            outcome.reason,
             coordinator_override=coordinator_override,
         ),
     )
     _reconcile_identity(
         client,
         identity,
-        unclaimed_body=_unclaimed_projection(ledger_url, reason),
+        unclaimed_body=_unclaimed_projection(ledger_url, outcome.reason),
     )
     return selected
 

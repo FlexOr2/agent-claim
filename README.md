@@ -7,14 +7,14 @@ Codex, Claude, Grok, people, and future agents use the same contract.
 ## Install and maintain
 
 ```bash
-uv tool install git+https://github.com/FlexOr2/agent-claim.git@v0.8.0
-# or: pipx install git+https://github.com/FlexOr2/agent-claim.git@v0.8.0
+uv tool install git+https://github.com/FlexOr2/agent-claim.git@v0.9.0
+# or: pipx install git+https://github.com/FlexOr2/agent-claim.git@v0.9.0
 uv tool upgrade agent-claim
 uv tool uninstall agent-claim
 ```
 
 To roll back, force-install the previous tag with `uv tool install --force
-git+https://github.com/FlexOr2/agent-claim.git@v0.6.0`.
+git+https://github.com/FlexOr2/agent-claim.git@v0.8.0`.
 
 ## Five-command quick start
 
@@ -22,7 +22,7 @@ git+https://github.com/FlexOr2/agent-claim.git@v0.6.0`.
 agent-claim bootstrap
 agent-claim status
 agent-claim claim 42 --agent "Ada" --scope src/widget.py
-agent-claim release 42
+agent-claim release 42 --merged 57
 agent-claim reconcile
 ```
 
@@ -40,11 +40,17 @@ Omitted `--claim-id` on `release` selects the unique active claim on that issue
 or lane whose agent is this session and whose branch is the current checkout;
 otherwise it fails closed.
 Omitted `--role` on `release` uses that selected claim's role; an explicit
-`--role` must still match unless `--coordinator-override`. Omitted `--reason` on
-`release` is `landed`. `--coordinator-override` still requires `--role coordinator` and
-`--reason`. `supersede` still requires `--agent` and `--role`. A `--claim-id` already
-present on the ledger, active or released, is refused before anything is posted;
-release the old claim and pass a fresh `--claim-id` instead.
+`--role` must still match unless `--coordinator-override`, which still requires
+`--role coordinator`. `release` takes exactly one outcome, never a free-form
+reason: `--merged <pull request>` or `--abandoned "<reason>"`. `--merged` is
+verified against GitHub before anything is posted — the pull request must be
+merged into the default branch, its `Work-Item:` line must name this claim's
+item (or it must carry `No-Item:` for an issue-less lane), and that item must be
+closed; otherwise the release is refused, naming what is missing. The ledger
+records `merged #<n>` or `abandoned: <reason>`. `supersede` still requires
+`--agent` and `--role`. A `--claim-id` already present on the ledger, active or
+released, is refused before anything is posted; release the old claim and pass a
+fresh `--claim-id` instead.
 `rescope <issue> --add <path> [--drop <path>]` changes a live claim's scope
 without releasing it: the claim id and base stay, added paths are advisory
 like `claim`, `--add` of a directory or a combined share above a quarter uses
@@ -101,6 +107,41 @@ A duplicate still active under two different agents is a real ownership
 conflict; `reconcile` reports it and leaves the whole ledger untouched — for
 every duplicated id, not just the conflicting one — instead of picking a winner.
 
+## Landing classification
+
+`agent-claim pr-check --pr <n>` reads one pull request of the current
+checkout's repository (or `--repo OWNER/REPOSITORY`) and answers one question:
+which item does this landing close? It prints `PR #<n> by <author> declares
+<classification>` and exits 0, or prints one `REFUSED: pull request #<n> ...`
+line and exits 1. Run it as a required check on every pull request that targets
+the default branch.
+
+A pull request body carries exactly one classification line:
+
+- `Work-Item: OWNER/REPO#n` (or `Work-Item: #n` for this repository) together
+  with a closing reference for that same item — `Closes #n`, or any other
+  keyword GitHub itself closes on, optionally qualified as `OWNER/REPO#n`; or
+- `No-Item: docs` or `No-Item: fix` for a lane that owns no issue.
+
+`pr-check` refuses a body with no classification line, with more than one, or
+naming two work items (split the pull request); a work item that is the claim
+ledger issue or lives in another repository; a work item with no active claim
+on the pull request's head branch; a closing reference naming anything but the
+work item; a `No-Item` pull request without an active issue-less lane claim on
+that head branch, or carrying any closing reference at all; a pull request
+whose head branch lives in another repository; and a pull request that does not
+target the default branch. A classification line inside a fenced code block is
+documentation, never a declaration. `Advances #n` is read nowhere: a dispatched
+slice is its own item, and its pull request closes it.
+
+Parentage is GitHub's own sub-issue relation, not a line in a body. `pr-check`
+reads the work item's recorded parent and that parent's open sub-issues: a
+landing that closes the parent's last open child must close the parent too,
+while a parent that keeps other open children must stay open and carry a `Next`
+line in its body. A parent recorded in another repository is refused by name,
+never skipped silently. `claim` warns when a slice-shaped title such as
+`Schema (#79 Scheibe 21)` names a parent that GitHub does not record as one.
+
 ## Read-only board projection
 
 `agent-claim board` reads the open issues, open PRs, PRs merged since the
@@ -143,6 +184,12 @@ issue blocker has closed, using the latest such UTC closing date and whole days
 since then; it otherwise shows `-`. Every item in `board --json` carries the
 same values as `freed_on` (`YYYY-MM-DD` or `null`) and `freed_days` (a
 nonnegative integer or `null`).
+
+`board` ends with a `RECOVERY (close or re-project)` section, and `next` names
+those items first with that step: open issues that a merged pull request already
+declared as its `Work-Item:` — the landing happened, the bookkeeping did not. It
+is keyed on that typed line, never on an issue's update time, and never names
+the ledger issue. `next --json` carries the same items under `recovery`.
 
 `agent-claim rulings` lists only open board items with open expectation lines
 as `#NUMBER OPEN/TOTAL: TITLE`; `rulings --json` returns the same `number`,
@@ -199,7 +246,7 @@ silent, unlabeled claim:
 git worktree add ../repo-worktrees/docs-tidy-readme -b docs/tidy-readme
 cd ../repo-worktrees/docs-tidy-readme
 agent-claim claim --agent "Ada" --scope README.md
-agent-claim release
+agent-claim release --merged 58
 ```
 
 Like an issue claim, a lane claim must begin from a clean linked worktree
@@ -218,7 +265,7 @@ coordinator override — always runs from a checkout of that same lane branch.
 If the original worktree is gone or held by another session, re-create a
 worktree on that branch (`git worktree add <path> <lane-branch>`) and run
 `agent-claim release --claim-id <id> --coordinator-override --role coordinator
---reason "..."` from inside it, where `<id>` comes from `agent-claim status`
+--abandoned "..."` from inside it, where `<id>` comes from `agent-claim status`
 (omitting `--claim-id` still filters by the releasing agent, coordinator
 override or not, so a foreign stuck claim needs the id).
 
