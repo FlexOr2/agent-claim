@@ -2272,7 +2272,8 @@ def test_board_reports_each_item_actionability_reason(
     )
     item = next(item for item in projected.items if item.number == issue.number)
 
-    assert (item.actionable, item.actionable_reason) == expected
+    actual = (item.actionable, item.actionable_reason)
+    assert actual == expected
 
 
 def test_board_collects_every_open_blocker_from_issue_list() -> None:
