@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -11,7 +12,7 @@ import sys
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from typing import TypeVar
 
 from . import board, protocol
@@ -22,7 +23,7 @@ from .protocol import (
     REPOSITORY_PATTERN,
     TRUSTED_ASSOCIATIONS,
     ClaimError,
-    ClaimUnavailable,
+    ClaimUnavailableError,
     IssueComment,
     _projection_ledger,
     _projection_marker,
@@ -117,10 +118,8 @@ def _close_process_streams(process: subprocess.Popen[bytes]) -> None:
     for stream in (process.stdin, process.stdout, process.stderr):
         if stream is None or stream.closed:
             continue
-        try:
+        with contextlib.suppress(OSError, ValueError):
             stream.close()
-        except (OSError, ValueError):
-            pass
 
 
 def _bounded_command(command: list[str], *, purpose: str, input_data: bytes | None = None) -> str:
@@ -622,12 +621,12 @@ class GitHubIssueComments:
         parsed_closed_at = None
         if closed_at is not None:
             try:
-                parsed_closed_at = datetime.fromisoformat(closed_at.replace("Z", "+00:00"))
+                parsed_closed_at = datetime.fromisoformat(closed_at)
             except ValueError as error:
                 raise ClaimError(self.MALFORMED_BOARD_BLOCKER) from error
             if parsed_closed_at.tzinfo is None:
                 raise ClaimError(self.MALFORMED_BOARD_BLOCKER)
-            parsed_closed_at = parsed_closed_at.astimezone(timezone.utc)
+            parsed_closed_at = parsed_closed_at.astimezone(UTC)
         return board.BlockerReference(
             number,
             blocker_state,
@@ -690,8 +689,8 @@ class GitHubIssueComments:
     def list_recent_merged_board_pull_requests(
         self, since: datetime
     ) -> tuple[board.PullRequest, ...]:
-        cutoff = since.astimezone(timezone.utc)
-        days = _query_days(cutoff.date(), datetime.now(timezone.utc).date())
+        cutoff = since.astimezone(UTC)
+        days = _query_days(cutoff.date(), datetime.now(UTC).date())
         with ThreadPoolExecutor(max_workers=min(len(days), PARALLEL_FETCH_CONCURRENCY)) as pool:
             shards = list(pool.map(self._merged_pull_requests_for_day, days))
         # GitHub's search date qualifier is an exact UTC day, so slicing the
@@ -703,7 +702,9 @@ class GitHubIssueComments:
         # single query's cap instead truncated the *whole* window), so that is
         # what the residual warning below watches for.
         saturated_days = tuple(
-            day for day, shard in zip(days, shards) if len(shard) >= MAX_RECENT_MERGED_PULL_REQUESTS
+            day
+            for day, shard in zip(days, shards, strict=True)
+            if len(shard) >= MAX_RECENT_MERGED_PULL_REQUESTS
         )
         if saturated_days:
             print(
@@ -718,7 +719,7 @@ class GitHubIssueComments:
             if pull_request.merged_at is None:
                 continue
             try:
-                merged_at = datetime.fromisoformat(pull_request.merged_at.replace("Z", "+00:00"))
+                merged_at = datetime.fromisoformat(pull_request.merged_at)
             except ValueError as error:
                 raise ClaimError("GitHub returned a malformed merged board pull request") from error
             if merged_at >= cutoff:
@@ -766,7 +767,7 @@ class GitHubIssueComments:
             or comments != 0
             or successor.get("is_pull_request") is not False
         ):
-            raise ClaimUnavailable(
+            raise ClaimUnavailableError(
                 f"successor #{issue} must be an open, empty, collaborator-locked issue"
             )
 

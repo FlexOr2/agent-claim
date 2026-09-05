@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from . import github
@@ -185,12 +185,12 @@ def trunk_landing_times() -> tuple[datetime, ...]:
     times: list[datetime] = []
     for line in raw.splitlines():
         try:
-            parsed = datetime.fromisoformat(line.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(line)
         except ValueError as error:
             raise ClaimError("git returned a malformed trunk landing timestamp") from error
         if parsed.tzinfo is None:
             raise ClaimError("git returned a malformed trunk landing timestamp")
-        times.append(parsed.astimezone(timezone.utc))
+        times.append(parsed.astimezone(UTC))
     return tuple(times)
 
 

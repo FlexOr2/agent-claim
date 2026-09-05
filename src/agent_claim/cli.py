@@ -8,7 +8,7 @@ import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
@@ -22,11 +22,11 @@ MAX_COMMENT_BYTES = protocol.MAX_COMMENT_BYTES
 ActiveClaim = protocol.ActiveClaim
 ClaimError = protocol.ClaimError
 ClaimRequest = protocol.ClaimRequest
-ClaimUnavailable = protocol.ClaimUnavailable
+ClaimUnavailableError = protocol.ClaimUnavailableError
 ClaimantRelease = protocol.ClaimantRelease
-DuplicateClaimConflict = protocol.DuplicateClaimConflict
+DuplicateClaimConflictError = protocol.DuplicateClaimConflictError
 DuplicateClaimRepair = protocol.DuplicateClaimRepair
-InvalidClaimMarker = protocol.InvalidClaimMarker
+InvalidClaimMarkerError = protocol.InvalidClaimMarkerError
 IssueComment = protocol.IssueComment
 IssueIdentity = protocol.IssueIdentity
 LaneIdentity = protocol.LaneIdentity
@@ -34,7 +34,7 @@ ISSUELESS_LANE_BRANCH_PREFIXES = protocol.ISSUELESS_LANE_BRANCH_PREFIXES
 LEDGER_BODY_MARKER = protocol.LEDGER_BODY_MARKER
 LEDGER_LABEL = protocol.LEDGER_LABEL
 LedgerSupersede = protocol.LedgerSupersede
-LedgerSuperseded = protocol.LedgerSuperseded
+LedgerSupersededError = protocol.LedgerSupersededError
 PROJECTION_MARKER_PATTERN = protocol.PROJECTION_MARKER_PATTERN
 _active_projection = protocol._active_projection
 _git_output = checkout._git_output
@@ -196,10 +196,7 @@ def _claim_cost_line(n: int, total: int, touches: tuple[protocol.ActiveClaim, ..
 
 def _request(arguments: argparse.Namespace) -> protocol.ClaimRequest:
     agent = checkout._resolved_agent(arguments.agent)
-    if arguments.base is None:
-        base = checkout._git_output(["rev-parse", "HEAD"])
-    else:
-        base = arguments.base
+    base = checkout._git_output(["rev-parse", "HEAD"]) if arguments.base is None else arguments.base
     if arguments.branch is None:
         branch = checkout._git_output(["branch", "--show-current"])
     else:
@@ -463,7 +460,7 @@ def _status(
     issue: int | None,
     now: datetime | None = None,
 ) -> int:
-    observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    observed_at = (now or datetime.now(UTC)).astimezone(UTC)
     related, index = _status_claims(claims, issue)
     if not related:
         subject = "repository" if issue is None else f"issue #{issue}"
@@ -493,7 +490,7 @@ def _status_json(
     ledger: int,
     now: datetime | None = None,
 ) -> int:
-    observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    observed_at = (now or datetime.now(UTC)).astimezone(UTC)
     related, index = _status_claims(claims, issue)
     if not related:
         state = "UNCLAIMED"
@@ -591,12 +588,20 @@ def _rescope_json(claimed: protocol.ActiveClaim) -> int:
     return 0
 
 
+@dataclass(frozen=True)
+class ScopeVersioning:
+    """How much of the claimed scope's Git history the checkout already has,
+    for the `--json` claim payload's `versioned_files`/`share` fields."""
+
+    versioned_files: int
+    versioned_files_total: int
+    share: float
+
+
 def _claim_json(
     claimed: protocol.ActiveClaim,
     *,
-    versioned_files: int,
-    versioned_files_total: int,
-    share: float,
+    versioning: ScopeVersioning,
     touches: tuple[protocol.ActiveClaim, ...],
     checks: tuple[SliceCheck, ...],
 ) -> int:
@@ -612,9 +617,9 @@ def _claim_json(
                 "branch": claimed.branch,
                 "scope": list(claimed.scope),
                 **_resource_fields(claimed),
-                "versioned_files": versioned_files,
-                "versioned_files_total": versioned_files_total,
-                "share": share,
+                "versioned_files": versioning.versioned_files,
+                "versioned_files_total": versioning.versioned_files_total,
+                "share": versioning.share,
                 "touches": [_touch_json(claim) for claim in touches],
                 "checks": [check.as_json() for check in checks],
             }
@@ -670,7 +675,7 @@ def _board(
     *,
     issues: tuple[board.Issue, ...] | None = None,
 ) -> board.Board:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     toplevel = Path(checkout._git_output(["rev-parse", "--show-toplevel"]))
     if issues is None:
         issues = client.list_open_board_issues()
@@ -1040,10 +1045,19 @@ def _body_contract_checks(
     return tuple(checks)
 
 
+@dataclass(frozen=True)
+class BoardReferenceLookup:
+    """The board client, its repository, and the currently open issues it can
+    resolve `#reference`s against — what every cross-issue slice/parent check
+    below needs to look a referenced issue up."""
+
+    client: github.GitHubIssueComments
+    repository: str
+    open_by_number: dict[int, board.Issue]
+
+
 def _slice_rule_checks(
-    client: github.GitHubIssueComments,
-    repository: str,
-    open_by_number: dict[int, board.Issue],
+    lookup: BoardReferenceLookup,
     issue: int,
     projected: board.Board,
     out_of_order_reason: str | None,
@@ -1052,7 +1066,7 @@ def _slice_rule_checks(
     out_of_order = _out_of_order_check(projected, issue, out_of_order_reason)
     if out_of_order is not None:
         checks.append(out_of_order)
-    state, title, body = _issue_reference_state(client, open_by_number, issue)
+    state, title, body = _issue_reference_state(lookup.client, lookup.open_by_number, issue)
     if state is ReferenceState.CLOSED:
         checks.append(SliceCheck("error", "closed-issue", f"issue #{issue} is closed", issue=issue))
     elif state is ReferenceState.MISSING:
@@ -1064,11 +1078,11 @@ def _slice_rule_checks(
         checks.extend(_body_contract_checks(item.contract, projected.blocker_references))
     if body is not None:
         for entry in board.parse_slice_table(body):
-            table_check = _slice_table_entry_checks(client, open_by_number, entry)
+            table_check = _slice_table_entry_checks(lookup.client, lookup.open_by_number, entry)
             if table_check is not None:
                 checks.append(table_check)
     if title is not None:
-        parent_check = _parent_checks(client, repository, issue, title)
+        parent_check = _parent_checks(lookup.client, lookup.repository, issue, title)
         if parent_check is not None:
             checks.append(parent_check)
     return tuple(checks)
@@ -1272,31 +1286,33 @@ def _verify_merged_release(
     """Refuse a `--merged` release the landing itself does not support."""
     detail = client.pull_request_detail(merged.pull_request)
     if not detail.merged:
-        raise protocol.ClaimUnavailable(f"pull request #{detail.number} is not merged")
+        raise protocol.ClaimUnavailableError(f"pull request #{detail.number} is not merged")
     default_branch = client.default_branch()
     if detail.base_ref_name != default_branch:
-        raise protocol.ClaimUnavailable(
+        raise protocol.ClaimUnavailableError(
             f"pull request #{detail.number} merged into {detail.base_ref_name!r}, "
             f"not the default branch {default_branch!r}"
         )
     classification = board.parse_pull_request_classification(detail.body, repository)
     if isinstance(classification, board.ClassificationDefect):
-        raise protocol.ClaimUnavailable(f"pull request #{detail.number} {classification.message}")
+        raise protocol.ClaimUnavailableError(
+            f"pull request #{detail.number} {classification.message}"
+        )
     if isinstance(identity, protocol.LaneIdentity):
         if isinstance(classification, board.WorkItemClassification):
-            raise protocol.ClaimUnavailable(
+            raise protocol.ClaimUnavailableError(
                 f"pull request #{detail.number} names {classification.item}; "
                 "an issue-less lane needs a No-Item line"
             )
         return
     item = board.IssueReference(repository, identity.issue)
     if not isinstance(classification, board.WorkItemClassification) or classification.item != item:
-        raise protocol.ClaimUnavailable(
+        raise protocol.ClaimUnavailableError(
             f"pull request #{detail.number} names {classification}, not work item #{identity.issue}"
         )
     reference = _fetch_issue_reference(client, identity.issue)
     if reference.state is not ReferenceState.CLOSED:
-        raise protocol.ClaimUnavailable(
+        raise protocol.ClaimUnavailableError(
             f"work item #{identity.issue} is {reference.state.value}, not closed"
         )
 
@@ -1345,7 +1361,7 @@ def _protect_relative_path(raw_path: str) -> str | None:
     try:
         relative = candidate.resolve().relative_to(toplevel).as_posix()
         return protocol._valid_scope([relative])[0]
-    except (protocol.InvalidClaimMarker, OSError, ValueError):
+    except (protocol.InvalidClaimMarkerError, OSError, ValueError):
         return None
 
 
@@ -1423,12 +1439,12 @@ def main(arguments: list[str] | None = None) -> int:
                 release_branch = checkout._git_output(["branch", "--show-current"])
                 if not release_branch:
                     if parsed.issue is None:
-                        raise protocol.ClaimUnavailable(
+                        raise protocol.ClaimUnavailableError(
                             "lane release requires a non-empty current branch; "
                             "check out the docs/ or fix/ lane branch, or pass "
                             "an issue number"
                         )
-                    raise protocol.ClaimUnavailable(
+                    raise protocol.ClaimUnavailableError(
                         "release without --claim-id requires a non-empty current branch; "
                         "pass --claim-id"
                     )
@@ -1441,7 +1457,7 @@ def main(arguments: list[str] | None = None) -> int:
             return 0
         ledger = discovery.discover_ledger(client)
         if ledger is None:
-            raise protocol.ClaimUnavailable(
+            raise protocol.ClaimUnavailableError(
                 "no agent-claim ledger exists; run agent-claim bootstrap"
             )
         protocol.configure_ledger(ledger)
@@ -1452,7 +1468,7 @@ def main(arguments: list[str] | None = None) -> int:
             issue = _optional_issue_number(parsed.issue)
             comments = client.list_protocol_candidates(protocol.LEDGER_ISSUE)
             claims = protocol.active_claims(comments)
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             if parsed.json:
                 return _status_json(claims, issue, ledger, now=now)
             print(f"LEDGER #{ledger}")
@@ -1495,7 +1511,7 @@ def main(arguments: list[str] | None = None) -> int:
             issue = _optional_issue_number(parsed.issue)
             rescope_branch = checkout._git_output(["branch", "--show-current"])
             if not rescope_branch:
-                raise protocol.ClaimUnavailable(
+                raise protocol.ClaimUnavailableError(
                     "rescope requires a non-empty current branch; "
                     "check out the claim branch, or pass an issue number"
                 )
@@ -1559,9 +1575,7 @@ def main(arguments: list[str] | None = None) -> int:
                     open_by_number = {issue.number: issue for issue in open_issues}
                     projected = _board(client, protocol._ledger_claims(client), issues=open_issues)
                     checks = _slice_rule_checks(
-                        client,
-                        repository,
-                        open_by_number,
+                        BoardReferenceLookup(client, repository, open_by_number),
                         target_issue,
                         projected,
                         requested.out_of_order_reason,
@@ -1578,7 +1592,7 @@ def main(arguments: list[str] | None = None) -> int:
             # landed after the mutation was already visible on the ledger.
             try:
                 claimed, observed = protocol._acquire_claim_with_observed(client, requested)
-            except protocol.ClaimPostedReconcileFailed as error:
+            except protocol.ClaimPostedReconcileFailedError as error:
                 # The claim comment already exists and already won the
                 # ledger; a failure in the post-claim label/projection
                 # reconcile must never read as a refusal — that would leave
@@ -1600,9 +1614,7 @@ def main(arguments: list[str] | None = None) -> int:
             if parsed.json:
                 return _claim_json(
                     claimed,
-                    versioned_files=n,
-                    versioned_files_total=total,
-                    share=share,
+                    versioning=ScopeVersioning(n, total, share),
                     touches=touches,
                     checks=checks,
                 )
@@ -1651,7 +1663,7 @@ def main(arguments: list[str] | None = None) -> int:
                     f"REPAIRED claim {repair.claim_id!r}: superseded {superseded} "
                     f"-> survivor #{repair.survivor_comment_id}"
                 )
-        except protocol.LedgerSuperseded:
+        except protocol.LedgerSupersededError:
             # A frozen ledger has nothing left for duplicate repair to fix; let the
             # label reconciliation below observe the freeze and run its own cleanup.
             pass

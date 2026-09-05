@@ -6,7 +6,7 @@ import json
 import re
 import tomllib
 from dataclasses import asdict, dataclass, replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 
@@ -35,6 +35,7 @@ OPERATOR_RULING_DATE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 RULING_OLD_AFTER_LANDINGS = 10
+STALE_IDLE_DAYS = 7
 FROZEN_LINE_PATTERN = re.compile(
     r"(?m)^(?:[ \t]{0,3}>)*[ \t]{0,3}(?:\*\*Eingefroren bis:\*\*|Eingefroren bis:)"
     r"[ \t]*(?P<value>[^\r\n]*)$"
@@ -650,12 +651,10 @@ def _table_row_cells(line: str) -> tuple[str, ...] | None:
     stripped = line.strip()
     if "|" not in stripped:
         return None
-    if stripped.startswith("|"):
-        stripped = stripped[1:]
-    if stripped.endswith("|"):
-        stripped = stripped[:-1]
+    stripped = stripped.removeprefix("|")
+    stripped = stripped.removesuffix("|")
     cells = tuple(cell.strip() for cell in stripped.split("|"))
-    return cells if cells else None
+    return cells or None
 
 
 def _is_slice_table_separator(line: str) -> bool:
@@ -857,7 +856,7 @@ def frozen_trigger(body: str) -> str | None:
 
 
 def landings_since(trunk_landings: tuple[datetime, ...], ruling: date) -> int:
-    start = datetime(ruling.year, ruling.month, ruling.day, tzinfo=timezone.utc) + timedelta(days=1)
+    start = datetime(ruling.year, ruling.month, ruling.day, tzinfo=UTC) + timedelta(days=1)
     return sum(1 for moment in trunk_landings if moment >= start)
 
 
@@ -940,7 +939,7 @@ def has_cut(body: str) -> bool:
 
 
 def claim_age(created_at: str, now: datetime) -> timedelta:
-    return now.astimezone(timezone.utc) - _timestamp(created_at)
+    return now.astimezone(UTC) - _timestamp(created_at)
 
 
 def _floored_claim_minutes(age: timedelta) -> int:
@@ -958,12 +957,12 @@ def claim_is_old(age: timedelta) -> bool:
 
 def _timestamp(value: str) -> datetime:
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value)
     except ValueError as error:
         raise protocol.ClaimError("GitHub returned a malformed board timestamp") from error
     if parsed.tzinfo is None:
         raise protocol.ClaimError("GitHub returned a malformed board timestamp")
-    return parsed.astimezone(timezone.utc)
+    return parsed.astimezone(UTC)
 
 
 def _single_concrete_next(value: str | None) -> bool:
@@ -1078,7 +1077,7 @@ def build_board(
     now: datetime | None = None,
     trunk_landings: tuple[datetime, ...] = (),
 ) -> Board:
-    observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    observed_at = (now or datetime.now(UTC)).astimezone(UTC)
     contracts = {issue.number: parse_contract(issue.body) for issue in issues}
     referenced_blockers = frozenset(
         blocker for contract in contracts.values() for blocker in contract.blocker_issues
@@ -1213,7 +1212,9 @@ def build_board(
         items=ordered,
         ready_now=tuple(item for item in ordered if item.actionable),
         stale=tuple(
-            item for item in ordered if item.idle_days > 7 and item.stage is Stage.TEXT_ONLY
+            item
+            for item in ordered
+            if item.idle_days > STALE_IDLE_DAYS and item.stage is Stage.TEXT_ONLY
         ),
         recovery=tuple(
             item
@@ -1244,7 +1245,7 @@ def board_json(board: Board) -> str:
         for item in payload[group]:
             freed_on = item["freed_on"]
             item["freed_on"] = (
-                None if freed_on is None else freed_on.astimezone(timezone.utc).date().isoformat()
+                None if freed_on is None else freed_on.astimezone(UTC).date().isoformat()
             )
     return json.dumps(payload, default=lambda value: value.value)
 
@@ -1355,7 +1356,7 @@ def _claim_cell(item: BoardItem) -> str:
 def _freed_cell(item: BoardItem) -> str:
     if item.freed_on is None or item.freed_days is None:
         return "-"
-    freed_date = item.freed_on.astimezone(timezone.utc).date().isoformat()
+    freed_date = item.freed_on.astimezone(UTC).date().isoformat()
     return f"{freed_date} ({item.freed_days} d)"
 
 

@@ -2,33 +2,34 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from agent_claim import __version__, board, checkout, discovery, github, protocol
 from agent_claim import cli as issue_claim
-from agent_claim.cli import (  # noqa: E402
+from agent_claim.cli import (
     MAX_COMMENT_BYTES,
     ActiveClaim,
     ClaimantRelease,
     ClaimError,
     ClaimRequest,
-    ClaimUnavailable,
-    DuplicateClaimConflict,
+    ClaimUnavailableError,
+    DuplicateClaimConflictError,
     DuplicateClaimRepair,
     GitHubIssueComments,
-    InvalidClaimMarker,
+    InvalidClaimMarkerError,
     IssueComment,
     IssueIdentity,
     LaneIdentity,
     LedgerSupersede,
-    LedgerSuperseded,
+    LedgerSupersededError,
     _repository,
     _status,
     acquire_claim,
@@ -125,7 +126,7 @@ def test_discovery_requires_a_locked_canonical_marker(
     assert issue_claim.discover_ledger(client) == 9
 
     unlocked, _ = ledger_client(monkeypatch, [ledger_row(2, locked=False)])
-    with pytest.raises(ClaimUnavailable, match="not locked"):
+    with pytest.raises(ClaimUnavailableError, match="not locked"):
         issue_claim.discover_ledger(unlocked)
 
 
@@ -496,7 +497,7 @@ class FakeComments:
 
     def validate_successor(self, issue: int) -> None:
         if issue not in self.valid_successors:
-            raise ClaimUnavailable(
+            raise ClaimUnavailableError(
                 f"successor #{issue} must be an open, empty, collaborator-locked issue"
             )
 
@@ -693,7 +694,7 @@ def test_board_projects_fixture_json_without_github_writes(
     class FixedDateTime(datetime):
         @classmethod
         def now(cls, tz=None):
-            return cls(2026, 8, 21, tzinfo=timezone.utc)
+            return cls(2026, 8, 21, tzinfo=UTC)
 
     monkeypatch.setattr(client, "_run", run)
     monkeypatch.setattr(github, "GitHubIssueComments", lambda repository: client)
@@ -996,11 +997,11 @@ def open_blocker_references() -> Callable[[frozenset[int]], tuple[board.BlockerR
 
 def _stub_issue_reference(
     monkeypatch: pytest.MonkeyPatch,
-    states: dict[int, tuple["issue_claim.ReferenceState", str, str]],
+    states: dict[int, tuple[issue_claim.ReferenceState, str, str]],
 ) -> None:
     """Overrides the autouse OPEN default for exactly the given issue numbers."""
 
-    def fetch(client: object, number: int) -> "issue_claim._IssueReference":
+    def fetch(client: object, number: int) -> issue_claim._IssueReference:
         state, title, body = states[number]
         return issue_claim._IssueReference(state, title, body)
 
@@ -1186,7 +1187,7 @@ def test_next_reports_expectation_state(
     assert capsys.readouterr().out == expected_output
 
     projected = projected_board(
-        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=UTC)
     )
     assert projected.items[0].expectation_state is expected_state
 
@@ -1257,7 +1258,7 @@ def test_next_pulls_an_unruled_item_and_names_only_unworkable_ones_as_skipped(
                     9,
                     board.BlockerState.CLOSED,
                     False,
-                    datetime(2026, 8, 20, tzinfo=timezone.utc),
+                    datetime(2026, 8, 20, tzinfo=UTC),
                 ),
             ),
             (),
@@ -1768,7 +1769,7 @@ def test_claim_refuses_a_closed_or_missing_target(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     tmp_path: Path,
-    state: "issue_claim.ReferenceState",
+    state: issue_claim.ReferenceState,
     check: str,
     expected_text: str,
 ) -> None:
@@ -2277,13 +2278,13 @@ def test_board_reports_each_item_actionability_reason(
                     9,
                     board.BlockerState.CLOSED,
                     False,
-                    datetime(2026, 8, 20, tzinfo=timezone.utc),
+                    datetime(2026, 8, 20, tzinfo=UTC),
                 ),
             )
             if not blocker_is_open
             else None
         ),
-        now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 21, tzinfo=UTC),
     )
     item = next(item for item in projected.items if item.number == issue.number)
 
@@ -2310,7 +2311,7 @@ def test_board_collects_every_open_blocker_from_issue_list() -> None:
         (),
         (),
         board.BoardConfig(),
-        now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 21, tzinfo=UTC),
     )
     item = next(item for item in projected.items if item.number == 10)
 
@@ -2327,7 +2328,7 @@ def test_board_treats_nichts_as_unblocked() -> None:
         (),
         (),
         board.BoardConfig(),
-        now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 21, tzinfo=UTC),
     )
 
     assert projected.items[0].open_blockers == ()
@@ -2347,7 +2348,7 @@ def test_frozen_item_leaves_actionable_and_thaws_when_the_line_is_removed() -> N
         (),
         (),
         board.BoardConfig(),
-        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 31, tzinfo=UTC),
     )
     item = projected_while_frozen.items[0]
 
@@ -2365,7 +2366,7 @@ def test_frozen_item_leaves_actionable_and_thaws_when_the_line_is_removed() -> N
         (),
         (),
         board.BoardConfig(),
-        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 31, tzinfo=UTC),
     )
     thawed_item = projected_after_thaw.items[0]
 
@@ -2390,7 +2391,7 @@ def test_frozen_item_score_stays_visible_on_the_rendered_board() -> None:
         (),
         (),
         board.BoardConfig(),
-        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 31, tzinfo=UTC),
     )
     item = projected.items[0]
     rendered = board.render(projected)
@@ -2410,7 +2411,7 @@ def test_frozen_marker_without_a_valid_form_fails_loud() -> None:
     )
 
     raised_argument_1 = board.BoardConfig()
-    raised_argument_2 = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    raised_argument_2 = datetime(2026, 8, 21, tzinfo=UTC)
     with pytest.raises(ClaimError, match="Eingefroren bis"):
         projected_board(
             (issue,),
@@ -2442,7 +2443,7 @@ def test_frozen_marker_syntax_documented_in_a_fence_is_not_a_live_marker() -> No
         (),
         (),
         board.BoardConfig(),
-        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 31, tzinfo=UTC),
     )
     item = projected.items[0]
 
@@ -2463,7 +2464,7 @@ def test_frozen_marker_outside_a_fence_still_fails_loud_when_malformed() -> None
     )
 
     raised_argument_1 = board.BoardConfig()
-    raised_argument_2 = datetime(2026, 8, 31, tzinfo=timezone.utc)
+    raised_argument_2 = datetime(2026, 8, 31, tzinfo=UTC)
     with pytest.raises(ClaimError, match="Eingefroren bis"):
         projected_board(
             (issue,),
@@ -2500,7 +2501,7 @@ def test_a_marker_swallowed_by_an_unclosed_fence_is_not_frozen() -> None:
         (),
         (),
         board.BoardConfig(),
-        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 31, tzinfo=UTC),
     )
     assert projected.items[0].actionable is True
 
@@ -2523,7 +2524,7 @@ def test_a_blockquoted_marker_still_freezes() -> None:
         (),
         (),
         board.BoardConfig(),
-        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 31, tzinfo=UTC),
     )
     assert projected.items[0].actionable is False
     assert projected.items[0].actionable_reason == "frozen: quoted real trigger"
@@ -2544,7 +2545,7 @@ def test_a_tilde_fenced_example_is_not_a_live_marker() -> None:
         (),
         (),
         board.BoardConfig(),
-        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 31, tzinfo=UTC),
     )
     assert projected.items[0].actionable is True
 
@@ -2567,7 +2568,7 @@ def test_an_info_stringed_delimiter_does_not_close_a_fence() -> None:
         (),
         (),
         board.BoardConfig(),
-        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 31, tzinfo=UTC),
     )
     assert projected.items[0].actionable is False
     assert projected.items[0].actionable_reason == "frozen: real trigger"
@@ -2591,7 +2592,7 @@ def test_an_info_stringed_middle_line_keeps_the_whole_block_one_fence() -> None:
         (),
         (),
         board.BoardConfig(),
-        now=datetime(2026, 8, 31, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 31, tzinfo=UTC),
     )
     assert projected.items[0].actionable is True
 
@@ -2785,14 +2786,14 @@ def test_board_marks_text_only_items_stale_only_after_seven_idle_days(
     issue = board.Issue(22, "Idle issue", (), "", "2026-08-01T00:00:00Z", updated_at)
 
     projected = projected_board(
-        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=UTC)
     )
 
     assert [item.number for item in projected.stale] == ([22] if expected_stale else [])
 
 
 def test_board_ranks_a_real_blocker_ahead_of_a_blocked_product_item() -> None:
-    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, tzinfo=UTC)
     blocker = board.Issue(
         20,
         "Unlabelled prerequisite",
@@ -2830,7 +2831,7 @@ def test_board_never_counts_an_open_pull_request_as_a_blocker() -> None:
         (),
         board.BoardConfig(),
         blocker_references=(pull_request,),
-        now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 21, tzinfo=UTC),
     )
 
     item = projected.items[0]
@@ -2850,7 +2851,7 @@ def test_board_never_counts_an_open_pull_request_as_a_blocker() -> None:
                     10,
                     board.BlockerState.CLOSED,
                     False,
-                    datetime(2026, 9, 1, tzinfo=timezone.utc),
+                    datetime(2026, 9, 1, tzinfo=UTC),
                 ),
                 board.BlockerReference(11, board.BlockerState.OPEN, False),
             ),
@@ -2863,16 +2864,16 @@ def test_board_never_counts_an_open_pull_request_as_a_blocker() -> None:
                     10,
                     board.BlockerState.CLOSED,
                     False,
-                    datetime(2026, 9, 1, tzinfo=timezone.utc),
+                    datetime(2026, 9, 1, tzinfo=UTC),
                 ),
                 board.BlockerReference(
                     11,
                     board.BlockerState.CLOSED,
                     False,
-                    datetime(2026, 9, 3, tzinfo=timezone.utc),
+                    datetime(2026, 9, 3, tzinfo=UTC),
                 ),
             ),
-            datetime(2026, 9, 3, tzinfo=timezone.utc),
+            datetime(2026, 9, 3, tzinfo=UTC),
             id="all-blockers-closed",
         ),
     ],
@@ -2890,7 +2891,7 @@ def test_board_records_the_latest_closed_issue_blocker(
         (),
         board.BoardConfig(),
         blocker_references=blocker_references,
-        now=datetime(2026, 9, 5, tzinfo=timezone.utc),
+        now=datetime(2026, 9, 5, tzinfo=UTC),
     )
     by_number = {item.number: item for item in projected.items}
 
@@ -2902,10 +2903,10 @@ def test_board_reports_when_the_last_stale_blocker_closed() -> None:
     dependent = board_issue(20, "Freed", complete_contract("Ship it.", blocked_by="#10, #11"))
     blockers = (
         board.BlockerReference(
-            10, board.BlockerState.CLOSED, False, datetime(2026, 9, 1, tzinfo=timezone.utc)
+            10, board.BlockerState.CLOSED, False, datetime(2026, 9, 1, tzinfo=UTC)
         ),
         board.BlockerReference(
-            11, board.BlockerState.CLOSED, False, datetime(2026, 9, 3, tzinfo=timezone.utc)
+            11, board.BlockerState.CLOSED, False, datetime(2026, 9, 3, tzinfo=UTC)
         ),
     )
 
@@ -2916,7 +2917,7 @@ def test_board_reports_when_the_last_stale_blocker_closed() -> None:
         (),
         board.BoardConfig(),
         blocker_references=blockers,
-        now=datetime(2026, 9, 5, tzinfo=timezone.utc),
+        now=datetime(2026, 9, 5, tzinfo=UTC),
     )
 
     item = json.loads(board.board_json(projected))["items"][0]
@@ -2930,7 +2931,7 @@ def test_board_text_and_json_show_freed_on_and_freed_days() -> None:
     unblocked = board_issue(22, "Never blocked", complete_contract("Ship it."))
     blockers = (
         board.BlockerReference(
-            10, board.BlockerState.CLOSED, False, datetime(2026, 9, 3, tzinfo=timezone.utc)
+            10, board.BlockerState.CLOSED, False, datetime(2026, 9, 3, tzinfo=UTC)
         ),
         board.BlockerReference(11, board.BlockerState.OPEN, False),
     )
@@ -2942,7 +2943,7 @@ def test_board_text_and_json_show_freed_on_and_freed_days() -> None:
         (),
         board.BoardConfig(),
         blocker_references=blockers,
-        now=datetime(2026, 9, 5, tzinfo=timezone.utc),
+        now=datetime(2026, 9, 5, tzinfo=UTC),
     )
 
     rendered = board.render(projected)
@@ -2968,7 +2969,7 @@ def test_board_text_and_json_show_freed_on_and_freed_days() -> None:
 
 
 def test_board_category_order_keeps_ci_ahead_of_a_high_scoring_blocker() -> None:
-    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, tzinfo=UTC)
     ci = board.Issue(30, "CI", ("ci",), "", "2026-08-20T00:00:00Z", "2026-08-20T00:00:00Z")
     blocker = board.Issue(31, "Blocker", (), "", "2026-08-20T00:00:00Z", "2026-08-20T00:00:00Z")
     dependent = board.Issue(
@@ -2995,7 +2996,7 @@ def test_board_category_order_keeps_ci_ahead_of_a_high_scoring_blocker() -> None
 
 
 def test_next_names_the_boards_top_row_even_when_it_is_not_the_highest_score() -> None:
-    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, tzinfo=UTC)
     in_flight_unlabelled = board_issue(50, "In-flight, unlabelled", complete_contract("Ship it."))
     blocker = board_issue(
         51, "Prerequisite the operator prioritized", complete_contract("Unblock #52.")
@@ -3036,7 +3037,7 @@ def _slice_pull_request_body(epic: int) -> str:
 
 
 def test_an_epic_inherits_the_landed_stage_of_a_slice_that_did_not_close_it() -> None:
-    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, tzinfo=UTC)
     epic = board_issue(
         60, "Epic cut into dispatched slices", complete_contract("Cut the next slice.")
     )
@@ -3050,7 +3051,7 @@ def test_an_epic_inherits_the_landed_stage_of_a_slice_that_did_not_close_it() ->
 
 
 def test_an_epic_is_in_flight_while_an_open_slice_touches_it_without_closing_it() -> None:
-    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, tzinfo=UTC)
     epic = board_issue(
         62, "Epic cut into dispatched slices", complete_contract("Cut the next slice.")
     )
@@ -3066,7 +3067,7 @@ def test_an_epic_is_in_flight_while_an_open_slice_touches_it_without_closing_it(
 
 
 def test_a_pull_request_merely_mentioning_the_epic_number_confers_no_stage() -> None:
-    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, tzinfo=UTC)
     epic = board_issue(
         61, "Epic untouched by this pull request", complete_contract("Cut the next slice.")
     )
@@ -3092,7 +3093,7 @@ def test_a_dedicated_reference_line_without_corroboration_confers_no_stage() -> 
     dropping this drops the false positive without dropping the two real
     landings above, which both name their epic a second time.
     """
-    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, tzinfo=UTC)
     epic = board_issue(
         63, "Epic named only once, in passing", complete_contract("Cut the next slice.")
     )
@@ -3106,7 +3107,7 @@ def test_a_dedicated_reference_line_without_corroboration_confers_no_stage() -> 
 
 
 def test_a_reference_line_inside_a_fenced_code_block_confers_no_stage() -> None:
-    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, tzinfo=UTC)
     epic = board_issue(
         64, "Epic quoted inside an example, not touched", complete_contract("Cut the next slice.")
     )
@@ -3129,7 +3130,7 @@ def test_a_fenced_closing_keyword_confers_no_stage() -> None:
     same way `_touched_without_closing` already does: a fenced example of the
     `Fixes #N` convention documents the syntax, it does not close #65.
     """
-    now = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 21, tzinfo=UTC)
     issue = board_issue(
         65, "Issue documented, never actually closed", complete_contract("Cut the next slice.")
     )
@@ -3186,7 +3187,7 @@ def test_board_queries_merged_pull_requests_back_to_the_oldest_open_issue(
 
     # A fixed 14-day window (now - 14 days = 2026-08-07) would have missed
     # anything the six-month-old epic's own slices landed months ago.
-    assert observed_since == [datetime(2026, 6, 1, tzinfo=timezone.utc)]
+    assert observed_since == [datetime(2026, 6, 1, tzinfo=UTC)]
 
 
 def test_board_loads_each_distinct_blocker_once(
@@ -3353,7 +3354,7 @@ def test_a_configured_idea_keeps_freeze_claim_and_blocker_reasons(
         (),
         active_claims,
         board.BoardConfig(idea_label="idea"),
-        now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 21, tzinfo=UTC),
     )
     item = next(item for item in projected.items if item.number == idea.number)
 
@@ -3371,7 +3372,7 @@ def test_an_idea_without_a_priority_label_follows_the_regular_score_order() -> N
         (),
         (),
         board.BoardConfig(idea_label="idea"),
-        now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 21, tzinfo=UTC),
     )
 
     assert [item.number for item in projected.items] == [regular_work.number, idea.number]
@@ -3504,7 +3505,7 @@ def test_marker_identity_discriminator_refuses_ambiguous_or_missing_keys(
     payload: dict[str, object], match: str
 ) -> None:
     raised_argument_1 = comment(1, marker(payload))
-    with pytest.raises(InvalidClaimMarker, match=match):
+    with pytest.raises(InvalidClaimMarkerError, match=match):
         parse_claim_event(raised_argument_1)
 
 
@@ -3563,7 +3564,7 @@ def test_edited_protocol_comment_fails_loud() -> None:
         edited.url,
     )
 
-    with pytest.raises(InvalidClaimMarker, match="edited after publication"):
+    with pytest.raises(InvalidClaimMarkerError, match="edited after publication"):
         parse_claim_event(edited)
 
 
@@ -3578,7 +3579,7 @@ def test_fake_neutralize_claim_comment_bumps_updated_at_like_a_real_patch() -> N
 
     edited = client.comments[LEDGER_ISSUE][0]
     assert edited.updated_at != edited.created_at
-    with pytest.raises(InvalidClaimMarker, match="edited after publication"):
+    with pytest.raises(InvalidClaimMarkerError, match="edited after publication"):
         parse_claim_event(edited)
 
 
@@ -3604,7 +3605,7 @@ def test_protocol_event_requires_exact_final_agent_attribution(
         body += f"\n\n{attribution}"
 
     raised_argument_1 = comment(1, body)
-    with pytest.raises(InvalidClaimMarker, match="exact agent attribution"):
+    with pytest.raises(InvalidClaimMarkerError, match="exact agent attribution"):
         parse_claim_event(raised_argument_1)
 
 
@@ -3728,10 +3729,10 @@ def test_invalid_branch_and_private_or_noncanonical_scope_fail_loud(
 
     raised_argument_1 = comment(1, marker(payload))
     with pytest.raises(
-        InvalidClaimMarker,
+        InvalidClaimMarkerError,
         match=(
-            "claim marker branch is not a safe Git ref|claim scope (entries must be "
-            "canonical bounded paths|must be repository-relative)"
+            r"claim marker branch is not a safe Git ref|claim scope (entries must be "
+            r"canonical bounded paths|must be repository-relative)"
         ),
     ):
         parse_claim_event(raised_argument_1)
@@ -3751,14 +3752,16 @@ def test_unknown_or_missing_marker_fields_fail_loud() -> None:
     }
 
     raised_argument_1 = comment(1, marker(unknown))
-    with pytest.raises(InvalidClaimMarker, match="upgrade the installed tool"):
+    with pytest.raises(InvalidClaimMarkerError, match="upgrade the installed tool"):
         parse_claim_event(raised_argument_1)
     raised_argument_1 = comment(2, marker({"action": "claim"}))
-    with pytest.raises(InvalidClaimMarker, match="claim marker issue must be a positive integer"):
+    with pytest.raises(
+        InvalidClaimMarkerError, match="claim marker issue must be a positive integer"
+    ):
         parse_claim_event(raised_argument_1)
     missing = {key: value for key, value in unknown.items() if key not in {"surprise", "scope"}}
     raised_argument_1 = comment(3, marker(missing))
-    with pytest.raises(InvalidClaimMarker, match="fields differ(?!.*upgrade)"):
+    with pytest.raises(InvalidClaimMarkerError, match=r"fields differ(?!.*upgrade)"):
         parse_claim_event(raised_argument_1)
 
 
@@ -3770,7 +3773,7 @@ def test_release_must_come_from_original_claimant() -> None:
 
     raised_argument_1 = comment(1, claimed_body)
     raised_argument_2 = comment(2, foreign_release)
-    with pytest.raises(InvalidClaimMarker, match="only be released by its claimant"):
+    with pytest.raises(InvalidClaimMarkerError, match="only be released by its claimant"):
         active_claims((raised_argument_1, raised_argument_2))
 
 
@@ -3793,7 +3796,7 @@ def test_coordinator_override_is_explicit_and_bound_to_claim_comment() -> None:
     payload["claim_comment_id"] = 999
     raised_argument_1 = comment(1, claimed_body)
     raised_argument_2 = comment(2, marker(payload))
-    with pytest.raises(InvalidClaimMarker, match="wrong claim comment"):
+    with pytest.raises(InvalidClaimMarkerError, match="wrong claim comment"):
         active_claims((raised_argument_1, raised_argument_2))
 
 
@@ -3809,7 +3812,7 @@ def test_active_claims_strict_reader_refuses_reused_claim_ids_and_orphan_release
     raised_argument_1 = comment(1, claimed_body)
     raised_argument_2 = comment(2, released)
     raised_argument_3 = comment(3, claimed_body)
-    with pytest.raises(InvalidClaimMarker, match="was reused"):
+    with pytest.raises(InvalidClaimMarkerError, match="was reused"):
         active_claims(
             (
                 raised_argument_1,
@@ -3818,7 +3821,7 @@ def test_active_claims_strict_reader_refuses_reused_claim_ids_and_orphan_release
             )
         )
     raised_argument_1 = comment(1, released)
-    with pytest.raises(InvalidClaimMarker, match="before it was acquired"):
+    with pytest.raises(InvalidClaimMarkerError, match="before it was acquired"):
         active_claims((raised_argument_1,))
 
 
@@ -3887,7 +3890,7 @@ def test_supersede_atomically_terminates_the_only_ledger_claim() -> None:
 
     raised_argument_1 = comment(1, claimed_body)
     raised_argument_2 = comment(2, frozen)
-    with pytest.raises(LedgerSuperseded, match="successor #170"):
+    with pytest.raises(LedgerSupersededError, match="successor #170"):
         active_claims((raised_argument_1, raised_argument_2))
     late_claim = comment(
         3,
@@ -3895,7 +3898,7 @@ def test_supersede_atomically_terminates_the_only_ledger_claim() -> None:
     )
     raised_argument_1 = comment(1, claimed_body)
     raised_argument_2 = comment(2, frozen)
-    with pytest.raises(LedgerSuperseded, match="successor #170"):
+    with pytest.raises(LedgerSupersededError, match="successor #170"):
         active_claims((raised_argument_1, raised_argument_2, late_claim))
 
 
@@ -3939,7 +3942,7 @@ def test_supersede_command_posts_terminal_event_and_observes_freeze() -> None:
     assert selected == acquired
     assert LEDGER_ISSUE not in client.labels
     raised_argument_1 = client.list_protocol_candidates(LEDGER_ISSUE)
-    with pytest.raises(LedgerSuperseded, match="successor #170"):
+    with pytest.raises(LedgerSupersededError, match="successor #170"):
         active_claims(raised_argument_1)
 
 
@@ -4006,7 +4009,7 @@ def test_supersede_refuses_an_unverified_successor_before_posting() -> None:
     acquired = acquire_claim(client, request(issue=LEDGER_ISSUE))
     protocol_count = len(client.list_protocol_candidates(LEDGER_ISSUE))
 
-    with pytest.raises(ClaimUnavailable, match="open, empty, collaborator-locked"):
+    with pytest.raises(ClaimUnavailableError, match="open, empty, collaborator-locked"):
         supersede_ledger(
             client,
             999999,
@@ -4032,7 +4035,7 @@ def test_supersede_requires_a_higher_numbered_successor() -> None:
             "coordinator",
             "invalid rollover",
         )
-    with pytest.raises(ClaimUnavailable, match="greater than the current ledger"):
+    with pytest.raises(ClaimUnavailableError, match="greater than the current ledger"):
         supersede_ledger(
             client,
             70,
@@ -4057,7 +4060,7 @@ def test_supersede_requires_a_higher_numbered_successor() -> None:
             }
         ),
     )
-    with pytest.raises(InvalidClaimMarker, match="greater than the current ledger"):
+    with pytest.raises(InvalidClaimMarkerError, match="greater than the current ledger"):
         parse_claim_event(raised_argument_1)
 
     assert len(client.list_protocol_candidates(LEDGER_ISSUE)) == protocol_count
@@ -4176,7 +4179,7 @@ def test_comma_joined_scope_refuses_empty_or_padded_entries(scope: list[str]) ->
     }
 
     raised_argument_1 = comment(1, marker(payload))
-    with pytest.raises(InvalidClaimMarker, match="canonical bounded paths"):
+    with pytest.raises(InvalidClaimMarkerError, match="canonical bounded paths"):
         parse_claim_event(raised_argument_1)
 
 
@@ -4380,7 +4383,7 @@ def test_rescope_refuses_dropping_a_path_it_does_not_hold() -> None:
     acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
 
     raised_argument_1 = IssueIdentity(72)
-    with pytest.raises(ClaimUnavailable, match="cannot drop 'docs/PRODUCT.md'"):
+    with pytest.raises(ClaimUnavailableError, match=re.escape("cannot drop 'docs/PRODUCT.md'")):
         rescope_claim(
             client,
             raised_argument_1,
@@ -4396,7 +4399,7 @@ def test_rescope_refuses_an_empty_or_unchanged_scope() -> None:
     acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
 
     raised_argument_1 = IssueIdentity(72)
-    with pytest.raises(ClaimUnavailable, match="non-empty scope"):
+    with pytest.raises(ClaimUnavailableError, match="non-empty scope"):
         rescope_claim(
             client,
             raised_argument_1,
@@ -4406,7 +4409,7 @@ def test_rescope_refuses_an_empty_or_unchanged_scope() -> None:
             "claim-a",
         )
     raised_argument_1 = IssueIdentity(72)
-    with pytest.raises(ClaimUnavailable, match="does not change"):
+    with pytest.raises(ClaimUnavailableError, match="does not change"):
         rescope_claim(
             client,
             raised_argument_1,
@@ -4422,7 +4425,7 @@ def test_rescope_refuses_a_foreign_agent() -> None:
     acquire_claim(client, request(issue=72, scope=("src/widget.py",)))
 
     raised_argument_1 = IssueIdentity(72)
-    with pytest.raises(ClaimUnavailable, match="only the original claimant"):
+    with pytest.raises(ClaimUnavailableError, match="only the original claimant"):
         rescope_claim(
             client,
             raised_argument_1,
@@ -4539,7 +4542,7 @@ def test_same_issue_refuses_a_second_claim_even_with_disjoint_scope() -> None:
     client = FakeComments({LEDGER_ISSUE: [incumbent]}, {72})
 
     raised_argument_1 = request("claim-b", "Grok 4.6", issue=72, scope=("src",))
-    with pytest.raises(ClaimUnavailable, match="issue #72"):
+    with pytest.raises(ClaimUnavailableError, match="issue #72"):
         acquire_claim(
             client,
             raised_argument_1,
@@ -4553,7 +4556,7 @@ def test_same_lane_refuses_a_second_claim_even_with_disjoint_scope() -> None:
     raised_argument_1 = request(
         "claim-b", "Grok 4.6", lane=True, branch="docs/lane-a", scope=("src",)
     )
-    with pytest.raises(ClaimUnavailable, match="lane 'docs/lane-a'"):
+    with pytest.raises(ClaimUnavailableError, match="lane 'docs/lane-a'"):
         acquire_claim(
             client,
             raised_argument_1,
@@ -4578,7 +4581,7 @@ def test_acquire_claim_refuses_reusing_an_active_claim_id_before_posting() -> No
     client = FakeComments({LEDGER_ISSUE: [incumbent]}, {72})
 
     raised_argument_1 = request("claim-a", "Codex Sol", issue=72, scope=("old", "new"))
-    with pytest.raises(ClaimUnavailable, match="claim id 'claim-a' is already"):
+    with pytest.raises(ClaimUnavailableError, match="claim id 'claim-a' is already"):
         acquire_claim(
             client,
             raised_argument_1,
@@ -4595,7 +4598,7 @@ def test_acquire_claim_refuses_reusing_a_released_claim_id_before_posting() -> N
     client = FakeComments({LEDGER_ISSUE: list(entries)})
 
     raised_argument_1 = request("claim-a", "Grok 4.6", issue=73, scope=("fresh",))
-    with pytest.raises(ClaimUnavailable, match="claim id 'claim-a' is already"):
+    with pytest.raises(ClaimUnavailableError, match="claim id 'claim-a' is already"):
         acquire_claim(
             client,
             raised_argument_1,
@@ -4612,7 +4615,7 @@ def test_acquire_claim_translates_a_same_claim_id_post_race_into_a_clear_error()
     )
 
     raised_argument_1 = request("claim-a", "Codex Sol", issue=72, scope=("mine",))
-    with pytest.raises(ClaimUnavailable, match="claim race detected"):
+    with pytest.raises(ClaimUnavailableError, match="claim race detected"):
         acquire_claim(client, raised_argument_1)
 
 
@@ -4754,7 +4757,7 @@ def test_release_refuses_foreign_actor_without_explicit_override() -> None:
     acquired = acquire_claim(client, request(issue=72))
 
     raised_argument_1 = IssueIdentity(72)
-    with pytest.raises(ClaimUnavailable, match="original claimant"):
+    with pytest.raises(ClaimUnavailableError, match="original claimant"):
         release_claim(
             client,
             raised_argument_1,
@@ -4867,7 +4870,7 @@ def test_release_claim_omitted_id_fails_closed_for_wrong_agent_branch_or_two_mat
     protocol_count = len(client.list_protocol_candidates(LEDGER_ISSUE))
 
     raised_argument_1 = IssueIdentity(72)
-    with pytest.raises(ClaimUnavailable, match="pass --claim-id") as raised:
+    with pytest.raises(ClaimUnavailableError, match="pass --claim-id") as raised:
         release_claim(client, raised_argument_1, agent, None, LANDED, None, branch=branch)
 
     assert "conflicting claims" not in str(raised.value)
@@ -4903,7 +4906,7 @@ def test_release_claim_omitted_id_requires_branch_and_does_not_call_git(
     )
 
     raised_argument_1 = IssueIdentity(72)
-    with pytest.raises(ClaimUnavailable, match="current branch"):
+    with pytest.raises(ClaimUnavailableError, match="current branch"):
         release_claim(client, raised_argument_1, "Ada", None, LANDED, None)
     assert len(client.list_protocol_candidates(LEDGER_ISSUE)) == 1
 
@@ -4917,7 +4920,7 @@ def test_release_claim_override_fails_before_ledger_without_the_coordinator_role
 ) -> None:
     client = FakeComments()
 
-    with pytest.raises(ClaimUnavailable, match="--role coordinator"):
+    with pytest.raises(ClaimUnavailableError, match="--role coordinator"):
         release_claim(
             client,
             IssueIdentity(72),
@@ -5041,7 +5044,7 @@ def test_reconcile_repairs_a_duplicate_claim_id_and_restores_strict_reads() -> N
     client = FakeComments({LEDGER_ISSUE: [comment(1, older_body), comment(2, newer_body)]})
 
     raised_argument_1 = client.list_protocol_candidates(LEDGER_ISSUE)
-    with pytest.raises(InvalidClaimMarker, match="was reused"):
+    with pytest.raises(InvalidClaimMarkerError, match="was reused"):
         active_claims(raised_argument_1)
 
     repaired = repair_duplicate_claims(client)
@@ -5091,7 +5094,7 @@ def test_repair_duplicate_claims_only_auto_resolves_the_safe_cases(
 
     if not expect_repaired:
         before = list(client.comments[LEDGER_ISSUE])
-        with pytest.raises(DuplicateClaimConflict, match="claim id 'claim-a'"):
+        with pytest.raises(DuplicateClaimConflictError, match="claim id 'claim-a'"):
             repair_duplicate_claims(client)
         assert client.comments[LEDGER_ISSUE] == before
         return
@@ -5133,7 +5136,7 @@ def test_repair_duplicate_claims_ignores_an_inert_ledger_supersede_as_a_release(
     client = FakeComments({LEDGER_ISSUE: [original, other_active_claim, inert_supersede, reused]})
     before = list(client.comments[LEDGER_ISSUE])
 
-    with pytest.raises(DuplicateClaimConflict, match="claim id 'claim-a'"):
+    with pytest.raises(DuplicateClaimConflictError, match="claim id 'claim-a'"):
         repair_duplicate_claims(client)
 
     assert client.comments[LEDGER_ISSUE] == before
@@ -5216,7 +5219,7 @@ def test_repair_duplicate_claims_validates_every_lifecycle_before_writing_any() 
     client = FakeComments({LEDGER_ISSUE: [first, middle, newest]})
     before = list(client.comments[LEDGER_ISSUE])
 
-    with pytest.raises(DuplicateClaimConflict, match="claim id 'claim-a'"):
+    with pytest.raises(DuplicateClaimConflictError, match="claim id 'claim-a'"):
         repair_duplicate_claims(client)
 
     assert client.comments[LEDGER_ISSUE] == before
@@ -5238,7 +5241,7 @@ def test_repair_duplicate_claims_leaves_other_duplicate_ids_untouched_when_one_c
     client = FakeComments({LEDGER_ISSUE: [safe_older, safe_newer, conflict_older, conflict_newer]})
     before = list(client.comments[LEDGER_ISSUE])
 
-    with pytest.raises(DuplicateClaimConflict, match="claim id 'claim-b'"):
+    with pytest.raises(DuplicateClaimConflictError, match="claim id 'claim-b'"):
         repair_duplicate_claims(client)
 
     assert client.comments[LEDGER_ISSUE] == before
@@ -5285,12 +5288,12 @@ def test_stale_reconcile_removes_label_when_supersede_wins_midflight() -> None:
         inject_during_next_add=frozen,
     )
 
-    with pytest.raises(LedgerSuperseded):
+    with pytest.raises(LedgerSupersededError):
         reconcile_issue_label(client, LEDGER_ISSUE)
 
     assert LEDGER_ISSUE not in client.labels
     raised_argument_1 = client.list_protocol_candidates(LEDGER_ISSUE)
-    with pytest.raises(LedgerSuperseded, match="successor #170"):
+    with pytest.raises(LedgerSupersededError, match="successor #170"):
         active_claims(raised_argument_1)
 
 
@@ -5311,13 +5314,13 @@ def test_old_reconcile_clears_only_its_generation_label_after_freeze() -> None:
         {claim_label(170): {170}},
     )
 
-    with pytest.raises(LedgerSuperseded):
+    with pytest.raises(LedgerSupersededError):
         reconcile_all_labels(client)
     assert client.labels == set()
     assert client.other_labels == {claim_label(170): {170}}
 
     client.labels.update({LEDGER_ISSUE, 170})
-    with pytest.raises(LedgerSuperseded):
+    with pytest.raises(LedgerSupersededError):
         reconcile_issue_label(client, 170)
     assert client.labels == {LEDGER_ISSUE}
     assert client.other_labels == {claim_label(170): {170}}
@@ -5356,7 +5359,7 @@ def test_paused_old_release_fails_frozen_without_mutating_successor_projection(
     client.labels.clear()
 
     monkeypatch.setattr(protocol, "LEDGER_ISSUE", 71)
-    with pytest.raises(LedgerSuperseded, match="successor #170"):
+    with pytest.raises(LedgerSupersededError, match="successor #170"):
         reconcile_issue_label(client, 72)
 
     assert client.comments[72][0].body == successor_projection
@@ -5469,7 +5472,7 @@ def test_github_comment_reader_fetches_pages_concurrently_until_a_short_page(
             "2026-09-03T12:00:00Z",
             False,
             board.BlockerState.CLOSED,
-            datetime(2026, 9, 3, 12, tzinfo=timezone.utc),
+            datetime(2026, 9, 3, 12, tzinfo=UTC),
             id="closed-issue",
         ),
         pytest.param(
@@ -5697,7 +5700,7 @@ def test_merged_pull_request_history_warns_when_it_reaches_the_result_cap(
     truncated query. `since` and "now" are pinned to the same day so the
     fetch is exactly one shard, matching the fixture below.
     """
-    since = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    since = datetime(2026, 8, 1, tzinfo=UTC)
 
     class FixedDateTime(datetime):
         @classmethod
@@ -5732,7 +5735,7 @@ def test_merged_pull_request_history_warns_when_it_reaches_the_result_cap(
 def test_merged_pull_request_history_below_the_cap_warns_of_nothing(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    since = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    since = datetime(2026, 8, 1, tzinfo=UTC)
 
     class FixedDateTime(datetime):
         @classmethod
@@ -5906,7 +5909,7 @@ def test_github_successor_must_exist_open_empty_locked_and_not_be_a_pr(
     ):
         invalid = {**valid, key: value}
         monkeypatch.setattr(client, "_run", lambda arguments, row=invalid: json.dumps(row))
-        with pytest.raises(ClaimUnavailable, match="open, empty, collaborator-locked"):
+        with pytest.raises(ClaimUnavailableError, match="open, empty, collaborator-locked"):
             client.validate_successor(170)
 
 
@@ -7181,7 +7184,7 @@ def test_cli_status_claim_release_and_adapter_error_exit_codes(
 class FixedDateTime(datetime):
     @classmethod
     def now(cls, tz=None):
-        return cls(2026, 8, 21, tzinfo=timezone.utc)
+        return cls(2026, 8, 21, tzinfo=UTC)
 
 
 @pytest.fixture(autouse=True)
@@ -9447,7 +9450,7 @@ def test_cli_supersede_freezes_the_drained_ledger_and_prints_the_contract_line(
     assert "not available in v0.1" not in captured.out
     assert "not available in v0.1" not in captured.err
     raised_argument_1 = client.list_protocol_candidates(LEDGER_ISSUE)
-    with pytest.raises(LedgerSuperseded, match="successor #170"):
+    with pytest.raises(LedgerSupersededError, match="successor #170"):
         active_claims(raised_argument_1)
 
 
@@ -10104,7 +10107,7 @@ def test_same_issue_still_refuses_a_second_live_claim() -> None:
     acquire_claim(client, request(issue=72, scope=("src/a.py",)))
 
     raised_argument_1 = request("claim-b", "Grok 4.6", issue=72, scope=("src/b.py",))
-    with pytest.raises(ClaimUnavailable, match="issue #72 is claimed"):
+    with pytest.raises(ClaimUnavailableError, match="issue #72 is claimed"):
         acquire_claim(client, raised_argument_1)
 
 
@@ -10161,7 +10164,7 @@ def test_resource_refuses_a_second_live_hold_of_the_same_value() -> None:
         resource="schema-hop",
         resource_value=4,
     )
-    with pytest.raises(ClaimUnavailable, match="schema-hop 4 is held by Codex Sol"):
+    with pytest.raises(ClaimUnavailableError, match="schema-hop 4 is held by Codex Sol"):
         acquire_claim(
             client,
             raised_argument_1,
@@ -10244,7 +10247,7 @@ def test_resource_race_explicit_value_still_fails_closed() -> None:
         resource="schema-hop",
         resource_value=1,
     )
-    with pytest.raises(ClaimUnavailable, match="schema-hop 1 is held by Grok 4.6"):
+    with pytest.raises(ClaimUnavailableError, match=re.escape("schema-hop 1 is held by Grok 4.6")):
         acquire_claim(
             client,
             raised_argument_1,
@@ -10663,7 +10666,7 @@ def test_ruled_expectations_without_a_date_fail_loud() -> None:
     )
 
     raised_argument_1 = board.BoardConfig()
-    raised_argument_2 = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    raised_argument_2 = datetime(2026, 8, 21, tzinfo=UTC)
     with pytest.raises(ClaimError, match="no readable date"):
         projected_board(
             (issue,),
@@ -10682,7 +10685,7 @@ def test_proposed_expectations_have_neither_fresh_nor_old() -> None:
         complete_contract("Claim #10.") + "\n\n" + expectation_block("- Name it. *(Default: yes)*"),
     )
     projected = projected_board(
-        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=UTC)
     )
 
     assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
@@ -10706,7 +10709,7 @@ def test_a_ruled_heading_rules_a_block_of_prose_lines() -> None:
         ),
     )
     projected = projected_board(
-        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=UTC)
     )
 
     assert projected.items[0].expectation_state is board.ExpectationState.RULED
@@ -10733,7 +10736,7 @@ def test_a_proposal_marker_under_a_ruled_heading_still_surfaces_as_proposed() ->
         ),
     )
     projected = projected_board(
-        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=UTC)
     )
 
     assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
@@ -10754,7 +10757,7 @@ def test_prose_without_a_ruled_heading_still_reads_as_proposed() -> None:
         ),
     )
     projected = projected_board(
-        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=UTC)
     )
 
     assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
@@ -10785,7 +10788,7 @@ def test_one_unruled_block_among_ruled_ones_keeps_the_item_proposed() -> None:
         ),
     )
     projected = projected_board(
-        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=UTC)
     )
 
     assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
@@ -10832,7 +10835,7 @@ def test_a_new_line_without_its_own_marker_stays_proposed_under_a_ruled_heading(
         ),
     )
     projected = projected_board(
-        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=UTC)
     )
 
     assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
@@ -10855,7 +10858,7 @@ def test_prose_and_a_table_row_stay_ruled_under_a_ruled_heading() -> None:
         ),
     )
     projected = projected_board(
-        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=UTC)
     )
 
     assert projected.items[0].expectation_state is board.ExpectationState.RULED
@@ -10871,7 +10874,7 @@ def test_a_ruled_heading_with_no_lines_beneath_it_reads_as_proposed() -> None:
         + expectation_block(heading="Erwartungen (GEREGELT: Operator 27.08.2026)"),
     )
     projected = projected_board(
-        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=UTC)
     )
 
     assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
@@ -10895,7 +10898,7 @@ def test_a_hyphenated_ja_nein_contradiction_is_not_ruled() -> None:
         ),
     )
     projected = projected_board(
-        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=UTC)
     )
 
     assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
@@ -10917,7 +10920,7 @@ def test_a_hyphenated_nein_ja_contradiction_is_not_ruled() -> None:
         ),
     )
     projected = projected_board(
-        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=UTC)
     )
 
     assert projected.items[0].expectation_state is board.ExpectationState.PROPOSED
@@ -10936,7 +10939,7 @@ def test_ja_with_an_owner_reference_still_rules() -> None:
         ),
     )
     projected = projected_board(
-        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=UTC)
     )
 
     assert projected.items[0].expectation_state is board.ExpectationState.RULED
@@ -10955,7 +10958,7 @@ def test_nein_with_a_reason_still_rules() -> None:
         ),
     )
     projected = projected_board(
-        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=timezone.utc)
+        (issue,), (), (), (), board.BoardConfig(), now=datetime(2026, 8, 21, tzinfo=UTC)
     )
 
     assert projected.items[0].expectation_state is board.ExpectationState.RULED
@@ -10967,14 +10970,14 @@ def test_a_ruling_is_old_after_ten_trunk_landings() -> None:
         "Ruled",
         complete_contract("Claim #10.") + "\n\n" + expectation_block("- Name it. *(geregelt: ja)*"),
     )
-    landings = tuple(datetime(2026, 8, 29, hour, tzinfo=timezone.utc) for hour in range(10))
+    landings = tuple(datetime(2026, 8, 29, hour, tzinfo=UTC) for hour in range(10))
     projected = projected_board(
         (issue,),
         (),
         (),
         (),
         board.BoardConfig(),
-        now=datetime(2026, 8, 30, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 30, tzinfo=UTC),
         trunk_landings=landings,
     )
     item = projected.items[0]
@@ -10996,8 +10999,8 @@ def test_one_trunk_landing_does_not_make_a_ruling_old() -> None:
         (),
         (),
         board.BoardConfig(),
-        now=datetime(2026, 8, 30, tzinfo=timezone.utc),
-        trunk_landings=(datetime(2026, 8, 29, tzinfo=timezone.utc),),
+        now=datetime(2026, 8, 30, tzinfo=UTC),
+        trunk_landings=(datetime(2026, 8, 29, tzinfo=UTC),),
     )
 
     assert projected.items[0].ruling_landings == 1
@@ -11016,8 +11019,8 @@ def test_same_day_trunk_landings_do_not_age_a_date_only_ruling() -> None:
         (),
         (),
         board.BoardConfig(),
-        now=datetime(2026, 8, 28, tzinfo=timezone.utc),
-        trunk_landings=(datetime(2026, 8, 28, 23, tzinfo=timezone.utc),),
+        now=datetime(2026, 8, 28, tzinfo=UTC),
+        trunk_landings=(datetime(2026, 8, 28, 23, tzinfo=UTC),),
     )
 
     assert projected.items[0].ruling_landings == 0
@@ -11036,8 +11039,8 @@ def test_operator_ruling_date_wins_over_another_heading_date() -> None:
         ),
     )
     landings = (
-        datetime(2026, 8, 15, tzinfo=timezone.utc),
-        datetime(2026, 8, 29, tzinfo=timezone.utc),
+        datetime(2026, 8, 15, tzinfo=UTC),
+        datetime(2026, 8, 29, tzinfo=UTC),
     )
     projected = projected_board(
         (issue,),
@@ -11045,7 +11048,7 @@ def test_operator_ruling_date_wins_over_another_heading_date() -> None:
         (),
         (),
         board.BoardConfig(),
-        now=datetime(2026, 8, 30, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 30, tzinfo=UTC),
         trunk_landings=landings,
     )
 
@@ -11065,7 +11068,7 @@ def test_distinct_heading_dates_without_an_operator_date_fail_loud() -> None:
     )
 
     raised_argument_1 = board.BoardConfig()
-    raised_argument_2 = datetime(2026, 8, 21, tzinfo=timezone.utc)
+    raised_argument_2 = datetime(2026, 8, 21, tzinfo=UTC)
     with pytest.raises(ClaimError, match="more than one date"):
         projected_board(
             (issue,),
@@ -11095,7 +11098,7 @@ def test_next_names_an_old_ruling_when_the_item_is_pulled(
     monkeypatch.setattr(
         checkout,
         "trunk_landing_times",
-        lambda: tuple(datetime(2026, 8, 29, hour, tzinfo=timezone.utc) for hour in range(10)),
+        lambda: tuple(datetime(2026, 8, 29, hour, tzinfo=UTC) for hour in range(10)),
     )
 
     assert issue_claim.main(["--repo", "example/agent-claim", "next"]) == 0
@@ -11133,14 +11136,14 @@ def test_each_item_carries_its_own_ruling_age() -> None:
             heading="Erwartung (refine-Lauf 01.08.2026)",
         ),
     )
-    landings = tuple(datetime(2026, 8, 10 + index, tzinfo=timezone.utc) for index in range(12))
+    landings = tuple(datetime(2026, 8, 10 + index, tzinfo=UTC) for index in range(12))
     projected = projected_board(
         (fresh, old),
         (),
         (),
         (),
         board.BoardConfig(),
-        now=datetime(2026, 8, 30, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 30, tzinfo=UTC),
         trunk_landings=landings,
     )
     by_number = {item.number: item for item in projected.items}
@@ -11186,8 +11189,8 @@ def test_trunk_landing_times_read_the_default_branch_not_the_work_branch(
     times = _LIVE_TRUNK_LANDING_TIMES()
 
     assert times == (
-        datetime(2026, 8, 29, tzinfo=timezone.utc),
-        datetime(2026, 8, 30, tzinfo=timezone.utc),
+        datetime(2026, 8, 29, tzinfo=UTC),
+        datetime(2026, 8, 30, tzinfo=UTC),
     )
     assert [
         "log",
@@ -11653,7 +11656,7 @@ def test_a_closing_reference_to_another_repository_confers_no_stage() -> None:
         (foreign,),
         (),
         board.BoardConfig(),
-        now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 21, tzinfo=UTC),
     )
 
     assert projected.items[0].stage is board.Stage.TEXT_ONLY
@@ -12044,7 +12047,7 @@ def test_board_recovers_an_open_item_a_merged_pull_request_already_landed() -> N
         (merged, ledger_pull_request),
         (),
         board.BoardConfig(),
-        now=datetime(2026, 8, 21, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 21, tzinfo=UTC),
     )
 
     assert [item.number for item in projected.recovery] == [90]

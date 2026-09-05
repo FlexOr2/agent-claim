@@ -35,17 +35,22 @@ MAX_PROTOCOL_BYTES = 8 * 1024 * 1024
 MAX_COMMENT_BYTES = 48 * 1024
 MAX_SCOPE_ENTRIES = 256
 MAX_SCOPE_PATH_LENGTH = 512
+# The first printable ASCII code point (space) and DEL bound the control
+# characters a claim marker field, scope path, or outbound text may never
+# contain -- each is meant to read as a single printable line.
+ASCII_PRINTABLE_MIN = 0x20
+ASCII_DEL = 0x7F
 
 
 class ClaimError(RuntimeError):
     pass
 
 
-class ClaimUnavailable(ClaimError):
+class ClaimUnavailableError(ClaimError):
     pass
 
 
-class InvalidClaimMarker(ClaimError):
+class InvalidClaimMarkerError(ClaimError):
     pass
 
 
@@ -176,7 +181,7 @@ class LedgerSupersede:
 ClaimEvent = ActiveClaim | ClaimantRelease | OverrideRelease | ClaimRescope | LedgerSupersede
 
 
-class DuplicateClaimConflict(ClaimError):
+class DuplicateClaimConflictError(ClaimError):
     """A duplicate claim id where reconcile refuses to pick a winner silently."""
 
     def __init__(self, claim_id: str, superseded: ActiveClaim, survivor: ActiveClaim):
@@ -190,7 +195,7 @@ class DuplicateClaimConflict(ClaimError):
         )
 
 
-class LedgerSuperseded(ClaimError):
+class LedgerSupersededError(ClaimError):
     def __init__(self, successor_issue: int, claim: ActiveClaim):
         self.successor_issue = successor_issue
         self.claim = claim
@@ -277,18 +282,26 @@ def _projection_ledger(comment: IssueComment) -> int | None:
     return int(match["ledger"]) if match is not None else None
 
 
+def _has_control_character(text: str) -> bool:
+    return any(
+        ord(character) < ASCII_PRINTABLE_MIN or ord(character) == ASCII_DEL for character in text
+    )
+
+
 def _required_text(payload: dict[str, object], key: str, *, maximum: int = 512) -> str:
     value = payload.get(key)
     if not isinstance(value, str):
-        raise InvalidClaimMarker(f"claim marker field {key!r} must be text")
+        raise InvalidClaimMarkerError(f"claim marker field {key!r} must be text")
     normalized = value.strip()
     if (
         not normalized
         or normalized != value
         or len(normalized) > maximum
-        or any(ord(character) < 32 or ord(character) == 127 for character in normalized)
+        or _has_control_character(normalized)
     ):
-        raise InvalidClaimMarker(f"claim marker field {key!r} must be one bounded non-empty line")
+        raise InvalidClaimMarkerError(
+            f"claim marker field {key!r} must be one bounded non-empty line"
+        )
     return normalized
 
 
@@ -300,7 +313,7 @@ def _outbound_text(value: object, field: str, *, maximum: int) -> str:
         not normalized
         or normalized != value
         or len(normalized) > maximum
-        or any(ord(character) < 32 or ord(character) == 127 for character in normalized)
+        or _has_control_character(normalized)
     ):
         raise ClaimError(f"{field} must be one bounded non-empty line")
     return normalized
@@ -316,7 +329,7 @@ def _outbound_resource_name(value: object) -> str:
 def _required_issue(payload: dict[str, object]) -> int:
     issue = payload.get("issue")
     if isinstance(issue, bool) or not isinstance(issue, int) or issue < 1:
-        raise InvalidClaimMarker("claim marker issue must be a positive integer")
+        raise InvalidClaimMarkerError("claim marker issue must be a positive integer")
     return issue
 
 
@@ -334,10 +347,10 @@ def _required_identity(payload: dict[str, object]) -> ClaimIdentity:
     has_issue = "issue" in payload
     has_lane = LANE_MARKER_KEY in payload
     if has_issue and has_lane:
-        raise InvalidClaimMarker("claim marker must not carry both issue and lane")
+        raise InvalidClaimMarkerError("claim marker must not carry both issue and lane")
     if has_lane:
         if payload[LANE_MARKER_KEY] is not True:
-            raise InvalidClaimMarker("claim marker lane field must be true")
+            raise InvalidClaimMarkerError("claim marker lane field must be true")
         return LaneIdentity()
     return IssueIdentity(_required_issue(payload))
 
@@ -377,7 +390,7 @@ def _valid_branch(payload: dict[str, object]) -> str:
             for segment in segments
         )
     ):
-        raise InvalidClaimMarker(f"claim marker branch is not a safe Git ref: {branch!r}")
+        raise InvalidClaimMarkerError(f"claim marker branch is not a safe Git ref: {branch!r}")
     return branch
 
 
@@ -393,31 +406,27 @@ def _scope_list_entries(scope: object) -> list[str]:
     them without rewriting the append-only comment.
     """
     if not isinstance(scope, list) or not scope:
-        raise InvalidClaimMarker("claim marker scope must be a non-empty list")
+        raise InvalidClaimMarkerError("claim marker scope must be a non-empty list")
     expanded: list[str] = []
     for raw_path in scope:
         if not isinstance(raw_path, str):
-            raise InvalidClaimMarker("claim scope entries must be text")
+            raise InvalidClaimMarkerError("claim scope entries must be text")
         if raw_path.strip() != raw_path or not raw_path:
-            raise InvalidClaimMarker(SCOPE_ENTRIES_MUST_BE_CANONICAL)
+            raise InvalidClaimMarkerError(SCOPE_ENTRIES_MUST_BE_CANONICAL)
         pieces = [piece.strip() for piece in raw_path.split(",")]
         if any(not piece for piece in pieces):
-            raise InvalidClaimMarker(SCOPE_ENTRIES_MUST_BE_CANONICAL)
+            raise InvalidClaimMarkerError(SCOPE_ENTRIES_MUST_BE_CANONICAL)
         expanded.extend(pieces)
     if len(expanded) > MAX_SCOPE_ENTRIES:
-        raise InvalidClaimMarker(f"claim marker scope exceeds {MAX_SCOPE_ENTRIES} entries")
+        raise InvalidClaimMarkerError(f"claim marker scope exceeds {MAX_SCOPE_ENTRIES} entries")
     return expanded
 
 
 def _valid_scope(scope: object) -> tuple[str, ...]:
     result: list[str] = []
     for path in _scope_list_entries(scope):
-        if (
-            len(path) > MAX_SCOPE_PATH_LENGTH
-            or "\\" in path
-            or any(ord(character) < 32 or ord(character) == 127 for character in path)
-        ):
-            raise InvalidClaimMarker(SCOPE_ENTRIES_MUST_BE_CANONICAL)
+        if len(path) > MAX_SCOPE_PATH_LENGTH or "\\" in path or _has_control_character(path):
+            raise InvalidClaimMarkerError(SCOPE_ENTRIES_MUST_BE_CANONICAL)
         parsed = PurePosixPath(path)
         windows_path = PureWindowsPath(path)
         if (
@@ -431,10 +440,10 @@ def _valid_scope(scope: object) -> tuple[str, ...]:
             or parsed.parts[0] == ".git"
             or str(parsed) != path
         ):
-            raise InvalidClaimMarker(f"claim scope must be repository-relative: {path!r}")
+            raise InvalidClaimMarkerError(f"claim scope must be repository-relative: {path!r}")
         result.append(path)
     if len(set(result)) != len(result):
-        raise InvalidClaimMarker("claim scope contains duplicate paths")
+        raise InvalidClaimMarkerError("claim scope contains duplicate paths")
     return tuple(result)
 
 
@@ -453,7 +462,7 @@ def _strict_keys(
             "; unknown fields in a trusted comment usually mean a newer "
             "agent-claim wrote this ledger - upgrade the installed tool"
         )
-    raise InvalidClaimMarker(message)
+    raise InvalidClaimMarkerError(message)
 
 
 def is_protocol_candidate(comment: IssueComment) -> bool:
@@ -472,18 +481,24 @@ def _marker_payload(comment: IssueComment) -> tuple[dict[str, object], bool] | N
     if not first_line.startswith(prefix):
         return None
     if comment.created_at != comment.updated_at:
-        raise InvalidClaimMarker(
+        raise InvalidClaimMarkerError(
             f"trusted protocol comment {comment.url} was edited after publication"
         )
     if not first_line.endswith(MARKER_SUFFIX):
-        raise InvalidClaimMarker(f"trusted comment {comment.url} has an unterminated claim marker")
+        raise InvalidClaimMarkerError(
+            f"trusted comment {comment.url} has an unterminated claim marker"
+        )
     encoded = first_line[len(prefix) : -len(MARKER_SUFFIX)]
     try:
         payload = json.loads(encoded)
     except json.JSONDecodeError as error:
-        raise InvalidClaimMarker(f"trusted comment {comment.url} has invalid claim JSON") from error
+        raise InvalidClaimMarkerError(
+            f"trusted comment {comment.url} has invalid claim JSON"
+        ) from error
     if not isinstance(payload, dict):
-        raise InvalidClaimMarker(f"trusted comment {comment.url} claim payload must be an object")
+        raise InvalidClaimMarkerError(
+            f"trusted comment {comment.url} claim payload must be an object"
+        )
     return payload, legacy
 
 
@@ -493,17 +508,17 @@ def _event_identity(payload: dict[str, object], comment: IssueComment) -> tuple[
     role = _required_text(payload, "role", maximum=64)
     visible_lines = [line for line in comment.body.splitlines() if line.strip()]
     if not visible_lines or visible_lines[-1] != f"Agent: {agent} ({role})":
-        raise InvalidClaimMarker(
+        raise InvalidClaimMarkerError(
             f"trusted protocol comment {comment.url} lacks its exact agent attribution"
         )
     if CLAIM_ID_PATTERN.fullmatch(claim_id) is None:
-        raise InvalidClaimMarker(f"trusted comment {comment.url} has an invalid claim id")
+        raise InvalidClaimMarkerError(f"trusted comment {comment.url} has an invalid claim id")
     return claim_id, agent, role
 
 
 def _valid_resource_name(name: str, *, field: str) -> str:
     if RESOURCE_NAME_PATTERN.fullmatch(name) is None:
-        raise InvalidClaimMarker(f"{field} is not a resource name")
+        raise InvalidClaimMarkerError(f"{field} is not a resource name")
     return name
 
 
@@ -512,7 +527,7 @@ def _required_resource_hold(payload: dict[str, object], comment: IssueComment) -
     _valid_resource_name(name, field=f"trusted comment {comment.url} resource")
     value = payload.get("resource_value")
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise InvalidClaimMarker(
+        raise InvalidClaimMarkerError(
             f"trusted comment {comment.url} resource_value must be a positive integer"
         )
     return ResourceHold(name, value)
@@ -525,7 +540,9 @@ def _parse_active_claim(
     if not legacy:
         expected.add(_identity_marker_key(identity))
     if "resource_value" in payload and "resource" not in payload:
-        raise InvalidClaimMarker(f"trusted comment {comment.url} resource_value requires resource")
+        raise InvalidClaimMarkerError(
+            f"trusted comment {comment.url} resource_value requires resource"
+        )
     if "resource" in payload:
         expected.add("resource")
         if "resource_value" in payload:
@@ -534,7 +551,7 @@ def _parse_active_claim(
     claim_id, agent, role = _event_identity(payload, comment)
     base = _required_text(payload, "base", maximum=40)
     if COMMIT_PATTERN.fullmatch(base) is None:
-        raise InvalidClaimMarker(
+        raise InvalidClaimMarkerError(
             f"trusted comment {comment.url} base must be a full lowercase commit SHA"
         )
     requested_resource = None
@@ -583,7 +600,7 @@ def _required_comment_id(payload: dict[str, object], *, action: str) -> int:
         or not isinstance(raw_comment_id, int)
         or raw_comment_id < 1
     ):
-        raise InvalidClaimMarker(f"{action} requires a positive claim comment id")
+        raise InvalidClaimMarkerError(f"{action} requires a positive claim comment id")
     return raw_comment_id
 
 
@@ -607,7 +624,7 @@ def _parse_override_release(
     )
     claim_id, agent, role = _event_identity(payload, comment)
     if role != "coordinator":
-        raise InvalidClaimMarker("override releases require coordinator role")
+        raise InvalidClaimMarkerError("override releases require coordinator role")
     return OverrideRelease(
         identity=identity,
         claim_id=claim_id,
@@ -640,7 +657,7 @@ def _parse_ledger_supersede(
     )
     claim_id, agent, role = _event_identity(payload, comment)
     if role != "coordinator":
-        raise InvalidClaimMarker("ledger supersede requires coordinator role")
+        raise InvalidClaimMarkerError("ledger supersede requires coordinator role")
     successor_issue = payload.get("successor_issue")
     if (
         isinstance(successor_issue, bool)
@@ -648,7 +665,7 @@ def _parse_ledger_supersede(
         or successor_issue < 1
         or successor_issue <= LEDGER_ISSUE
     ):
-        raise InvalidClaimMarker("ledger successor must be greater than the current ledger")
+        raise InvalidClaimMarkerError("ledger successor must be greater than the current ledger")
     return LedgerSupersede(
         issue=issue,
         claim_id=claim_id,
@@ -696,11 +713,13 @@ def parse_claim_event(comment: IssueComment) -> ClaimEvent | None:
     payload, legacy = parsed_marker
     action = _required_text(payload, "action", maximum=32)
     if action not in {"claim", "release", "override_release", "rescope", "supersede"}:
-        raise InvalidClaimMarker(f"trusted comment {comment.url} has unknown action {action!r}")
+        raise InvalidClaimMarkerError(
+            f"trusted comment {comment.url} has unknown action {action!r}"
+        )
 
     if legacy:
         if action not in {"claim", "release"}:
-            raise InvalidClaimMarker("legacy claim markers cannot use this action")
+            raise InvalidClaimMarkerError("legacy claim markers cannot use this action")
         if LEDGER_ISSUE < 1:
             # IssueIdentity itself would reject 0 as "not a positive integer", which
             # would misreport this as a marker defect; it is a caller/setup defect.
@@ -750,18 +769,22 @@ def _apply_terminal_event(
             or set(active) != {claimed.claim_id}
         ):
             return False
-        raise LedgerSuperseded(event.successor_issue, claimed)
+        raise LedgerSupersededError(event.successor_issue, claimed)
     if claimed is None:
-        raise InvalidClaimMarker(f"claim id {event.claim_id!r} was released before it was acquired")
+        raise InvalidClaimMarkerError(
+            f"claim id {event.claim_id!r} was released before it was acquired"
+        )
     if claimed.identity != event.identity:
-        raise InvalidClaimMarker(f"claim id {event.claim_id!r} release targets the wrong claim")
+        raise InvalidClaimMarkerError(
+            f"claim id {event.claim_id!r} release targets the wrong claim"
+        )
     if isinstance(event, ClaimantRelease):
         if (claimed.agent, claimed.role) != (event.agent, event.role):
-            raise InvalidClaimMarker(
+            raise InvalidClaimMarkerError(
                 f"claim id {event.claim_id!r} can only be released by its claimant"
             )
     elif event.claim_comment_id != claimed.comment.identifier:
-        raise InvalidClaimMarker(
+        raise InvalidClaimMarkerError(
             f"claim id {event.claim_id!r} terminal event targets the wrong claim comment"
         )
     active.pop(event.claim_id, None)
@@ -822,18 +845,18 @@ def _aggregate_claim_events(comments: tuple[IssueComment, ...]) -> ClaimLedgerAg
             current = active.get(event.claim_id)
             if current is None:
                 if event.claim_id in acquired:
-                    raise InvalidClaimMarker(
+                    raise InvalidClaimMarkerError(
                         f"claim id {event.claim_id!r} was rescoped after it was released"
                     )
-                raise InvalidClaimMarker(
+                raise InvalidClaimMarkerError(
                     f"claim id {event.claim_id!r} was rescoped before it was acquired"
                 )
             if current.identity != event.identity:
-                raise InvalidClaimMarker(
+                raise InvalidClaimMarkerError(
                     f"claim id {event.claim_id!r} rescope targets the wrong claim"
                 )
             if (current.agent, current.role) != (event.agent, event.role):
-                raise InvalidClaimMarker(
+                raise InvalidClaimMarkerError(
                     f"claim id {event.claim_id!r} can only be rescoped by its claimant"
                 )
             active[event.claim_id] = replace(current, scope=event.scope)
@@ -920,7 +943,7 @@ def _apply_derived_resource_holds(
 
 def _reject_duplicate_claim_ids(aggregate: ClaimLedgerAggregate) -> None:
     if aggregate.duplicate_claim_ids:
-        raise InvalidClaimMarker(f"claim id {aggregate.duplicate_claim_ids[0]!r} was reused")
+        raise InvalidClaimMarkerError(f"claim id {aggregate.duplicate_claim_ids[0]!r} was reused")
 
 
 def active_claims(comments: tuple[IssueComment, ...]) -> tuple[ActiveClaim, ...]:
@@ -1380,7 +1403,7 @@ def reconcile_issue_label(
     for _ in range(3):
         try:
             expected = _issue_claim(_ledger_claims(client), issue)
-        except LedgerSuperseded:
+        except LedgerSupersededError:
             client.remove_label(issue, claim_label())
             raise
         _apply_issue_projection(
@@ -1395,7 +1418,7 @@ def reconcile_issue_label(
             client.remove_label(issue, claim_label())
         try:
             observed = _issue_claim(_ledger_claims(client), issue)
-        except LedgerSuperseded:
+        except LedgerSupersededError:
             client.remove_label(issue, claim_label())
             raise
         if (observed.claim_id if observed else None) == (expected.claim_id if expected else None):
@@ -1415,7 +1438,7 @@ def reconcile_all_labels(client: IssueComments) -> tuple[int, ...]:
             for claim in _ledger_claims(client)
             if isinstance(claim.identity, IssueIdentity)
         }
-    except LedgerSuperseded:
+    except LedgerSupersededError:
         for issue in client.list_claimed_issues():
             client.remove_label(issue, claim_label())
         raise
@@ -1484,7 +1507,7 @@ def repair_duplicate_claims(client: IssueComments) -> tuple[DuplicateClaimRepair
                 survivor.role,
             )
             if not (terminal_comments or same_claimant):
-                raise DuplicateClaimConflict(claim_id, occurrence, survivor)
+                raise DuplicateClaimConflictError(claim_id, occurrence, survivor)
             superseded_comments.append(occurrence.comment)
             superseded_comments.extend(terminal_comments)
         plans.append((claim_id, survivor, tuple(superseded_comments)))
@@ -1551,7 +1574,7 @@ def acquire_claim(client: IssueComments, request: ClaimRequest) -> ActiveClaim:
     return claimed
 
 
-class ClaimPostedReconcileFailed(ClaimError):
+class ClaimPostedReconcileFailedError(ClaimError):
     """The requested claim is live on the ledger, but the label/projection
     reconcile that normally follows a winning post failed.
 
@@ -1586,7 +1609,7 @@ def _acquire_claim_with_observed(
     if replayed is not None:
         return replayed, aggregate.active
     if request.claim_id in aggregate.seen_claim_ids:
-        raise ClaimUnavailable(
+        raise ClaimUnavailableError(
             f"claim id {request.claim_id!r} is already on this ledger, active or "
             "released; release it, then claim again with a fresh --claim-id"
         )
@@ -1594,7 +1617,7 @@ def _acquire_claim_with_observed(
     blocked_by = blocking_claims(standing, request)
     if blocked_by:
         owner = blocked_by[0]
-        raise ClaimUnavailable(
+        raise ClaimUnavailableError(
             f"{_identity_summary(request.identity, request.branch)} is "
             f"claimed by {owner.agent} ({owner.role}) on "
             f"{_identity_summary(owner.identity, owner.branch)} branch {owner.branch}"
@@ -1604,7 +1627,7 @@ def _acquire_claim_with_observed(
         holder = _resource_holders(standing, hold, except_id=request.claim_id)
         if holder:
             owner = holder[0]
-            raise ClaimUnavailable(
+            raise ClaimUnavailableError(
                 f"{hold.name} {hold.value} is held by {owner.agent} ({owner.role}) on "
                 f"{_identity_summary(owner.identity, owner.branch)}"
             )
@@ -1612,7 +1635,7 @@ def _acquire_claim_with_observed(
     client.post_comment(LEDGER_ISSUE, claim_comment(request))
     post_aggregate = _aggregate_claim_events(client.list_protocol_candidates(LEDGER_ISSUE))
     if request.claim_id in post_aggregate.duplicate_claim_ids:
-        raise ClaimUnavailable(
+        raise ClaimUnavailableError(
             f"claim id {request.claim_id!r} claim race detected: another post reused "
             "this id while it was being posted; run agent-claim reconcile, then claim "
             "again with a fresh --claim-id"
@@ -1638,7 +1661,7 @@ def _acquire_claim_with_observed(
             )
             _reconcile_identity(client, request.identity)
             _reconcile_identity(client, winner.identity)
-            raise ClaimUnavailable(
+            raise ClaimUnavailableError(
                 f"{_identity_summary(request.identity, request.branch)} claim race lost to "
                 f"{winner.agent} ({winner.role}) on "
                 f"{_identity_summary(winner.identity, winner.branch)} branch {winner.branch}"
@@ -1657,12 +1680,14 @@ def _acquire_claim_with_observed(
             _reconcile_identity(client, request.identity)
             if holder is not None:
                 _reconcile_identity(client, holder.identity)
-                raise ClaimUnavailable(
+                raise ClaimUnavailableError(
                     f"{expected.name} {expected.value} is held by "
                     f"{holder.agent} ({holder.role}) on "
                     f"{_identity_summary(holder.identity, holder.branch)}"
                 )
-            raise ClaimUnavailable(f"{expected.name} {expected.value} is held by another claim")
+            raise ClaimUnavailableError(
+                f"{expected.name} {expected.value} is held by another claim"
+            )
     elif request.resource is not None:
         hold = own.resource
         if hold is None or hold.name != request.resource:
@@ -1677,7 +1702,7 @@ def _acquire_claim_with_observed(
         # The claim comment above already won the ledger (the earlier race
         # checks all passed), so a failure reconciling the issue's label or
         # projection must never surface as if the claim itself had failed.
-        raise ClaimPostedReconcileFailed(own, observed, error) from error
+        raise ClaimPostedReconcileFailedError(own, observed, error) from error
     return own, observed
 
 
@@ -1687,15 +1712,15 @@ def _combined_scope(
     current_set = set(current)
     missing = next((path for path in drop if path not in current_set), None)
     if missing is not None:
-        raise ClaimUnavailable(f"cannot drop {missing!r}; it is not in this claim's scope")
+        raise ClaimUnavailableError(f"cannot drop {missing!r}; it is not in this claim's scope")
     drop_set = set(drop)
     kept = tuple(path for path in current if path not in drop_set)
     added = tuple(path for path in add if path not in kept)
     if not kept and not added:
-        raise ClaimUnavailable("rescope must leave a non-empty scope")
+        raise ClaimUnavailableError("rescope must leave a non-empty scope")
     combined = kept + added
     if combined == current:
-        raise ClaimUnavailable("rescope does not change the claim scope")
+        raise ClaimUnavailableError("rescope does not change the claim scope")
     return _valid_scope(list(combined))
 
 
@@ -1704,19 +1729,18 @@ def _observe_rescoped_claim(
     identity: ClaimIdentity,
     selected: ActiveClaim,
     expected_scope: tuple[str, ...],
-    *,
-    expose: str,
-    observe: str,
 ) -> tuple[tuple[ActiveClaim, ...], ActiveClaim]:
     aggregate = _aggregate_claim_events(client.list_protocol_candidates(LEDGER_ISSUE))
     _reject_duplicate_claim_ids(aggregate)
     observed = aggregate.active
     own = next((claim for claim in observed if claim.claim_id == selected.claim_id), None)
     if own is None:
-        raise ClaimError(f"{_identity_summary(identity, selected.branch)} did not expose {expose}")
+        raise ClaimError(
+            f"{_identity_summary(identity, selected.branch)} did not expose the rescoped claim id"
+        )
     if own.scope != expected_scope:
         raise ClaimError(
-            f"{_identity_summary(identity, selected.branch)} did not observe {observe}"
+            f"{_identity_summary(identity, selected.branch)} did not observe the posted rescope"
         )
     return observed, own
 
@@ -1731,19 +1755,19 @@ def _select_rescope_claim(
 ) -> ActiveClaim:
     standing = _claims_for_identity(claims, identity, branch)
     if not standing:
-        raise ClaimUnavailable(
+        raise ClaimUnavailableError(
             f"{_identity_summary(identity, branch or '')} has no active build claim"
         )
     if claim_id is None:
         if not branch:
-            raise ClaimUnavailable(
+            raise ClaimUnavailableError(
                 "rescope without --claim-id requires a non-empty current branch; pass --claim-id"
             )
         matches = tuple(
             claim for claim in standing if claim.agent == agent and claim.branch == branch
         )
         if len(matches) != 1:
-            raise ClaimUnavailable(
+            raise ClaimUnavailableError(
                 f"{_identity_summary(identity, branch)} has no unique claim for this "
                 f"session on branch {branch!r}; pass --claim-id"
             )
@@ -1754,13 +1778,13 @@ def _select_rescope_claim(
             None,
         )
         if selected is None:
-            raise ClaimUnavailable(
+            raise ClaimUnavailableError(
                 f"{_identity_summary(identity, branch or '')} has no active claim {claim_id!r}"
             )
     if agent != selected.agent:
-        raise ClaimUnavailable("only the original claimant may rescope")
+        raise ClaimUnavailableError("only the original claimant may rescope")
     if branch and selected.branch != branch:
-        raise ClaimUnavailable(
+        raise ClaimUnavailableError(
             f"claim branch {selected.branch!r} does not match checkout branch {branch!r}"
         )
     return selected
@@ -1778,7 +1802,7 @@ def rescope_claim(
     allow_directory_reason: str | None = None,
 ) -> ActiveClaim:
     if not add and not drop:
-        raise ClaimUnavailable("rescope requires --add or --drop")
+        raise ClaimUnavailableError("rescope requires --add or --drop")
     add_scope = _valid_scope(list(add)) if add else ()
     drop_scope = _valid_scope(list(drop)) if drop else ()
     observed = _ledger_claims(client)
@@ -1794,14 +1818,7 @@ def rescope_claim(
             allow_directory_reason=allow_directory_reason,
         ),
     )
-    _, own = _observe_rescoped_claim(
-        client,
-        identity,
-        selected,
-        new_scope,
-        expose="the rescoped claim id",
-        observe="the posted rescope",
-    )
+    _, own = _observe_rescoped_claim(client, identity, selected, new_scope)
 
     _reconcile_identity(client, identity)
     return own
@@ -1809,7 +1826,7 @@ def rescope_claim(
 
 def _require_coordinator_override(role: str | None) -> None:
     if role != "coordinator":
-        raise ClaimUnavailable("a coordinator override requires --role coordinator")
+        raise ClaimUnavailableError("a coordinator override requires --role coordinator")
 
 
 def _claims_for_identity(
@@ -1829,7 +1846,7 @@ def _claims_for_identity(
             if isinstance(claim.identity, IssueIdentity) and claim.identity.issue == identity.issue
         )
     if not branch:
-        raise ClaimUnavailable(
+        raise ClaimUnavailableError(
             "lane release requires a non-empty current branch; check out the "
             "docs/ or fix/ lane branch, or pass an issue number"
         )
@@ -1855,19 +1872,19 @@ def release_claim(
         _require_coordinator_override(role)
     standing = _claims_for_identity(_ledger_claims(client), identity, branch)
     if not standing:
-        raise ClaimUnavailable(
+        raise ClaimUnavailableError(
             f"{_identity_summary(identity, branch or '')} has no active build claim"
         )
     if claim_id is None:
         if not branch:
-            raise ClaimUnavailable(
+            raise ClaimUnavailableError(
                 "release without --claim-id requires a non-empty current branch; pass --claim-id"
             )
         matches = tuple(
             claim for claim in standing if claim.agent == agent and claim.branch == branch
         )
         if len(matches) != 1:
-            raise ClaimUnavailable(
+            raise ClaimUnavailableError(
                 f"{_identity_summary(identity, branch)} has no unique claim for this "
                 f"session on branch {branch!r}; pass --claim-id"
             )
@@ -1878,13 +1895,13 @@ def release_claim(
             None,
         )
         if selected is None:
-            raise ClaimUnavailable(
+            raise ClaimUnavailableError(
                 f"{_identity_summary(identity, branch or '')} has no active claim {claim_id!r}"
             )
     if role is None:
         role = selected.role
     if not coordinator_override and (agent, role) != (selected.agent, selected.role):
-        raise ClaimUnavailable(
+        raise ClaimUnavailableError(
             "only the original claimant may release; use an explicit coordinator override"
         )
     ledger_url = client.post_comment(
@@ -1914,12 +1931,12 @@ def supersede_ledger(
     claim_id: str,
 ) -> ActiveClaim:
     if role != "coordinator":
-        raise ClaimUnavailable("ledger supersede requires --role coordinator")
+        raise ClaimUnavailableError("ledger supersede requires --role coordinator")
     if successor_issue <= LEDGER_ISSUE:
-        raise ClaimUnavailable("successor issue must be greater than the current ledger")
+        raise ClaimUnavailableError("successor issue must be greater than the current ledger")
     try:
         standing = _ledger_claims(client)
-    except LedgerSuperseded as error:
+    except LedgerSupersededError as error:
         if error.successor_issue != successor_issue or error.claim.claim_id != claim_id:
             raise
         client.remove_label(LEDGER_ISSUE, claim_label())
@@ -1931,7 +1948,7 @@ def supersede_ledger(
         or selected.identity.issue != LEDGER_ISSUE
         or len(standing) != 1
     ):
-        raise ClaimUnavailable(
+        raise ClaimUnavailableError(
             "ledger supersede requires the named claim to be the only active claim "
             "and to own the ledger issue"
         )
@@ -1942,7 +1959,7 @@ def supersede_ledger(
     )
     try:
         _ledger_claims(client)
-    except LedgerSuperseded as error:
+    except LedgerSupersededError as error:
         if error.successor_issue == successor_issue and error.claim == selected:
             client.remove_label(LEDGER_ISSUE, claim_label())
             return selected
