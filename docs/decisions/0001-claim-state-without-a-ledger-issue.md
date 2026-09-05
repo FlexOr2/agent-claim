@@ -4,10 +4,9 @@ Status: accepted as direction, not yet implementable. Each §4 criterion is gate
 step that resolves it: the state-ref cut (step 5) resolves criteria 1–6 and 10 (criterion 8
 is already tied there to fencing v0.9 clients); port extraction (step 3) resolves criterion 9,
 the complete Landing candidate (already tied there); criterion 7, the GitLab
-state-transport preflight, must be re-run before the first GitLab adapter; and criterion 11,
-the live GitHub custom-ref probe, must be re-run before port extraction (step 3) and the
-state-ref cut (step 5) are dispatched. No slice may be dispatched before its gating step's
-criteria are satisfied.
+state-transport preflight, must be re-run before the first GitLab adapter; criterion 11, the
+live GitHub custom-ref probe, is satisfied (re-run by the head 05.09.2026, results on #131).
+No slice may be dispatched before its gating step's criteria are satisfied.
 
 Date: 05.09.2026. Baseline: `origin/main` = `2bcf3f3` (v0.9.0 plus the #109/#110 Sonar
 cleanup, which changed no contract), tag `v0.9.0`.
@@ -144,12 +143,11 @@ plan review must satisfy. The direction in §2 is ruled; these are not.
     `RuledExpectation.default` with a typed `yes | no | later`; and a typed failure for a
     malformed or unsupported state-tree schema, distinct from a stale rejection and from
     ambiguous push completion.
-11. **GitHub custom-ref probe re-run.** §6 marks GitHub's acceptance of pushes to
-    `refs/agent-claim/*` as reported live but unverified — both counter-checks lost network
-    access before they could reproduce it. Required, before the port-extraction/state-ref
-    slice is dispatched: a live re-run of the custom-ref push/fetch/CAS probe against GitHub —
-    create-if-absent, fast-forward update, non-fast-forward rejection, concurrent rejection,
-    and delete.
+11. **GitHub custom-ref probe re-run — satisfied for GitHub.** The live re-run of the
+    custom-ref push/fetch/CAS probe against GitHub — create-if-absent, fast-forward update,
+    non-fast-forward rejection, concurrent rejection, and delete — landed 05.09.2026 (results
+    on #131); §6 now marks the GitHub custom-ref facts verified. The GitLab equivalent
+    (criterion 7) stays open.
 
 Removed until a caller exists: chain-length reporting, a public `capabilities()` if only
 adapters consume it, nonzero gate freshness, and the receipt unless phone visibility is
@@ -165,8 +163,8 @@ As ruled by the round-2 counter-check. Strictly sequential.
    mapping exists.
 3. **Port extraction** — `ForgeReader` / `ForgeWriter`, the GitHub adapter, typed errors. A
    pure extraction against the current call set, with no behaviour change, and it must
-   already satisfy criterion 9. Criterion 11's live GitHub custom-ref probe must also be
-   re-run before this step is dispatched.
+   already satisfy criterion 9. Criterion 11's live GitHub custom-ref probe is satisfied
+   (re-run 05.09.2026, results on #131).
 4. **One body and relation migration** — the typed block, blockers and parentage from
    structured relations, and the conversion command, in one slice. Blockers never pass
    through the body on GitHub.
@@ -180,15 +178,18 @@ As ruled by the round-2 counter-check. Strictly sequential.
 
 Judged as the counter-checks judged them. "Reported live" means the concept author ran it on
 05.09.2026 against `overnightworks/agent-claim` and neither counter-check could reproduce it
-(both lost network access to `api.github.com`); it is therefore **not** independently
-verified and no slice may depend on it without re-running the probe.
+(both lost network access to `api.github.com`); a fact still marked "Reported live,
+unverified" below is therefore not independently verified and no slice may depend on it
+without re-running the probe. The GitHub custom-ref probe was re-run live by the head on
+05.09.2026 (results on #131) and is marked verified below; the org-plan and issue-type
+probes remain unverified.
 
 | Fact | Standing | Source |
 |---|---|---|
-| GitHub accepts pushes to `refs/agent-claim/*` | Reported live, unverified | Concept probe, 05.09.2026 |
+| GitHub accepts pushes to `refs/agent-claim/*`; create-if-absent, fast-forward update, non-fast-forward rejection, concurrent rejection (two parallel pushes of different children from two clones → exactly one winner, the other "cannot lock ref"), a stale-lease create rejected, and delete all behave as required; the REST endpoint `git/refs/agent-claim` returns 200 while the ref is present and 404 after deletion; the ref is invisible in the normal GitHub UI | Verified 05.09.2026 (re-run by the head, results on #131) | Head's live re-run, 05.09.2026, `overnightworks/agent-claim`, namespace `refs/agent-claim/probe-1788623638` (deleted afterwards) |
 | Push to a custom ref: plain push is fast-forward-only; a matching lease still permits a non-fast-forward replacement | Verified (documentation) | `git push` documentation; the reason §2 rejects the lease |
 | Two racers on one expected OID: at most one lands; the loser re-reads and retries | Verified in a throwaway bare repo; "exactly one" corrected to "at most one" (permissions, hooks or transport can fail every racer) | Concept local experiment; round-1 counter-check |
-| Custom-ref push 1.88 s, one-ref fetch 1.31 s, `ls-remote` 1.47 s; today's gate ~2.4 s per write | Reported live, unverified; environment-specific and not to be projected onto other repositories | Concept measurement, 05.09.2026 |
+| Custom-ref create-if-absent 1.9 s, fast-forward update 1.9 s, `ls-remote` 1.4 s, single-ref fetch 1.4 s, delete 1.9 s; today's gate ~2.4 s per write | Verified 05.09.2026 (re-run by the head, results on #131); environment-specific and not to be projected onto other repositories | Head's live re-run, 05.09.2026 |
 | `overnightworks` plan free, repository public; org issue types are `Task, Bug, Feature` with no `Container` | Reported live, unverified; token scopes never evidenced | Concept probes, 05.09.2026 |
 | GitHub issue dependencies are available on Free; sub-issues allow 100 direct children and 8 nesting levels | Verified (documentation) | GitHub docs |
 | GitHub rulesets and branch protection target branches and tags only, never `refs/agent-claim/*` | Verified (documentation) | GitHub docs. Accepted: the threat model is cooperating clients |
