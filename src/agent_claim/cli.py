@@ -254,6 +254,9 @@ def _request(arguments: argparse.Namespace) -> protocol.ClaimRequest:
     return request
 
 
+LANE_ISSUE_HELP = "omit for lane mode, derived from a docs/ or fix/ checkout branch"
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-claim", description=__doc__)
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -286,7 +289,7 @@ def _parser() -> argparse.ArgumentParser:
         "issue",
         type=int,
         nargs="?",
-        help="omit for lane mode, derived from a docs/ or fix/ checkout branch",
+        help=LANE_ISSUE_HELP,
     )
     claim.add_argument("--agent")
     claim.add_argument("--role", default=DEFAULT_CLAIM_ROLE)
@@ -324,7 +327,7 @@ def _parser() -> argparse.ArgumentParser:
         "issue",
         type=int,
         nargs="?",
-        help="omit for lane mode, derived from a docs/ or fix/ checkout branch",
+        help=LANE_ISSUE_HELP,
     )
     release.add_argument("--agent")
     release.add_argument("--role")
@@ -351,7 +354,7 @@ def _parser() -> argparse.ArgumentParser:
         "issue",
         type=int,
         nargs="?",
-        help="omit for lane mode, derived from a docs/ or fix/ checkout branch",
+        help=LANE_ISSUE_HELP,
     )
     rescope.add_argument("--agent")
     rescope.add_argument(
@@ -959,93 +962,79 @@ def _out_of_order_check(
 
 def _slice_table_entry_checks(
     repository: str, open_by_number: dict[int, board.Issue], entry: board.SliceTableEntry
-) -> tuple[SliceCheck, ...]:
+) -> SliceCheck | None:
     if isinstance(entry, board.MalformedSliceTable):
-        return (
-            SliceCheck(
-                "error",
-                "malformed-slice-table",
-                f'malformed slice table header: "{entry.line}"',
-            ),
+        return SliceCheck(
+            "error",
+            "malformed-slice-table",
+            f'malformed slice table header: "{entry.line}"',
         )
     if isinstance(entry, board.MalformedSliceRow):
-        return (
-            SliceCheck(
-                "error",
-                "malformed-slice-cell",
-                f'malformed slice table row: "{entry.line}"',
-            ),
+        return SliceCheck(
+            "error",
+            "malformed-slice-cell",
+            f'malformed slice table row: "{entry.line}"',
         )
     return _slice_row_checks(repository, open_by_number, entry)
 
 
 def _slice_row_checks(
     repository: str, open_by_number: dict[int, board.Issue], row: board.SliceTableRow
-) -> tuple[SliceCheck, ...]:
+) -> SliceCheck | None:
     if row.item_issue is not None:
         state, _title, _body = _issue_reference_state(repository, open_by_number, row.item_issue)
         if state is ReferenceState.CLOSED:
-            return (
-                SliceCheck(
-                    "error",
-                    "landed-slice-in-table",
-                    f"slice {row.index} links closed #{row.item_issue}; "
-                    "a landed slice leaves the table",
-                    slice=row.index,
-                    issue=row.item_issue,
-                ),
+            return SliceCheck(
+                "error",
+                "landed-slice-in-table",
+                f"slice {row.index} links closed #{row.item_issue}; "
+                "a landed slice leaves the table",
+                slice=row.index,
+                issue=row.item_issue,
             )
         if state is ReferenceState.MISSING:
-            return (
-                SliceCheck(
-                    "error",
-                    "missing-slice-item",
-                    f"slice {row.index} links #{row.item_issue}, which does not exist here",
-                    slice=row.index,
-                    issue=row.item_issue,
-                ),
-            )
-        return ()
-    if row.item_cell == board.UNDISPATCHED_SLICE_CELL:
-        return (
-            SliceCheck(
-                "warning",
-                "undispatched-slice",
-                f'slice {row.index} "{row.name}" is not dispatched; '
-                "make it an item before building it",
+            return SliceCheck(
+                "error",
+                "missing-slice-item",
+                f"slice {row.index} links #{row.item_issue}, which does not exist here",
                 slice=row.index,
-            ),
-        )
-    return (
-        SliceCheck(
-            "error",
-            "malformed-slice-cell",
-            f'slice {row.index} item cell "{row.item_cell}" is neither — nor #n',
+                issue=row.item_issue,
+            )
+        return None
+    if row.item_cell == board.UNDISPATCHED_SLICE_CELL:
+        return SliceCheck(
+            "warning",
+            "undispatched-slice",
+            f'slice {row.index} "{row.name}" is not dispatched; '
+            "make it an item before building it",
             slice=row.index,
-        ),
+        )
+    return SliceCheck(
+        "error",
+        "malformed-slice-cell",
+        f'slice {row.index} item cell "{row.item_cell}" is neither — nor #n',
+        slice=row.index,
     )
 
 
 def _parent_checks(
     client: github.GitHubIssueComments, repository: str, issue: int, title: str
-) -> tuple[SliceCheck, ...]:
+) -> SliceCheck | None:
     """Warn when a slice-shaped title names a parent GitHub does not record as one."""
     match = board.slice_title_match(title)
     if match is None:
-        return ()
+        return None
     slice_number, parent_issue = match
     parent = client.parent_issue(issue)
     if parent is not None and parent.reference == board.IssueReference(repository, parent_issue):
-        return ()
-    return (
-        SliceCheck(
-            "warning",
-            "missing-parent",
-            f"looks like slice {slice_number} of #{parent_issue} but is no sub-issue "
-            f"of #{parent_issue}; the parent inherits nothing",
-            slice=slice_number,
-            issue=parent_issue,
-        ),
+        return None
+    return SliceCheck(
+        "warning",
+        "missing-parent",
+        f"looks like slice {slice_number} of #{parent_issue} but is no sub-issue "
+        f"of #{parent_issue}; the parent inherits nothing",
+        slice=slice_number,
+        issue=parent_issue,
     )
 
 
@@ -1104,9 +1093,13 @@ def _slice_rule_checks(
         checks.extend(_body_contract_checks(item.contract, projected.blocker_references))
     if body is not None:
         for entry in board.parse_slice_table(body):
-            checks.extend(_slice_table_entry_checks(repository, open_by_number, entry))
+            table_check = _slice_table_entry_checks(repository, open_by_number, entry)
+            if table_check is not None:
+                checks.append(table_check)
     if title is not None:
-        checks.extend(_parent_checks(client, repository, issue, title))
+        parent_check = _parent_checks(client, repository, issue, title)
+        if parent_check is not None:
+            checks.append(parent_check)
     return tuple(checks)
 
 
@@ -1397,13 +1390,16 @@ def _protect_relative_path(raw_path: str) -> str | None:
         return None
 
 
+PATH_REQUIRED = "path required"
+
+
 def _protect_write(repository: str | None, payload: dict[str, object]) -> int:
     tool_input = _hook_field(payload, "toolInput", "tool_input")
     if not isinstance(tool_input, dict):
-        return _hook_deny("path required")
+        return _hook_deny(PATH_REQUIRED)
     raw_path = _hook_path(tool_input)
     if raw_path is None:
-        return _hook_deny("path required")
+        return _hook_deny(PATH_REQUIRED)
     agent = checkout._resolved_agent(None)
     branch = checkout._git_output(["branch", "--show-current"])
     if branch in {"main", "master"}:
@@ -1414,7 +1410,7 @@ def _protect_write(repository: str | None, payload: dict[str, object]) -> int:
         return _hook_deny("worktree")
     relative = _protect_relative_path(raw_path)
     if relative is None:
-        return _hook_deny("path required")
+        return _hook_deny(PATH_REQUIRED)
     client = github.GitHubIssueComments(checkout._repository(repository))
     ledger = discovery.discover_ledger(client)
     if ledger is None:

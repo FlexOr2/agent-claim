@@ -29,9 +29,7 @@ CLAIM_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 RESOURCE_NAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9._-]{0,63}")
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 BRANCH_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}")
-REPOSITORY_PATTERN = re.compile(
-    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9_.-]{1,100}"
-)
+REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}")
 MAX_PROTOCOL_EVENTS = 4096
 MAX_PROTOCOL_BYTES = 8 * 1024 * 1024
 MAX_COMMENT_BYTES = 48 * 1024
@@ -390,6 +388,9 @@ def _valid_branch(payload: dict[str, object]) -> str:
     return branch
 
 
+SCOPE_ENTRIES_MUST_BE_CANONICAL = "claim scope entries must be canonical bounded paths"
+
+
 def _scope_list_entries(scope: object) -> list[str]:
     """Expand a stored or CLI scope list into individual path strings.
 
@@ -405,10 +406,10 @@ def _scope_list_entries(scope: object) -> list[str]:
         if not isinstance(raw_path, str):
             raise InvalidClaimMarker("claim scope entries must be text")
         if raw_path.strip() != raw_path or not raw_path:
-            raise InvalidClaimMarker("claim scope entries must be canonical bounded paths")
+            raise InvalidClaimMarker(SCOPE_ENTRIES_MUST_BE_CANONICAL)
         pieces = [piece.strip() for piece in raw_path.split(",")]
         if any(not piece for piece in pieces):
-            raise InvalidClaimMarker("claim scope entries must be canonical bounded paths")
+            raise InvalidClaimMarker(SCOPE_ENTRIES_MUST_BE_CANONICAL)
         expanded.extend(pieces)
     if len(expanded) > MAX_SCOPE_ENTRIES:
         raise InvalidClaimMarker(
@@ -425,7 +426,7 @@ def _valid_scope(scope: object) -> tuple[str, ...]:
             or "\\" in path
             or any(ord(character) < 32 or ord(character) == 127 for character in path)
         ):
-            raise InvalidClaimMarker("claim scope entries must be canonical bounded paths")
+            raise InvalidClaimMarker(SCOPE_ENTRIES_MUST_BE_CANONICAL)
         parsed = PurePosixPath(path)
         windows_path = PureWindowsPath(path)
         if (

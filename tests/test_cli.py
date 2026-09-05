@@ -12178,3 +12178,11 @@ def test_pr_check_accepts_a_body_naming_work_github_does_not_close_on(
     assert capsys.readouterr().out == (
         f"PR #12 by ada declares Work-Item: {REPOSITORY}#{WORK_ITEM_ISSUE}\n"
     )
+
+
+def test_a_non_ascii_digit_in_a_hash_reference_is_not_an_issue_number() -> None:
+    arabic_three = board.parse_contract("## Blocked by\n#٣")
+    mixed = board.parse_contract("## Blocked by\n#1٣")
+
+    assert arabic_three.blocker_issues == frozenset()
+    assert mixed.blocker_issues == frozenset()

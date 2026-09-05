@@ -592,6 +592,8 @@ class GitHubIssueComments:
             if not (isinstance(value, dict) and value.get("isPullRequest"))
         )
 
+    MALFORMED_BOARD_BLOCKER = "GitHub returned a malformed board blocker"
+
     def _board_blocker(self, number: int) -> board.BlockerReference:
         try:
             raw = self._run(
@@ -608,7 +610,7 @@ class GitHubIssueComments:
             raise
         values = self._json_lines(raw, "board blocker")
         if len(values) != 1 or not isinstance(values[0], dict):
-            raise ClaimError("GitHub returned a malformed board blocker")
+            raise ClaimError(self.MALFORMED_BOARD_BLOCKER)
         value = values[0]
         returned_number = value.get("number")
         state = value.get("state")
@@ -627,15 +629,15 @@ class GitHubIssueComments:
             )
             or (blocker_state is board.BlockerState.CLOSED and closed_at is None)
         ):
-            raise ClaimError("GitHub returned a malformed board blocker")
+            raise ClaimError(self.MALFORMED_BOARD_BLOCKER)
         parsed_closed_at = None
         if closed_at is not None:
             try:
                 parsed_closed_at = datetime.fromisoformat(closed_at.replace("Z", "+00:00"))
             except ValueError as error:
-                raise ClaimError("GitHub returned a malformed board blocker") from error
+                raise ClaimError(self.MALFORMED_BOARD_BLOCKER) from error
             if parsed_closed_at.tzinfo is None:
-                raise ClaimError("GitHub returned a malformed board blocker")
+                raise ClaimError(self.MALFORMED_BOARD_BLOCKER)
             parsed_closed_at = parsed_closed_at.astimezone(timezone.utc)
         return board.BlockerReference(
             number,
